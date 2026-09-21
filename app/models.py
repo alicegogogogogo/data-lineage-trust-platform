@@ -269,3 +269,37 @@ class ProcessingRunFinish(BaseModel):
 
     status: Literal["succeeded", "failed"]
     error: StrictStr | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Processing task run audit records
+# --------------------------------------------------------------------------- #
+
+
+class AuditRecordCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event: StrictStr = Field(description="Non-empty name of the audited event")
+    input_summary: StrictStr = Field(description="Non-empty summary of the input")
+    result_summary: StrictStr = Field(description="Non-empty summary of the result")
+
+
+class AuditRecord(BaseModel):
+    id: int
+    sequence: int
+    event: str
+    input_summary: str
+    result_summary: str
+    run_status: Literal["running", "succeeded", "failed"]
+    previous_hash: str | None
+    evidence_hash: str
+    created_at: str
+
+
+class AuditChainVerifyResponse(BaseModel):
+    dataset: str
+    version: int
+    task_id: int
+    run_id: int
+    valid: bool
+    checked_count: int

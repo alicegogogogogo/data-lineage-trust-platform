@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
+import threading
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
@@ -1277,3 +1279,259 @@ def finish_task_run(
         "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
     ).fetchone()
     return _run_row_to_dict(updated)
+
+
+# --------------------------------------------------------------------------- #
+# Processing task run audit records (append-only proof chain)
+# --------------------------------------------------------------------------- #
+
+
+# Serializes read-tail -> append within this process so concurrent requests
+# never compute the same sequence. SQLite's UNIQUE(run_id, sequence) constraint
+# is the hard guard against writers in other processes; such a collision is
+# resolved with a bounded re-read-and-retry.
+_audit_append_locks: dict[int, threading.Lock] = {}
+_audit_append_locks_guard = threading.Lock()
+
+# Bound on re-read-and-retry attempts when a writer in another process wins the
+# race for the same (run_id, sequence).
+_AUDIT_APPEND_MAX_ATTEMPTS = 100
+
+
+def _audit_append_lock(run_id: int) -> threading.Lock:
+    with _audit_append_locks_guard:
+        lock = _audit_append_locks.get(run_id)
+        if lock is None:
+            lock = threading.Lock()
+            _audit_append_locks[run_id] = lock
+        return lock
+
+
+AUDIT_EVIDENCE_FIELDS = (
+    "event",
+    "input_summary",
+    "previous_hash",
+    "result_summary",
+    "run_status",
+    "sequence",
+)
+
+
+def _audit_evidence_hash(record: dict[str, Any]) -> str:
+    """SHA-256 over the canonical JSON of every hashed field.
+
+    Keys are sorted by Unicode code point, no whitespace is emitted and the
+    text is UTF-8 encoded (non-ASCII characters are not escaped). ``id``,
+    ``created_at`` and ``evidence_hash`` itself are excluded.
+    """
+    payload = {field: record[field] for field in AUDIT_EVIDENCE_FIELDS}
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _audit_record_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "sequence": row["sequence"],
+        "event": row["event"],
+        "input_summary": row["input_summary"],
+        "result_summary": row["result_summary"],
+        "run_status": row["run_status"],
+        "previous_hash": row["previous_hash"],
+        "evidence_hash": row["evidence_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+def _resolve_run(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+) -> tuple[dict, sqlite3.Row, sqlite3.Row, sqlite3.Row]:
+    """Resolve a path to (dataset, version, task, run).
+
+    Unknown dataset/version/task/run are 404; a run that exists but belongs to a
+    different task (including a task in another version) is 422.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, version_row, dataset_name, version_number, task_id
+    )
+    run_row = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if run_row is None:
+        raise NotFoundError(f"Processing task run {run_id} does not exist")
+    if run_row["task_id"] != task_row["id"]:
+        raise RequestInvalidError(
+            f"Processing task run {run_id} does not belong to task {task_id} "
+            f"in version {version_number} of dataset '{dataset_name}'"
+        )
+    return dataset, version_row, task_row, run_row
+
+
+def create_audit_record(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    event: str,
+    input_summary: str,
+    result_summary: str,
+) -> dict:
+    # Precedence mirrors finishing a run: the path dataset/version/task must
+    # exist (404); blank fields are then rejected (422); finally the run itself
+    # must exist (404) and belong to the path task (422).
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, version_row, dataset_name, version_number, task_id
+    )
+
+    for label, value in (
+        ("event", event),
+        ("input_summary", input_summary),
+        ("result_summary", result_summary),
+    ):
+        if not value.strip():
+            raise RequestInvalidError(f"'{label}' must not be empty")
+
+    run_row = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if run_row is None:
+        raise NotFoundError(f"Processing task run {run_id} does not exist")
+    if run_row["task_id"] != task_row["id"]:
+        raise RequestInvalidError(
+            f"Processing task run {run_id} does not belong to task {task_id} "
+            f"in version {version_number} of dataset '{dataset_name}'"
+        )
+
+    # The per-run lock makes read-tail -> append atomic within this process
+    # (FastAPI runs this synchronous endpoint in one process's threadpool).
+    # The UNIQUE(run_id, sequence) constraint is the hard cross-process guard;
+    # a writer that loses a race against another process retries with the new
+    # tail instead of failing the request.
+    with _audit_append_lock(run_id):
+        for attempt in range(_AUDIT_APPEND_MAX_ATTEMPTS):
+            # Read the run status and chain tail immediately before inserting so
+            # both reflect the state at write time.
+            run_status = conn.execute(
+                "SELECT status FROM processing_task_runs WHERE id = ?", (run_id,)
+            ).fetchone()["status"]
+            tail = conn.execute(
+                "SELECT sequence, evidence_hash FROM processing_task_audit_records "
+                "WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if tail is None:
+                sequence = 1
+                previous_hash = None
+            else:
+                sequence = tail["sequence"] + 1
+                previous_hash = tail["evidence_hash"]
+
+            record = {
+                "sequence": sequence,
+                "event": event,
+                "input_summary": input_summary,
+                "result_summary": result_summary,
+                "run_status": run_status,
+                "previous_hash": previous_hash,
+            }
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO processing_task_audit_records ("
+                    "run_id, sequence, event, input_summary, result_summary, "
+                    "run_status, previous_hash, evidence_hash, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        sequence,
+                        event,
+                        input_summary,
+                        result_summary,
+                        run_status,
+                        previous_hash,
+                        _audit_evidence_hash(record),
+                        utc_now_iso(),
+                    ),
+                )
+                break
+            except sqlite3.IntegrityError:
+                # Another process inserted the same sequence first. End the
+                # current (pinned) transaction so the re-read establishes a new
+                # snapshot that includes the competing commit, then retry.
+                if attempt + 1 == _AUDIT_APPEND_MAX_ATTEMPTS:
+                    conn.rollback()
+                    raise ConflictError(
+                        "Too many concurrent audit-record writes; retry the request"
+                    )
+                conn.rollback()
+                continue
+
+    stored = conn.execute(
+        "SELECT * FROM processing_task_audit_records WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _audit_record_row_to_dict(stored)
+
+
+def list_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+) -> list[dict]:
+    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+    rows = conn.execute(
+        "SELECT * FROM processing_task_audit_records WHERE run_id = ? "
+        "ORDER BY sequence ASC",
+        (run_id,),
+    ).fetchall()
+    return [_audit_record_row_to_dict(row) for row in rows]
+
+
+def verify_audit_chain(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+) -> dict:
+    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+    rows = conn.execute(
+        "SELECT * FROM processing_task_audit_records WHERE run_id = ? "
+        "ORDER BY sequence ASC",
+        (run_id,),
+    ).fetchall()
+
+    valid = True
+    expected_sequence = 1
+    previous_hash: str | None = None
+    for row in rows:
+        record = _audit_record_row_to_dict(row)
+        if record["sequence"] != expected_sequence:
+            valid = False
+        if record["previous_hash"] != previous_hash:
+            valid = False
+        if _audit_evidence_hash(record) != record["evidence_hash"]:
+            valid = False
+        previous_hash = record["evidence_hash"]
+        expected_sequence += 1
+
+    return {
+        "dataset": dataset_name,
+        "version": version_number,
+        "task_id": task_id,
+        "run_id": run_id,
+        "valid": valid,
+        "checked_count": len(rows),
+    }

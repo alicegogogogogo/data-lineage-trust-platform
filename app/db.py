@@ -119,6 +119,39 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (task_id, attempt)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS processing_task_audit_records (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id        INTEGER NOT NULL
+                      REFERENCES processing_task_runs(id) ON DELETE CASCADE,
+        sequence      INTEGER NOT NULL CHECK (sequence >= 1),
+        event         TEXT NOT NULL,
+        input_summary TEXT NOT NULL,
+        result_summary TEXT NOT NULL,
+        run_status    TEXT NOT NULL
+                      CHECK (run_status IN ('running', 'succeeded', 'failed')),
+        previous_hash TEXT,
+        evidence_hash TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        UNIQUE (run_id, sequence)
+    )
+    """,
+    # Audit records are an append-only proof chain: the database itself refuses
+    # updates and deletes so the evidence history cannot be rewritten.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_processing_audit_records_no_update
+    BEFORE UPDATE ON processing_task_audit_records
+    BEGIN
+        SELECT RAISE(ABORT, 'processing task audit records are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_processing_audit_records_no_delete
+    BEFORE DELETE ON processing_task_audit_records
+    BEGIN
+        SELECT RAISE(ABORT, 'processing task audit records are immutable');
+    END
+    """,
 )
 
 

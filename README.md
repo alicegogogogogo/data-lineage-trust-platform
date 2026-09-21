@@ -215,3 +215,37 @@ run records one attempt. Tasks and runs are persisted across restarts.
   does not belong to the task/version in the path → `422`; unknown
   dataset/version/task/run → `404`; other invalid input → `422` and nothing
   is written.
+
+### Processing run audit records (append-only proof chain)
+
+Every run carries an independent, tamper-evident chain of audit records.
+Records are append-only (the database rejects updates and deletes, and there
+are no per-record HTTP routes), numbered from `1` per run and linked through
+SHA-256 evidence hashes. They persist across restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}/audit-records` —
+  append a record. Body contains exactly `event`, `input_summary` and
+  `result_summary`, each a string that is non-empty after trimming whitespace.
+  Returns `201` with the submitted fields plus `id`, `sequence` (continuous
+  from `1` within the run), `run_status` (the run's status at write time:
+  `running`/`succeeded`/`failed`), `previous_hash` (`null` for the first
+  record, otherwise the previous record's `evidence_hash`), `evidence_hash`
+  and `created_at`. Missing, extra, non-string or blank fields → `422` and
+  nothing is written; unknown dataset/version/task/run → `404`; a run that
+  does not belong to the path task (including one in another version) →
+  `422`. Concurrent appends never reuse a sequence or break the chain.
+- `GET .../runs/{run_id}/audit-records` — list the run's records in ascending
+  `sequence` order. Same `404`/`422` path rules.
+- `GET .../runs/{run_id}/audit-records/verify` — verify the chain. Returns the
+  path identifiers together with `valid` and `checked_count`:
+  `{"dataset", "version", "task_id", "run_id", "valid", "checked_count"}`.
+  Verification recomputes every `evidence_hash`, checks that `sequence` values
+  are continuous from `1` and that each `previous_hash` equals the preceding
+  record's `evidence_hash` (the first must be `null`). An intact chain returns
+  `"valid": true` (also for an empty chain).
+
+`evidence_hash` is the hexadecimal SHA-256 of a canonical JSON document built
+from every stored field except `id`, `created_at` and `evidence_hash` itself
+(`event`, `input_summary`, `result_summary`, `sequence`, `run_status`,
+`previous_hash`): keys are sorted by Unicode code point, no insignificant
+whitespace is emitted and the text is UTF-8 encoded.
