@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictStr,
+    field_validator,
+)
 
 
 class DatasetCreate(BaseModel):
@@ -130,6 +137,79 @@ class QualityRuleEvaluateResponse(BaseModel):
     dataset: str
     version: int
     results: list[QualityRuleResult]
+
+
+# --------------------------------------------------------------------------- #
+# Privacy policies
+# --------------------------------------------------------------------------- #
+
+
+PrivacyMasking = Literal["redact", "partial"]
+
+
+class PrivacyPolicyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: StrictStr = Field(description="Existing field of the schema version")
+    classification: StrictStr = Field(
+        description="Non-empty classification label, e.g. 'pii'"
+    )
+    masking: PrivacyMasking
+    allowed_roles: list[StrictStr] = Field(
+        description="Roles allowed to see the unmasked value; may be empty"
+    )
+
+    @field_validator("classification")
+    @classmethod
+    def _classification_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("classification must be a non-empty string")
+        return value
+
+    @field_validator("allowed_roles")
+    @classmethod
+    def _roles_non_empty_and_unique(cls, value: list[str]) -> list[str]:
+        if any(not role.strip() for role in value):
+            raise ValueError("allowed_roles must contain only non-empty strings")
+        if len(set(value)) != len(value):
+            raise ValueError("allowed_roles must not contain duplicates")
+        return value
+
+
+class PrivacyPolicy(BaseModel):
+    id: int
+    field: str
+    classification: str
+    masking: PrivacyMasking
+    allowed_roles: list[str]
+    enabled: bool
+    created_at: str
+
+
+class PrivacyPolicyEnabledUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool
+
+
+class PrivacyViewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: StrictStr = Field(description="Non-empty viewing role")
+    rows: list[dict[str, Any]] = Field(description="Rows to mask for this role")
+
+    @field_validator("role")
+    @classmethod
+    def _role_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("role must be a non-empty string")
+        return value
+
+
+class PrivacyViewResponse(BaseModel):
+    dataset: str
+    version: int
+    rows: list[dict[str, Any]]
 
 
 class ErrorResponse(BaseModel):

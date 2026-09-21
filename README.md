@@ -113,3 +113,45 @@ and persisted (including their enabled state) across restarts.
     counts as `null`, and every row taking part in a duplicate group is a
     violation.
   - With an empty `rows` list every rule passes.
+
+### Privacy policies
+
+Privacy policies attach a classification and a masking strategy to one field of
+a schema version and expose a role-based masked view of rows. Policies and
+their enabled state are persisted across restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/privacy-policies` — register a
+  policy. Body:
+
+  ```json
+  {
+    "field": "ssn",
+    "classification": "pii",
+    "masking": "redact",
+    "allowed_roles": ["auditor"]
+  }
+  ```
+
+  `field` must be an existing field of the version; `classification` must be a
+  non-empty string; `masking` is `redact` or `partial`; `allowed_roles` is a
+  list of non-empty, distinct role strings and may be empty. Returns `201`
+  with the submitted fields plus `id`, `enabled` (defaults to `true`) and
+  `created_at`. A second policy for the same field in the same version returns
+  `409`; unknown dataset/version/field returns `404`; any other invalid input
+  returns `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies` — list policies
+  sorted by `id` ascending.
+- `PATCH /datasets/{dataset}/versions/{version}/privacy-policies/{policy_id}` —
+  enable or disable a policy. Body: `{"enabled": true}` (boolean only); returns
+  the updated policy. Unknown policy/dataset/version → `404`.
+- `POST /datasets/{dataset}/versions/{version}/privacy-policies/view` — masked
+  view. Body: `{"role": "analyst", "rows": [{...}, ...]}` with a non-empty
+  `role` and a `rows` array of objects. Returns
+  `{"dataset", "version", "rows"}` with a copy of the rows in the same order.
+  Only enabled policies whose `allowed_roles` do not include `role` mask their
+  field:
+  - `redact` replaces every non-`null` value with `"***"`.
+  - `partial` keeps the first character and last two characters of strings
+    longer than 4 characters (e.g. `"secret-value"` → `"s***ue"`); all other
+    non-`null` values become `"***"`.
+  - `null` values and fields without a policy are returned unchanged.

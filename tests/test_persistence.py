@@ -31,7 +31,11 @@ ok(client.post(
 ))
 ok(client.post(
     "/datasets/target_ds/versions",
-    json={"fields": [{"name": "tid", "type": "integer", "nullable": False}]},
+    json={"fields": [
+        {"name": "tid", "type": "integer", "nullable": False},
+        {"name": "ssn", "type": "string", "nullable": True},
+        {"name": "email", "type": "string", "nullable": True},
+    ]},
 ))
 ok(client.post(
     "/datasets/target_ds/versions/1/lineage",
@@ -57,6 +61,22 @@ assert paused.status_code == 201, paused.text
 paused_id = paused.json()["id"]
 ok(client.patch(
     f"/datasets/target_ds/versions/1/quality-rules/{paused_id}",
+    json={"enabled": False},
+))
+ok(client.post(
+    "/datasets/target_ds/versions/1/privacy-policies",
+    json={"field": "ssn", "classification": "pii", "masking": "redact",
+          "allowed_roles": ["auditor"]},
+))
+disabled_policy = client.post(
+    "/datasets/target_ds/versions/1/privacy-policies",
+    json={"field": "email", "classification": "pii", "masking": "partial",
+          "allowed_roles": []},
+)
+assert disabled_policy.status_code == 201, disabled_policy.text
+ok(client.patch(
+    "/datasets/target_ds/versions/1/privacy-policies/"
+    f"{disabled_policy.json()['id']}",
     json={"enabled": False},
 ))
 print("created")
@@ -85,14 +105,13 @@ assert version.json()["fields"] == [
 lineage = client.get("/datasets/target_ds/versions/1/lineage")
 assert lineage.status_code == 200, lineage.text
 body = lineage.json()
-assert body["fields"] == [
-    {
-        "target_field": "tid",
-        "sources": [
-            {"dataset": "source_ds", "version": 1, "field": "sid"}
-        ],
-    }
+lineage_by_field = {entry["target_field"]: entry["sources"] for entry in body["fields"]}
+assert set(lineage_by_field) == {"tid", "ssn", "email"}
+assert lineage_by_field["tid"] == [
+    {"dataset": "source_ds", "version": 1, "field": "sid"}
 ]
+assert lineage_by_field["ssn"] == []
+assert lineage_by_field["email"] == []
 
 rules = client.get("/datasets/target_ds/versions/1/quality-rules")
 assert rules.status_code == 200, rules.text
@@ -113,6 +132,37 @@ assert evaluated.status_code == 200, evaluated.text
 evaluation = evaluated.json()
 assert [r["name"] for r in evaluation["results"]] == ["tid present"]
 assert evaluation["results"][0]["violations"] == [0]
+
+policies = client.get("/datasets/target_ds/versions/1/privacy-policies")
+assert policies.status_code == 200, policies.text
+policy_rows = policies.json()
+assert [p["field"] for p in policy_rows] == ["ssn", "email"]
+policies_by_field = {p["field"]: p for p in policy_rows}
+assert policies_by_field["ssn"]["classification"] == "pii"
+assert policies_by_field["ssn"]["masking"] == "redact"
+assert policies_by_field["ssn"]["allowed_roles"] == ["auditor"]
+assert policies_by_field["ssn"]["enabled"] is True
+assert policies_by_field["email"]["masking"] == "partial"
+assert policies_by_field["email"]["allowed_roles"] == []
+assert policies_by_field["email"]["enabled"] is False
+
+# Masking behaviour and the persisted enabled state hold after the restart.
+view_rows = [{"tid": 1, "ssn": "123-45-6789", "email": "alice@example.com"}]
+masked = client.post(
+    "/datasets/target_ds/versions/1/privacy-policies/view",
+    json={"role": "guest", "rows": view_rows},
+)
+assert masked.status_code == 200, masked.text
+masked_rows = masked.json()["rows"]
+assert masked_rows[0]["ssn"] == "***"            # enabled redact, role not allowed
+assert masked_rows[0]["email"] == "alice@example.com"  # disabled policy
+
+visible = client.post(
+    "/datasets/target_ds/versions/1/privacy-policies/view",
+    json={"role": "auditor", "rows": view_rows},
+)
+assert visible.status_code == 200, visible.text
+assert visible.json()["rows"][0]["ssn"] == "123-45-6789"  # allowed role
 print(json.dumps({"dataset_id": by_name["target_ds"]["id"]}))
 """
 
