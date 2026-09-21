@@ -93,6 +93,32 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS processing_tasks (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id    INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        name          TEXT NOT NULL,
+        depends_on    TEXT NOT NULL DEFAULT '[]',
+        max_attempts  INTEGER NOT NULL CHECK (max_attempts >= 1),
+        status        TEXT NOT NULL
+                      CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        created_at    TEXT NOT NULL,
+        UNIQUE (version_id, name)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS processing_task_runs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id     INTEGER NOT NULL REFERENCES processing_tasks(id) ON DELETE CASCADE,
+        attempt     INTEGER NOT NULL,
+        status      TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+        started_at  TEXT NOT NULL,
+        finished_at TEXT,
+        error       TEXT,
+        UNIQUE (task_id, attempt)
+    )
+    """,
 )
 
 

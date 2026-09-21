@@ -181,3 +181,40 @@ time. Snapshots (including their rows) survive restarts.
   rows present more often (or only) in the `to` snapshot and `removed` the
   converse, each entry being `{"row": {...}, "count": <int>}` sorted by the
   canonical (key-sorted) JSON text of `row`.
+
+### Processing tasks
+
+A processing task is a named unit of work attached to a schema version; each
+run of a task is persisted as an attempt record. Tasks and runs survive
+restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks` — create a
+  task. Body: `{"name": "extract", "depends_on": [<task id>, ...], "max_attempts": 2}`
+  where `depends_on` defaults to `[]` and `max_attempts` to `1`. `name` must be
+  non-empty and unique within the version (`409` on conflict); `depends_on`
+  lists distinct ids of tasks of the same version; `max_attempts` is a positive
+  integer. Returns `201` with `id`, `dataset`, `version`, `name`, `depends_on`,
+  `max_attempts`, `status` (`"pending"`), `attempt_count` (`0`) and
+  `created_at`. Unknown dataset/version → `404`; other invalid input → `422`
+  and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/processing-tasks` — list tasks
+  sorted by `id` ascending.
+- `GET /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}` —
+  return one task plus its `runs`, sorted by `attempt` ascending. Each run has
+  `id`, `task_id`, `attempt`, `status`, `started_at`, `finished_at` and
+  `error`. Unknown dataset/version/task → `404`.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs` —
+  start a new run. Only allowed while the task is `pending` or `failed`, has
+  used fewer than `max_attempts` attempts and every task in `depends_on` has
+  status `succeeded`; otherwise `409` and nothing is written. On success the
+  task's `attempt_count` increases by one, the task becomes `running` and the
+  new run is returned with `201` (`status` `"running"`, `finished_at` and
+  `error` `null`).
+- `PATCH /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}` —
+  finish the currently running run. Body is either `{"status": "succeeded"}` or
+  `{"status": "failed", "error": "<non-empty message>"}`; anything else is
+  `422` and nothing is written. The run's `finished_at` is recorded and the
+  task's status becomes `succeeded`/`failed`; a failed task with attempts left
+  can be started again. Finishing a run that is not running → `409`; a run
+  that does not belong to the task in the path → `422`; unknown
+  dataset/version/task/run → `404`.

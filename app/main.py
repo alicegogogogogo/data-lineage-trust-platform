@@ -22,6 +22,11 @@ from app.models import (
     PrivacyPolicyEnabledUpdate,
     PrivacyViewRequest,
     PrivacyViewResponse,
+    ProcessingTask,
+    ProcessingTaskCreate,
+    ProcessingTaskDetail,
+    ProcessingTaskRun,
+    ProcessingTaskRunFinish,
     QualityRule,
     QualityRuleCreate,
     QualityRuleEnabledUpdate,
@@ -419,5 +424,97 @@ def diff_snapshots(
     return SnapshotDiffResponse(
         **repository.diff_snapshots(
             conn, dataset_name, version, snapshot_id, other_snapshot_id
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Processing tasks
+# --------------------------------------------------------------------------- #
+
+
+PROCESSING_TASKS_PATH = "/datasets/{dataset_name}/versions/{version}/processing-tasks"
+
+
+@app.post(PROCESSING_TASKS_PATH, response_model=ProcessingTask, status_code=201)
+def create_processing_task(
+    dataset_name: str,
+    version: int,
+    payload: ProcessingTaskCreate,
+    conn=Depends(get_db),
+) -> ProcessingTask:
+    return ProcessingTask(
+        **repository.create_processing_task(
+            conn,
+            dataset_name,
+            version,
+            payload.name,
+            payload.depends_on,
+            payload.max_attempts,
+        )
+    )
+
+
+@app.get(PROCESSING_TASKS_PATH, response_model=list[ProcessingTask])
+def list_processing_tasks(
+    dataset_name: str, version: int, conn=Depends(get_db)
+) -> list[ProcessingTask]:
+    return [
+        ProcessingTask(**task)
+        for task in repository.list_processing_tasks(conn, dataset_name, version)
+    ]
+
+
+@app.get(f"{PROCESSING_TASKS_PATH}/{{task_id}}", response_model=ProcessingTaskDetail)
+def get_processing_task(
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    conn=Depends(get_db),
+) -> ProcessingTaskDetail:
+    return ProcessingTaskDetail(
+        **repository.get_processing_task(conn, dataset_name, version, task_id)
+    )
+
+
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/{{task_id}}/runs",
+    response_model=ProcessingTaskRun,
+    status_code=201,
+)
+def create_processing_task_run(
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    conn=Depends(get_db),
+) -> ProcessingTaskRun:
+    return ProcessingTaskRun(
+        **repository.create_processing_task_run(
+            conn, dataset_name, version, task_id
+        )
+    )
+
+
+@app.patch(
+    f"{PROCESSING_TASKS_PATH}/{{task_id}}/runs/{{run_id}}",
+    response_model=ProcessingTaskRun,
+)
+def finish_processing_task_run(
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    run_id: int,
+    payload: ProcessingTaskRunFinish,
+    conn=Depends(get_db),
+) -> ProcessingTaskRun:
+    return ProcessingTaskRun(
+        **repository.finish_processing_task_run(
+            conn,
+            dataset_name,
+            version,
+            task_id,
+            run_id,
+            payload.status,
+            payload.error,
         )
     )

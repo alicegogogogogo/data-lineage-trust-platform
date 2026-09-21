@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
 
 class DatasetCreate(BaseModel):
@@ -218,3 +218,63 @@ class SnapshotDiffResponse(BaseModel):
     to_snapshot_id: int
     added: list[SnapshotDiffEntry]
     removed: list[SnapshotDiffEntry]
+
+
+# --------------------------------------------------------------------------- #
+# Processing tasks
+# --------------------------------------------------------------------------- #
+
+
+ProcessingTaskStatus = Literal["pending", "running", "succeeded", "failed"]
+ProcessingRunStatus = Literal["running", "succeeded", "failed"]
+
+
+class ProcessingTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: StrictStr = Field(
+        description="Unique, non-empty task name within the version"
+    )
+    depends_on: list[StrictInt] = Field(
+        default_factory=list,
+        description="Distinct ids of tasks in the same version that must "
+        "succeed before this task can run",
+    )
+    max_attempts: StrictInt = Field(
+        default=1,
+        ge=1,
+        description="Positive number of run attempts allowed for the task",
+    )
+
+
+class ProcessingTask(BaseModel):
+    id: int
+    dataset: str
+    version: int
+    name: str
+    depends_on: list[int]
+    max_attempts: int
+    status: ProcessingTaskStatus
+    attempt_count: int
+    created_at: str
+
+
+class ProcessingTaskRun(BaseModel):
+    id: int
+    task_id: int
+    attempt: int
+    status: ProcessingRunStatus
+    started_at: str
+    finished_at: str | None
+    error: str | None
+
+
+class ProcessingTaskDetail(ProcessingTask):
+    runs: list[ProcessingTaskRun]
+
+
+class ProcessingTaskRunFinish(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["succeeded", "failed"]
+    error: StrictStr | None = None
