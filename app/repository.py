@@ -1021,3 +1021,259 @@ def diff_snapshots(
             for key in removed_keys
         ],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Processing tasks
+# --------------------------------------------------------------------------- #
+
+
+def _task_row_to_dict(
+    row: sqlite3.Row, dataset_name: str, version_number: int
+) -> dict:
+    return {
+        "id": row["id"],
+        "dataset": dataset_name,
+        "version": version_number,
+        "name": row["name"],
+        "depends_on": json.loads(row["depends_on"]),
+        "max_attempts": row["max_attempts"],
+        "status": row["status"],
+        "attempt_count": row["attempt_count"],
+        "created_at": row["created_at"],
+    }
+
+
+def _run_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "task_id": row["task_id"],
+        "attempt": row["attempt"],
+        "status": row["status"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "error": row["error"],
+    }
+
+
+def _require_task(
+    conn: sqlite3.Connection,
+    version_row: sqlite3.Row,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM processing_tasks WHERE version_id = ? AND id = ?",
+        (version_row["id"], task_id),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"Processing task {task_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    return row
+
+
+def create_processing_task(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    name: str,
+    depends_on: list[int],
+    max_attempts: int,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    clean_name = name.strip()
+    if not clean_name:
+        raise RequestInvalidError("Processing task name must not be empty")
+
+    if len(set(depends_on)) != len(depends_on):
+        raise RequestInvalidError("'depends_on' must not contain duplicate task ids")
+    for dependency_id in depends_on:
+        dependency = conn.execute(
+            "SELECT id FROM processing_tasks WHERE version_id = ? AND id = ?",
+            (version_row["id"], dependency_id),
+        ).fetchone()
+        if dependency is None:
+            raise NotFoundError(
+                f"Dependency task {dependency_id} does not exist in version "
+                f"{version_number} of dataset '{dataset_name}'"
+            )
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO processing_tasks ("
+            "version_id, name, depends_on, max_attempts, status, attempt_count, "
+            "created_at"
+            ") VALUES (?, ?, ?, ?, 'pending', 0, ?)",
+            (
+                version_row["id"],
+                clean_name,
+                json.dumps(list(depends_on)),
+                max_attempts,
+                utc_now_iso(),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ConflictError(
+            f"Processing task '{clean_name}' already exists for version "
+            f"{version_number} of dataset '{dataset_name}'"
+        ) from exc
+
+    row = conn.execute(
+        "SELECT * FROM processing_tasks WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return _task_row_to_dict(row, dataset["name"], version_row["version"])
+
+
+def list_processing_tasks(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int
+) -> list[dict]:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    rows = conn.execute(
+        "SELECT * FROM processing_tasks WHERE version_id = ? ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+    return [
+        _task_row_to_dict(row, dataset["name"], version_row["version"])
+        for row in rows
+    ]
+
+
+def get_processing_task(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, version_row, dataset_name, version_number, task_id
+    )
+
+    run_rows = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE task_id = ? ORDER BY attempt",
+        (task_row["id"],),
+    ).fetchall()
+    result = _task_row_to_dict(task_row, dataset["name"], version_row["version"])
+    result["runs"] = [_run_row_to_dict(row) for row in run_rows]
+    return result
+
+
+def create_task_run(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, version_row, dataset_name, version_number, task_id
+    )
+
+    if task_row["status"] not in ("pending", "failed"):
+        raise ConflictError(
+            f"Processing task {task_id} is '{task_row['status']}' and cannot "
+            "start a new run"
+        )
+    if task_row["attempt_count"] >= task_row["max_attempts"]:
+        raise ConflictError(
+            f"Processing task {task_id} has exhausted its "
+            f"{task_row['max_attempts']} attempt(s)"
+        )
+
+    depends_on = json.loads(task_row["depends_on"])
+    if depends_on:
+        placeholders = ", ".join("?" for _ in depends_on)
+        dependency_rows = conn.execute(
+            f"SELECT id, status FROM processing_tasks WHERE id IN ({placeholders})",
+            depends_on,
+        ).fetchall()
+        blocking = [row["id"] for row in dependency_rows if row["status"] != "succeeded"]
+        if blocking:
+            raise ConflictError(
+                "Processing task "
+                f"{task_id} cannot start: dependency task(s) "
+                + ", ".join(str(dep_id) for dep_id in sorted(blocking))
+                + " have not succeeded"
+            )
+
+    attempt = task_row["attempt_count"] + 1
+    cursor = conn.execute(
+        "INSERT INTO processing_task_runs (task_id, attempt, status, started_at) "
+        "VALUES (?, ?, 'running', ?)",
+        (task_row["id"], attempt, utc_now_iso()),
+    )
+    conn.execute(
+        "UPDATE processing_tasks SET attempt_count = ?, status = 'running' "
+        "WHERE id = ?",
+        (attempt, task_row["id"]),
+    )
+    row = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return _run_row_to_dict(row)
+
+
+def finish_task_run(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    status: str,
+    error: str | None,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, version_row, dataset_name, version_number, task_id
+    )
+
+    if status == "succeeded":
+        if error is not None:
+            raise RequestInvalidError(
+                "A successful run must not carry an error message"
+            )
+    else:
+        if error is None or not error.strip():
+            raise RequestInvalidError(
+                "A failed run requires a non-empty error message"
+            )
+
+    run_row = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if run_row is None:
+        raise NotFoundError(f"Processing task run {run_id} does not exist")
+    if run_row["task_id"] != task_row["id"]:
+        raise RequestInvalidError(
+            f"Processing task run {run_id} does not belong to task {task_id} "
+            f"in version {version_number} of dataset '{dataset_name}'"
+        )
+    if run_row["status"] != "running":
+        raise ConflictError(
+            f"Processing task run {run_id} is already '{run_row['status']}' "
+            "and cannot be finished again"
+        )
+
+    conn.execute(
+        "UPDATE processing_task_runs SET status = ?, finished_at = ?, error = ? "
+        "WHERE id = ?",
+        (status, utc_now_iso(), error, run_row["id"]),
+    )
+    conn.execute(
+        "UPDATE processing_tasks SET status = ? WHERE id = ?",
+        (status, task_row["id"]),
+    )
+    updated = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
+    ).fetchone()
+    return _run_row_to_dict(updated)

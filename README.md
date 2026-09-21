@@ -181,3 +181,37 @@ time. Snapshots (including their rows) survive restarts.
   rows present more often (or only) in the `to` snapshot and `removed` the
   converse, each entry being `{"row": {...}, "count": <int>}` sorted by the
   canonical (key-sorted) JSON text of `row`.
+
+### Processing tasks
+
+A processing task is a named unit of work attached to a schema version; each
+run records one attempt. Tasks and runs are persisted across restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks` — create a
+  task. Body: `{"name": "extract", "depends_on": [1], "max_attempts": 3}`.
+  `name` must be non-empty and unique within the version (`409` on conflict);
+  `depends_on` is an array of distinct task ids from the same version (default
+  `[]`, unknown ids → `404`); `max_attempts` is a positive integer (default
+  `1`). Returns `201` with `id`, `dataset`, `version`, `name`, `depends_on`,
+  `max_attempts`, `status` (`pending`), `attempt_count` (`0`) and
+  `created_at`. Other invalid input → `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/processing-tasks` — list tasks
+  sorted by `id` ascending.
+- `GET /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}` —
+  return the task together with its `runs`, sorted by `attempt` ascending.
+  Each run has `id`, `task_id`, `attempt`, `status`, `started_at`,
+  `finished_at` and `error`. Unknown dataset/version/task → `404`.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs` —
+  start a new run. Only allowed while the task is `pending` or `failed`, has
+  attempts left (`attempt_count < max_attempts`) and every task in
+  `depends_on` has status `succeeded`; otherwise `409` and nothing is written.
+  Returns `201` with the new `running` run and increments the task's
+  `attempt_count` (the task becomes `running`).
+- `PATCH /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}` —
+  finish the currently running run. Body: `{"status": "succeeded"}` or
+  `{"status": "failed", "error": "<non-empty message>"}`. Writes `finished_at`
+  and moves the task to the same status; a `failed` task with attempts left
+  can be started again. Finishing an already finished run → `409`; a run that
+  does not belong to the task/version in the path → `422`; unknown
+  dataset/version/task/run → `404`; other invalid input → `422` and nothing
+  is written.
