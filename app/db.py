@@ -84,6 +84,15 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (version_id, field)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS snapshots (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        row_count  INTEGER NOT NULL CHECK (row_count >= 0),
+        rows       TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
 )
 
 

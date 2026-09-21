@@ -148,3 +148,36 @@ data. Policies (including their enabled state) are persisted across restarts.
     `"***"`.
   - `null` values and fields without a policy are returned unchanged; rows
     missing a covered field are left without it.
+
+### Row snapshots
+
+A row snapshot persistently records the rows of a schema version at one point in
+time. Snapshots (including their rows) survive restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/snapshots` — persist a snapshot.
+  Body: `{"rows": [{...}, ...]}` where `rows` must be an array of JSON objects
+  (it may be empty). The JSON values and the order of rows/object keys are deep
+  copied verbatim. Returns `201` with `id`, `dataset`, `version`,
+  `created_at` and `row_count` (no rows). Unknown dataset/version → `404`;
+  malformed or non-object rows → `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/snapshots` — list snapshot
+  metadata sorted by `id` ascending (no `rows`).
+- `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}` — return
+  the metadata together with the saved `rows`. Unknown dataset/version/snapshot
+  → `404`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/at?timestamp=<ISO-8601>` —
+  return the most recent snapshot whose `created_at` is not later than
+  `timestamp`, including its rows. The timestamp must be a timezone-aware
+  ISO-8601 date-time (an offset or trailing `Z`): missing, invalid or
+  timezone-less values return `422`; unknown dataset/version → `404`; when no
+  snapshot exists at or before the timestamp the response is `404`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/diff/{other_snapshot_id}` —
+  compare two snapshots as JSON-object multisets. Object key order does not
+  affect equality, while array order and JSON value types do (e.g. `1`, `1.0`,
+  `"1"` and `true` are all distinct), and duplicate rows are counted. Both
+  snapshots must belong to the dataset and version named in the path, otherwise
+  `422`; unknown dataset/version/snapshot → `404`. The response is
+  `{"from_snapshot_id", "to_snapshot_id", "added", "removed"}`; `added` lists
+  rows present more often (or only) in the `to` snapshot and `removed` the
+  converse, each entry being `{"row": {...}, "count": <int>}` sorted by the
+  canonical (key-sorted) JSON text of `row`.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -29,6 +29,10 @@ from app.models import (
     QualityRuleEvaluateResponse,
     SchemaVersion,
     SchemaVersionCreate,
+    SnapshotCreate,
+    SnapshotDiffResponse,
+    SnapshotMetadata,
+    SnapshotResponse,
 )
 
 app = FastAPI(title="Data Lineage Trust Platform", version="0.1.0")
@@ -341,5 +345,79 @@ def view_privacy_rows(
     return PrivacyViewResponse(
         **repository.view_privacy_rows(
             conn, dataset_name, version, payload.role, payload.rows
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Row snapshots
+# --------------------------------------------------------------------------- #
+
+
+SNAPSHOTS_PATH = "/datasets/{dataset_name}/versions/{version}/snapshots"
+
+
+@app.post(SNAPSHOTS_PATH, response_model=SnapshotMetadata, status_code=201)
+def create_snapshot(
+    dataset_name: str,
+    version: int,
+    payload: SnapshotCreate,
+    conn=Depends(get_db),
+) -> SnapshotMetadata:
+    return SnapshotMetadata(
+        **repository.create_snapshot(conn, dataset_name, version, payload.rows)
+    )
+
+
+@app.get(SNAPSHOTS_PATH, response_model=list[SnapshotMetadata])
+def list_snapshots(
+    dataset_name: str, version: int, conn=Depends(get_db)
+) -> list[SnapshotMetadata]:
+    return [
+        SnapshotMetadata(**snapshot)
+        for snapshot in repository.list_snapshots(conn, dataset_name, version)
+    ]
+
+
+# Declared before the "/{snapshot_id}" route so the literal "at" segment is
+# matched there rather than parsed as a snapshot id.
+@app.get(f"{SNAPSHOTS_PATH}/at", response_model=SnapshotResponse)
+def get_snapshot_at(
+    dataset_name: str,
+    version: int,
+    timestamp: str | None = Query(default=None),
+    conn=Depends(get_db),
+) -> SnapshotResponse:
+    return SnapshotResponse(
+        **repository.get_snapshot_at(conn, dataset_name, version, timestamp)
+    )
+
+
+@app.get(f"{SNAPSHOTS_PATH}/{{snapshot_id}}", response_model=SnapshotResponse)
+def get_snapshot(
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    conn=Depends(get_db),
+) -> SnapshotResponse:
+    return SnapshotResponse(
+        **repository.get_snapshot(conn, dataset_name, version, snapshot_id)
+    )
+
+
+@app.get(
+    f"{SNAPSHOTS_PATH}/{{snapshot_id}}/diff/{{other_snapshot_id}}",
+    response_model=SnapshotDiffResponse,
+)
+def diff_snapshots(
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    other_snapshot_id: int,
+    conn=Depends(get_db),
+) -> SnapshotDiffResponse:
+    return SnapshotDiffResponse(
+        **repository.diff_snapshots(
+            conn, dataset_name, version, snapshot_id, other_snapshot_id
         )
     )
