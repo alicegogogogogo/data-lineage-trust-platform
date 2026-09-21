@@ -79,3 +79,37 @@ schema version in a different (source) dataset.
   field (including fields without sources) together with its source references.
   Results are sorted by target field name, then source dataset name, source
   version and source field name.
+
+### Quality rules
+
+Quality rules validate rows against a schema version. Rules are version-scoped
+and persisted (including their enabled state) across restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/quality-rules` — create a rule.
+  Body: `{"name": "id required", "kind": "not_null", "params": {...}}`. Returns
+  `201` with `id`, `name`, `kind`, `params`, `enabled`, `created_at`; `enabled`
+  defaults to `true`. Rule names must be unique within a version (`409` on
+  conflict). Referenced dataset/version/field must exist (`404`); other invalid
+  input returns `422` and nothing is written. Supported kinds:
+  - `not_null` — params `{"field": "<existing field>"}`.
+  - `numeric_range` — params `{"field": "<existing field>", "min": <finite
+    number>, "max": <finite number>}` with `min <= max`.
+  - `unique` — params `{"fields": ["<existing field>", ...]}`: a non-empty list
+    of distinct, existing field names.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules` — list rules
+  sorted by `id` ascending.
+- `PATCH /datasets/{dataset}/versions/{version}/quality-rules/{rule_id}` —
+  enable or disable a rule. Body: `{"enabled": true}` (boolean only); returns
+  the updated rule. Unknown rule/dataset/version → `404`.
+- `POST /datasets/{dataset}/versions/{version}/quality-rules/evaluate` —
+  evaluate rows. Body: `{"rows": [{...}, ...]}`. Only enabled rules run.
+  Returns `{"dataset", "version", "results"}` with results sorted by `rule_id`;
+  each result has `rule_id`, `name`, `passed` and `violations` (0-based row
+  indices in ascending order).
+  - `not_null` fails on missing or `null` values.
+  - `numeric_range` fails on missing, `null`, non-numeric, boolean or
+    out-of-range values (boundaries included).
+  - `unique` compares the tuple of `fields` values per row; a missing field
+    counts as `null`, and every row taking part in a duplicate group is a
+    violation.
+  - With an empty `rows` list every rule passes.

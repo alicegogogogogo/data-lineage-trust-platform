@@ -59,6 +59,18 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         CHECK (source_dataset_id <> target_dataset_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS quality_rules (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        name       TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        params     TEXT NOT NULL,
+        enabled    INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        created_at TEXT NOT NULL,
+        UNIQUE (version_id, name)
+    )
+    """,
 )
 
 

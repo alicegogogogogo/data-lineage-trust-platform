@@ -44,6 +44,21 @@ ok(client.post(
         "source_field": "sid",
     },
 ))
+ok(client.post(
+    "/datasets/target_ds/versions/1/quality-rules",
+    json={"name": "tid present", "kind": "not_null", "params": {"field": "tid"}},
+))
+paused = client.post(
+    "/datasets/target_ds/versions/1/quality-rules",
+    json={"name": "tid range", "kind": "numeric_range",
+          "params": {"field": "tid", "min": 0, "max": 99}},
+)
+assert paused.status_code == 201, paused.text
+paused_id = paused.json()["id"]
+ok(client.patch(
+    f"/datasets/target_ds/versions/1/quality-rules/{paused_id}",
+    json={"enabled": False},
+))
 print("created")
 """
 
@@ -78,6 +93,26 @@ assert body["fields"] == [
         ],
     }
 ]
+
+rules = client.get("/datasets/target_ds/versions/1/quality-rules")
+assert rules.status_code == 200, rules.text
+rule_rows = rules.json()
+assert [r["name"] for r in rule_rows] == ["tid present", "tid range"]
+rules_by_name = {r["name"]: r for r in rule_rows}
+assert rules_by_name["tid present"]["kind"] == "not_null"
+assert rules_by_name["tid present"]["params"] == {"field": "tid"}
+assert rules_by_name["tid present"]["enabled"] is True
+assert rules_by_name["tid range"]["enabled"] is False
+
+# Only the enabled rule executes after the restart.
+evaluated = client.post(
+    "/datasets/target_ds/versions/1/quality-rules/evaluate",
+    json={"rows": [{"tid": None}, {"tid": 5}]},
+)
+assert evaluated.status_code == 200, evaluated.text
+evaluation = evaluated.json()
+assert [r["name"] for r in evaluation["results"]] == ["tid present"]
+assert evaluation["results"][0]["violations"] == [0]
 print(json.dumps({"dataset_id": by_name["target_ds"]["id"]}))
 """
 

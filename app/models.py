@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 
 class DatasetCreate(BaseModel):
@@ -74,6 +76,60 @@ class LineageResponse(BaseModel):
     target_dataset: str
     target_version: int
     fields: list[TargetFieldLineage]
+
+
+# --------------------------------------------------------------------------- #
+# Quality rules
+# --------------------------------------------------------------------------- #
+
+
+QualityRuleKind = Literal["not_null", "numeric_range", "unique"]
+
+
+class QualityRuleCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="Unique rule name within the version")
+    kind: QualityRuleKind
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Kind-specific parameters: {'field': ...}, "
+        "{'field': ..., 'min': ..., 'max': ...} or {'fields': [...]}",
+    )
+
+
+class QualityRule(BaseModel):
+    id: int
+    name: str
+    kind: QualityRuleKind
+    params: dict[str, Any]
+    enabled: bool
+    created_at: str
+
+
+class QualityRuleEnabledUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool
+
+
+class QualityRuleEvaluateRequest(BaseModel):
+    rows: list[dict[str, Any]] = Field(
+        description="Rows to check; only enabled rules are executed"
+    )
+
+
+class QualityRuleResult(BaseModel):
+    rule_id: int
+    name: str
+    passed: bool
+    violations: list[int]
+
+
+class QualityRuleEvaluateResponse(BaseModel):
+    dataset: str
+    version: int
+    results: list[QualityRuleResult]
 
 
 class ErrorResponse(BaseModel):

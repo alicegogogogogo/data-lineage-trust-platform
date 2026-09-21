@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
 from datetime import datetime, timezone
+from typing import Any
 
 from app.errors import ConflictError, NotFoundError, RequestInvalidError
 from app.models import FieldSpec
@@ -324,4 +327,284 @@ def get_lineage(
             {"target_field": name, "sources": sources_by_target[name]}
             for name in sorted(sources_by_target)
         ],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Quality rules
+# --------------------------------------------------------------------------- #
+
+
+QUALITY_RULE_KINDS = ("not_null", "numeric_range", "unique")
+
+
+def _require_schema_version(
+    conn: sqlite3.Connection, dataset: dict, version_number: int
+) -> sqlite3.Row:
+    version_row = conn.execute(
+        "SELECT id, version, created_at FROM schema_versions "
+        "WHERE dataset_id = ? AND version = ?",
+        (dataset["id"], version_number),
+    ).fetchone()
+    if version_row is None:
+        raise NotFoundError(
+            f"Schema version {version_number} of dataset '{dataset['name']}' does not exist"
+        )
+    return version_row
+
+
+def _version_field_names(conn: sqlite3.Connection, version_id: int) -> set[str]:
+    rows = conn.execute(
+        "SELECT name FROM schema_fields WHERE version_id = ?", (version_id,)
+    ).fetchall()
+    return {row["name"] for row in rows}
+
+
+def _is_finite_number(value: Any) -> bool:
+    # bool is a subclass of int; a boolean is not a numeric value here.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def _validate_rule_params(
+    kind: str, params: dict[str, Any], field_names: set[str]
+) -> None:
+    """Validate rule parameters structurally (422) and against the schema (404)."""
+
+    def require_existing_field(field_name: Any) -> str:
+        if not isinstance(field_name, str) or not field_name:
+            raise RequestInvalidError(
+                f"Rule kind '{kind}' requires a non-empty 'field' parameter"
+            )
+        if field_name not in field_names:
+            raise NotFoundError(f"Field '{field_name}' does not exist in this version")
+        return field_name
+
+    if kind == "not_null":
+        require_existing_field(params.get("field"))
+        return
+
+    if kind == "numeric_range":
+        field_name = require_existing_field(params.get("field"))
+        minimum = params.get("min")
+        maximum = params.get("max")
+        if not _is_finite_number(minimum) or not _is_finite_number(maximum):
+            raise RequestInvalidError(
+                f"Rule on field '{field_name}' requires finite numeric 'min' and 'max'"
+            )
+        if minimum > maximum:
+            raise RequestInvalidError(
+                f"Rule on field '{field_name}' requires min <= max"
+            )
+        return
+
+    if kind == "unique":
+        fields = params.get("fields")
+        if not isinstance(fields, list) or not fields:
+            raise RequestInvalidError(
+                "Rule kind 'unique' requires a non-empty 'fields' list"
+            )
+        if not all(isinstance(name, str) and name for name in fields):
+            raise RequestInvalidError(
+                "Rule kind 'unique' requires 'fields' to contain non-empty field names"
+            )
+        if len(set(fields)) != len(fields):
+            raise RequestInvalidError(
+                "Rule kind 'unique' requires 'fields' to contain no duplicates"
+            )
+        unknown = [name for name in fields if name not in field_names]
+        if unknown:
+            raise NotFoundError(
+                f"Field '{unknown[0]}' does not exist in this version"
+            )
+        return
+
+
+def _quality_rule_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "kind": row["kind"],
+        "params": json.loads(row["params"]),
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+    }
+
+
+def create_quality_rule(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    name: str,
+    kind: str,
+    params: dict[str, Any],
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    clean_name = name.strip()
+    if not clean_name:
+        raise RequestInvalidError("Quality rule name must not be empty")
+
+    field_names = _version_field_names(conn, version_row["id"])
+    _validate_rule_params(kind, params, field_names)
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO quality_rules (version_id, name, kind, params, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, 1, ?)",
+            (
+                version_row["id"],
+                clean_name,
+                kind,
+                json.dumps(params),
+                utc_now_iso(),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ConflictError(
+            f"Quality rule '{clean_name}' already exists for version "
+            f"{version_number} of dataset '{dataset_name}'"
+        ) from exc
+
+    row = conn.execute(
+        "SELECT id, name, kind, params, enabled, created_at "
+        "FROM quality_rules WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _quality_rule_row_to_dict(row)
+
+
+def list_quality_rules(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int
+) -> list[dict]:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    rows = conn.execute(
+        "SELECT id, name, kind, params, enabled, created_at "
+        "FROM quality_rules WHERE version_id = ? ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+    return [_quality_rule_row_to_dict(row) for row in rows]
+
+
+def set_quality_rule_enabled(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    rule_id: int,
+    enabled: bool,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    row = conn.execute(
+        "SELECT id, name, kind, params, enabled, created_at "
+        "FROM quality_rules WHERE version_id = ? AND id = ?",
+        (version_row["id"], rule_id),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"Quality rule {rule_id} does not exist in this version")
+
+    conn.execute(
+        "UPDATE quality_rules SET enabled = ? WHERE id = ?",
+        (1 if enabled else 0, row["id"]),
+    )
+    updated = conn.execute(
+        "SELECT id, name, kind, params, enabled, created_at "
+        "FROM quality_rules WHERE id = ?",
+        (row["id"],),
+    ).fetchone()
+    return _quality_rule_row_to_dict(updated)
+
+
+def _row_violates_not_null(row: dict[str, Any], field: str) -> bool:
+    return field not in row or row[field] is None
+
+
+def _row_violates_numeric_range(
+    row: dict[str, Any], field: str, minimum: float, maximum: float
+) -> bool:
+    if field not in row:
+        return True
+    value = row[field]
+    if value is None or not _is_finite_number(value):
+        return True
+    return value < minimum or value > maximum
+
+
+def _row_violates_unique(row: dict[str, Any], fields: list[str]) -> tuple:
+    return tuple(None if name not in row else row[name] for name in fields)
+
+
+def _json_combo_key(combo: tuple) -> str:
+    # Values are already JSON-decoded scalars (or nested arrays/objects); use
+    # JSON text so that, e.g., the number 1 and the string "1" never compare
+    # equal and nested objects with reordered keys still match.
+    return json.dumps(combo, sort_keys=True, separators=(",", ":"))
+
+
+def evaluate_quality_rules(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int, rows: list[dict]
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    rule_rows = conn.execute(
+        "SELECT id, name, kind, params, enabled "
+        "FROM quality_rules WHERE version_id = ? AND enabled = 1 ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+
+    results: list[dict] = []
+    for rule_row in rule_rows:
+        params = json.loads(rule_row["params"])
+        kind = rule_row["kind"]
+        violations: list[int] = []
+
+        if kind == "not_null":
+            field = params["field"]
+            violations = [
+                index
+                for index, row in enumerate(rows)
+                if _row_violates_not_null(row, field)
+            ]
+        elif kind == "numeric_range":
+            field = params["field"]
+            violations = [
+                index
+                for index, row in enumerate(rows)
+                if _row_violates_numeric_range(
+                    row, field, params["min"], params["max"]
+                )
+            ]
+        elif kind == "unique":
+            fields = params["fields"]
+            seen: dict[str, int] = {}
+            duplicated: set[int] = set()
+            for index, row in enumerate(rows):
+                combo = _row_violates_unique(row, fields)
+                key = _json_combo_key(combo)
+                if key in seen:
+                    duplicated.add(seen[key])
+                    duplicated.add(index)
+                else:
+                    seen[key] = index
+            violations = sorted(duplicated)
+
+        results.append(
+            {
+                "rule_id": rule_row["id"],
+                "name": rule_row["name"],
+                "passed": not violations,
+                "violations": violations,
+            }
+        )
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "results": results,
     }
