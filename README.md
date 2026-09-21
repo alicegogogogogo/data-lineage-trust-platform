@@ -79,6 +79,25 @@ schema version in a different (source) dataset.
   field (including fields without sources) together with its source references.
   Results are sorted by target field name, then source dataset name, source
   version and source field name.
+- `GET /datasets/{dataset}/versions/{version}/lineage/impact?field=<field>` —
+  incremental impact query. The path and `field` together locate an existing
+  source field. Returns `{"source", "impacted"}` where `impacted` lists every
+  direct and indirect downstream field reachable from `source` along lineage
+  mappings; each item is `{"dataset", "version", "field"}`, deduplicated,
+  sorted by dataset/version/field and never containing the source itself. The
+  traversal is cycle-safe. Unknown dataset, version or field → `404`; a
+  missing, blank or otherwise invalid `field` → `422`.
+
+  Impact results are persistently cached in the database, so a cache entry
+  remains usable after a restart, but every read reflects the currently
+  committed lineage graph — a stale entry is never served. Successfully
+  creating a schema version invalidates that dataset's cached entries.
+  Successfully creating a lineage mapping invalidates the cached result for
+  the new mapping's source field and for every field that can reach it (its
+  upstream transitive closure); unrelated entries are retained but can never
+  be reused as an affected result. Invalidation runs inside the same database
+  transaction as the write, so a failed request (`422`/`404`/`409` or a write
+  error) changes neither the cache nor existing data.
 
 ### Quality rules
 

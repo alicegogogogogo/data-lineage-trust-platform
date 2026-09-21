@@ -60,6 +60,21 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS lineage_graph_revision (
+        id       INTEGER PRIMARY KEY CHECK (id = 1),
+        revision INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS lineage_impact_cache (
+        source_field_id INTEGER PRIMARY KEY
+                        REFERENCES schema_fields(id) ON DELETE CASCADE,
+        impacted        TEXT NOT NULL,
+        revision        INTEGER NOT NULL,
+        created_at      TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS quality_rules (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         version_id INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,

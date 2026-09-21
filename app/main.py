@@ -17,6 +17,7 @@ from app.models import (
     AuditRecordCreate,
     Dataset,
     DatasetCreate,
+    FieldImpactResponse,
     LineageCreate,
     LineageCreatedResponse,
     LineageResponse,
@@ -203,6 +204,28 @@ def get_lineage(
 ) -> LineageResponse:
     return LineageResponse(
         **repository.get_lineage(conn, dataset_name, version)
+    )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/lineage/impact",
+    response_model=FieldImpactResponse,
+)
+def get_field_impact(
+    dataset_name: str,
+    version: int,
+    field: str | None = Query(default=None),
+    conn=Depends(get_db),
+) -> FieldImpactResponse:
+    # The path and field together locate an existing source field. A missing or
+    # blank field is structurally invalid (422); existence is checked after that
+    # so unknown dataset/version/field still answer 404.
+    if field is None or not field.strip():
+        raise RequestInvalidError(
+            "Query parameter 'field' is required and must name an existing field"
+        )
+    return FieldImpactResponse(
+        **repository.get_field_impact(conn, dataset_name, version, field.strip())
     )
 
 

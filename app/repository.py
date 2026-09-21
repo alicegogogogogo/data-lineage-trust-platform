@@ -129,6 +129,10 @@ def create_schema_version(
         "VALUES (?, ?, ?, ?, ?)",
         [(version_id, name, ftype, nullable, position) for name, ftype, nullable, position in validated],
     )
+    # A committed new version invalidates the dataset's cached impact results;
+    # everything happens in the request transaction, so a failed request rolls
+    # both the version and the invalidation back.
+    invalidate_field_impact_for_dataset(conn, dataset["id"])
     return get_schema_version(conn, dataset_name, next_version)
 
 
@@ -266,6 +270,11 @@ def create_lineage_link(
     except sqlite3.IntegrityError as exc:
         raise ConflictError("This field mapping has already been registered") from exc
 
+    # The edge is now visible inside this transaction; invalidate the source
+    # field and all fields that can reach it, still inside the same transaction
+    # so a 409/failed write rolls the invalidation back as well.
+    invalidate_field_impact_for_new_link(conn, source_field_id)
+
     return {
         "target_dataset": target["name"],
         "target_version": target_version,
@@ -330,6 +339,216 @@ def get_lineage(
             {"target_field": name, "sources": sources_by_target[name]}
             for name in sorted(sources_by_target)
         ],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Incremental field impact (downstream reachability) with a persistent cache
+# --------------------------------------------------------------------------- #
+
+
+def _graph_revision(conn: sqlite3.Connection) -> int:
+    # The revision row is created lazily; every lineage write bumps it so a
+    # cache entry computed against an older graph is never reused.
+    conn.execute(
+        "INSERT OR IGNORE INTO lineage_graph_revision (id, revision) VALUES (1, 1)"
+    )
+    return conn.execute(
+        "SELECT revision FROM lineage_graph_revision WHERE id = 1"
+    ).fetchone()["revision"]
+
+
+def _bump_graph_revision(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO lineage_graph_revision (id, revision) VALUES (1, 1)"
+    )
+    conn.execute(
+        "UPDATE lineage_graph_revision SET revision = revision + 1 WHERE id = 1"
+    )
+
+
+def _load_forward_edges(
+    conn: sqlite3.Connection,
+) -> dict[int, list[tuple[int, dict]]]:
+    """All lineage edges as source_field_id -> [(target_field_id, ref), ...]."""
+    rows = conn.execute(
+        """
+        SELECT  ll.source_field_id AS source_id,
+                ll.target_field_id AS target_id,
+                td.name AS target_dataset,
+                tv.version AS target_version,
+                tf.name AS target_field
+        FROM    lineage_links ll
+        JOIN    schema_fields tf ON tf.id = ll.target_field_id
+        JOIN    schema_versions tv ON tv.id = ll.target_version_id
+        JOIN    datasets td ON td.id = ll.target_dataset_id
+        """
+    ).fetchall()
+    edges: dict[int, list[tuple[int, dict]]] = {}
+    for row in rows:
+        edges.setdefault(row["source_id"], []).append(
+            (
+                row["target_id"],
+                {
+                    "dataset": row["target_dataset"],
+                    "version": row["target_version"],
+                    "field": row["target_field"],
+                },
+            )
+        )
+    return edges
+
+
+def _reachable_downstream(
+    edges: dict[int, list[tuple[int, dict]]], source_field_id: int
+) -> list[dict]:
+    """Fields reachable from the source along lineage edges, cycle-safe.
+
+    ``seen`` pins every visited node, so cycles terminate the walk; the source
+    itself is seeded into ``seen`` and is therefore never part of the result.
+    """
+    refs: dict[int, dict] = {}
+    seen = {source_field_id}
+    stack = [source_field_id]
+    while stack:
+        current = stack.pop()
+        for target_id, ref in edges.get(current, ()):
+            if target_id in seen:
+                continue
+            seen.add(target_id)
+            # One node has one (dataset, version, field) identity; the first
+            # edge through which it was reached is enough and dedupes branches.
+            refs[target_id] = ref
+            stack.append(target_id)
+    return sorted(
+        refs.values(), key=lambda ref: (ref["dataset"], ref["version"], ref["field"])
+    )
+
+
+def _upstream_fields(
+    conn: sqlite3.Connection, field_id: int
+) -> set[int]:
+    """Every field that can reach ``field_id`` along lineage edges, plus itself.
+
+    Traversed over the reverse graph; ``seen`` makes the walk safe for cycles.
+    """
+    rows = conn.execute(
+        "SELECT source_field_id AS source_id, target_field_id AS target_id "
+        "FROM lineage_links"
+    ).fetchall()
+    reverse: dict[int, set[int]] = {}
+    for row in rows:
+        reverse.setdefault(row["target_id"], set()).add(row["source_id"])
+
+    seen = {field_id}
+    stack = [field_id]
+    while stack:
+        current = stack.pop()
+        for predecessor in reverse.get(current, ()):
+            if predecessor not in seen:
+                seen.add(predecessor)
+                stack.append(predecessor)
+    return seen
+
+
+def invalidate_field_impact_for_dataset(
+    conn: sqlite3.Connection, dataset_id: int
+) -> None:
+    """Drop cached impact results keyed on fields of one dataset.
+
+    Creating a schema version only adds isolated field nodes (no edges), so
+    impact results cannot change; only the dataset's own entries are removed
+    and unrelated caches stay usable.
+    """
+    conn.execute(
+        """
+        DELETE FROM lineage_impact_cache
+        WHERE source_field_id IN (
+            SELECT  sf.id
+            FROM    schema_fields sf
+            JOIN    schema_versions sv ON sv.id = sf.version_id
+            WHERE   sv.dataset_id = ?
+        )
+        """,
+        (dataset_id,),
+    )
+
+
+def invalidate_field_impact_for_new_link(
+    conn: sqlite3.Connection, source_field_id: int
+) -> None:
+    """Invalidate caches for the new edge's source field and all its upstream.
+
+    A new edge s -> t only changes results whose traversal can pass through s:
+    the source itself and every field that reaches it. The global graph
+    revision is also bumped so an in-flight (other process) cache fill computed
+    before this commit can never be served afterwards.
+    """
+    affected = _upstream_fields(conn, source_field_id)
+    conn.executemany(
+        "DELETE FROM lineage_impact_cache WHERE source_field_id = ?",
+        [(field_id,) for field_id in affected],
+    )
+    _bump_graph_revision(conn)
+
+
+def get_field_impact(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    field_name: str,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = conn.execute(
+        "SELECT id FROM schema_versions WHERE dataset_id = ? AND version = ?",
+        (dataset["id"], version_number),
+    ).fetchone()
+    if version_row is None:
+        raise NotFoundError(
+            f"Schema version {version_number} of dataset '{dataset_name}' does not exist"
+        )
+    field_row = conn.execute(
+        "SELECT id FROM schema_fields WHERE version_id = ? AND name = ?",
+        (version_row["id"], field_name),
+    ).fetchone()
+    if field_row is None:
+        raise NotFoundError(
+            f"Field '{field_name}' does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    source_field_id = field_row["id"]
+
+    revision = _graph_revision(conn)
+    cached = conn.execute(
+        "SELECT impacted, revision FROM lineage_impact_cache "
+        "WHERE source_field_id = ?",
+        (source_field_id,),
+    ).fetchone()
+    if cached is not None and cached["revision"] == revision:
+        impacted = json.loads(cached["impacted"])
+    else:
+        impacted = _reachable_downstream(_load_forward_edges(conn), source_field_id)
+        # INSERT OR REPLACE also refreshes an entry left behind by an older
+        # graph revision.
+        conn.execute(
+            "INSERT OR REPLACE INTO lineage_impact_cache "
+            "(source_field_id, impacted, revision, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                source_field_id,
+                json.dumps(impacted, ensure_ascii=False),
+                revision,
+                utc_now_iso(),
+            ),
+        )
+
+    return {
+        "source": {
+            "dataset": dataset["name"],
+            "version": version_number,
+            "field": field_name,
+        },
+        "impacted": impacted,
     }
 
 
