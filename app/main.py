@@ -19,6 +19,7 @@ from app.models import (
     DatasetCreate,
     LineageCreate,
     LineageCreatedResponse,
+    LineageImpactResponse,
     LineageResponse,
     PrivacyPolicy,
     PrivacyPolicyCreate,
@@ -203,6 +204,28 @@ def get_lineage(
 ) -> LineageResponse:
     return LineageResponse(
         **repository.get_lineage(conn, dataset_name, version)
+    )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/lineage/impact",
+    response_model=LineageImpactResponse,
+)
+def get_lineage_impact(
+    dataset_name: str,
+    version: int,
+    field: str | None = Query(default=None),
+    conn=Depends(get_db),
+) -> LineageImpactResponse:
+    if field is None or not field.strip():
+        raise RequestInvalidError(
+            "Query parameter 'field' is required and must be a non-empty "
+            "field name"
+        )
+    return LineageImpactResponse(
+        **repository.get_lineage_impact(
+            conn, dataset_name, version, field.strip()
+        )
     )
 
 

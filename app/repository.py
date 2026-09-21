@@ -129,6 +129,9 @@ def create_schema_version(
         "VALUES (?, ?, ?, ?, ?)",
         [(version_id, name, ftype, nullable, position) for name, ftype, nullable, position in validated],
     )
+    # A new version of this dataset may become part of future impact answers;
+    # drop every cached entry related to the dataset.
+    invalidate_impact_cache_for_dataset(conn, dataset_name)
     return get_schema_version(conn, dataset_name, next_version)
 
 
@@ -266,6 +269,11 @@ def create_lineage_link(
     except sqlite3.IntegrityError as exc:
         raise ConflictError("This field mapping has already been registered") from exc
 
+    # The new edge can only extend the impact of fields that reach its source.
+    _invalidate_impact_cache_for_upstream(
+        conn, source["name"], source_version, source_field, source_field_id
+    )
+
     return {
         "target_dataset": target["name"],
         "target_version": target_version,
@@ -330,6 +338,181 @@ def get_lineage(
             {"target_field": name, "sources": sources_by_target[name]}
             for name in sorted(sources_by_target)
         ],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Lineage impact queries (with persistent cache)
+# --------------------------------------------------------------------------- #
+
+
+def _lineage_forward_edges(
+    conn: sqlite3.Connection,
+) -> dict[int, list[tuple[int, dict]]]:
+    """Adjacency of the lineage graph: source field id -> target field refs."""
+    rows = conn.execute(
+        """
+        SELECT  ll.source_field_id AS source_field_id,
+                ll.target_field_id AS target_field_id,
+                td.name            AS target_dataset,
+                tv.version         AS target_version,
+                tf.name            AS target_field
+        FROM    lineage_links ll
+        JOIN    datasets td ON td.id = ll.target_dataset_id
+        JOIN    schema_versions tv ON tv.id = ll.target_version_id
+        JOIN    schema_fields tf ON tf.id = ll.target_field_id
+        """
+    ).fetchall()
+    edges: dict[int, list[tuple[int, dict]]] = {}
+    for row in rows:
+        ref = {
+            "dataset": row["target_dataset"],
+            "version": row["target_version"],
+            "field": row["target_field"],
+        }
+        edges.setdefault(row["source_field_id"], []).append(
+            (row["target_field_id"], ref)
+        )
+    return edges
+
+
+def _compute_impacted(conn: sqlite3.Connection, source_field_id: int) -> list[dict]:
+    """All fields reachable downstream of the source, deduplicated and sorted.
+
+    The source field id is seeded into the visited set, so cycles terminate
+    and the source itself never appears in the result.
+    """
+    edges = _lineage_forward_edges(conn)
+    visited = {source_field_id}
+    impacted: dict[tuple[str, int, str], dict] = {}
+    queue = [source_field_id]
+    while queue:
+        current = queue.pop()
+        for target_field_id, ref in edges.get(current, ()):
+            if target_field_id in visited:
+                continue
+            visited.add(target_field_id)
+            impacted[(ref["dataset"], ref["version"], ref["field"])] = ref
+            queue.append(target_field_id)
+    return [impacted[key] for key in sorted(impacted)]
+
+
+def _impact_cache_lookup(
+    conn: sqlite3.Connection, dataset: str, version: int, field: str
+) -> list[dict] | None:
+    row = conn.execute(
+        "SELECT impacted FROM lineage_impact_cache "
+        "WHERE source_dataset = ? AND source_version = ? AND source_field = ?",
+        (dataset, version, field),
+    ).fetchone()
+    return None if row is None else json.loads(row["impacted"])
+
+
+def _impact_cache_store(
+    conn: sqlite3.Connection,
+    dataset: str,
+    version: int,
+    field: str,
+    impacted: list[dict],
+) -> None:
+    conn.execute(
+        "DELETE FROM lineage_impact_cache "
+        "WHERE source_dataset = ? AND source_version = ? AND source_field = ?",
+        (dataset, version, field),
+    )
+    cursor = conn.execute(
+        "INSERT INTO lineage_impact_cache ("
+        "source_dataset, source_version, source_field, impacted, created_at"
+        ") VALUES (?, ?, ?, ?, ?)",
+        (dataset, version, field, json.dumps(impacted), utc_now_iso()),
+    )
+    cache_id = cursor.lastrowid
+    mentioned = {dataset} | {item["dataset"] for item in impacted}
+    conn.executemany(
+        "INSERT INTO lineage_impact_cache_datasets (cache_id, dataset) "
+        "VALUES (?, ?)",
+        [(cache_id, name) for name in sorted(mentioned)],
+    )
+
+
+def invalidate_impact_cache_for_dataset(
+    conn: sqlite3.Connection, dataset_name: str
+) -> None:
+    """Drop every cache entry that mentions the dataset in any role."""
+    conn.execute(
+        "DELETE FROM lineage_impact_cache WHERE id IN ("
+        "SELECT cache_id FROM lineage_impact_cache_datasets WHERE dataset = ?"
+        ")",
+        (dataset_name,),
+    )
+
+
+def _invalidate_impact_cache_for_upstream(
+    conn: sqlite3.Connection,
+    source_dataset: str,
+    source_version: int,
+    source_field: str,
+    source_field_id: int,
+) -> None:
+    """Invalidate cached impacts of the new link's source and its upstream.
+
+    A new mapping ``source -> target`` only changes the impact result of
+    fields that can reach ``source`` (``source`` itself included), so exactly
+    those cached entries are dropped; unrelated entries are kept. The reverse
+    walk runs after the link was inserted so cycles are covered too.
+    """
+    rows = conn.execute(
+        """
+        SELECT  ll.target_field_id AS target_field_id,
+                ll.source_field_id AS source_field_id,
+                sd.name            AS source_dataset,
+                sv.version         AS source_version,
+                sf.name            AS source_field
+        FROM    lineage_links ll
+        JOIN    datasets sd ON sd.id = ll.source_dataset_id
+        JOIN    schema_versions sv ON sv.id = ll.source_version_id
+        JOIN    schema_fields sf ON sf.id = ll.source_field_id
+        """
+    ).fetchall()
+    reverse: dict[int, list[sqlite3.Row]] = {}
+    for row in rows:
+        reverse.setdefault(row["target_field_id"], []).append(row)
+
+    visited = {source_field_id}
+    upstream = {(source_dataset, source_version, source_field)}
+    queue = [source_field_id]
+    while queue:
+        current = queue.pop()
+        for row in reverse.get(current, ()):
+            if row["source_field_id"] in visited:
+                continue
+            visited.add(row["source_field_id"])
+            upstream.add(
+                (row["source_dataset"], row["source_version"], row["source_field"])
+            )
+            queue.append(row["source_field_id"])
+
+    conn.executemany(
+        "DELETE FROM lineage_impact_cache "
+        "WHERE source_dataset = ? AND source_version = ? AND source_field = ?",
+        sorted(upstream),
+    )
+
+
+def get_lineage_impact(
+    conn: sqlite3.Connection, dataset_name: str, version: int, field: str
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    _, field_id = _require_field(conn, dataset, version, field, role="Source")
+
+    impacted = _impact_cache_lookup(conn, dataset["name"], version, field)
+    if impacted is None:
+        impacted = _compute_impacted(conn, field_id)
+        _impact_cache_store(conn, dataset["name"], version, field, impacted)
+
+    return {
+        "source": {"dataset": dataset["name"], "version": version, "field": field},
+        "impacted": impacted,
     }
 
 

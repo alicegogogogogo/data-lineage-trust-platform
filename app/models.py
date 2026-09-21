@@ -78,6 +78,11 @@ class LineageResponse(BaseModel):
     fields: list[TargetFieldLineage]
 
 
+class LineageImpactResponse(BaseModel):
+    source: LineageSourceRef
+    impacted: list[LineageSourceRef]
+
+
 # --------------------------------------------------------------------------- #
 # Quality rules
 # --------------------------------------------------------------------------- #

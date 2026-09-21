@@ -136,6 +136,29 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (run_id, sequence)
     )
     """,
+    # Persistent cache of field-impact query results, keyed by the source
+    # field. Entries are invalidated whenever a committed write could change
+    # what is reachable from the cached source (see app.repository).
+    """
+    CREATE TABLE IF NOT EXISTS lineage_impact_cache (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_dataset TEXT NOT NULL,
+        source_version INTEGER NOT NULL,
+        source_field   TEXT NOT NULL,
+        impacted       TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        UNIQUE (source_dataset, source_version, source_field)
+    )
+    """,
+    # Datasets mentioned by each cache entry (as source or inside the impacted
+    # result) so that per-dataset invalidation stays a simple indexed delete.
+    """
+    CREATE TABLE IF NOT EXISTS lineage_impact_cache_datasets (
+        cache_id INTEGER NOT NULL
+                 REFERENCES lineage_impact_cache(id) ON DELETE CASCADE,
+        dataset  TEXT NOT NULL
+    )
+    """,
     # Audit records are an append-only proof chain: the database itself refuses
     # updates and deletes so the evidence history cannot be rewritten.
     """
