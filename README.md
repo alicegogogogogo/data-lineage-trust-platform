@@ -148,3 +148,38 @@ data. Policies (including their enabled state) are persisted across restarts.
     `"***"`.
   - `null` values and fields without a policy are returned unchanged; rows
     missing a covered field are left without it.
+
+### Row snapshots
+
+A row snapshot is an immutable, persisted multiset of row objects captured for a
+specific schema version. Snapshots survive restarts and are identified by a
+globally unique `id`.
+
+- `POST /datasets/{dataset}/versions/{version}/snapshots` — create a snapshot.
+  Body: `{"rows": [{...}, ...]}` where `rows` is an array of JSON objects (it
+  may be empty). The submitted JSON values are deep-copied and stored together
+  with their original row order. Returns `201` with `id`, `dataset`, `version`,
+  `created_at` and `row_count`. Unknown dataset/version → `404`; a missing
+  `rows` key or non-object elements → `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/snapshots` — list snapshot
+  metadata (no `rows`) sorted by `id` ascending. Unknown dataset/version →
+  `404`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}` — return
+  the metadata together with the saved `rows` in their original order. Unknown
+  dataset/version/snapshot → `404`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/at?timestamp=<ISO-8601>`
+  — return the newest snapshot of the version whose `created_at` is not later
+  than `timestamp` (the boundary is inclusive), together with its `rows`. The
+  timestamp must be an ISO-8601 date-time **with a timezone offset** (e.g.
+  `2030-01-01T00:00:00Z` or `2030-01-01T02:00:00+02:00`); a missing,
+  unparseable or timezone-naive timestamp → `422`. Unknown dataset/version →
+  `404`; no snapshot at or before the timestamp → `404`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/diff/{other_snapshot_id}`
+  — compare two snapshots as JSON-object multisets. Both snapshots must belong
+  to the same dataset and version, otherwise `422`; an unknown snapshot →
+  `404`. Object key order does not affect equality, while array order and value
+  types do (e.g. `1`, `true` and `"1"` are distinct, as are `[1, 2]` and
+  `[2, 1]`). Duplicate rows count with multiplicity. Returns
+  `{"from_snapshot_id", "to_snapshot_id", "added", "removed"}`; each entry of
+  `added`/`removed` is `{"row": {...}, "count": <positive int>}` and the lists
+  are sorted by canonical JSON text (object keys sorted, compact separators).

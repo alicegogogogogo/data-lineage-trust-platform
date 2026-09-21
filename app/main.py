@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -29,6 +30,10 @@ from app.models import (
     QualityRuleEvaluateResponse,
     SchemaVersion,
     SchemaVersionCreate,
+    SnapshotCreate,
+    SnapshotDiffResponse,
+    SnapshotMeta,
+    SnapshotResponse,
 )
 
 app = FastAPI(title="Data Lineage Trust Platform", version="0.1.0")
@@ -341,5 +346,105 @@ def view_privacy_rows(
     return PrivacyViewResponse(
         **repository.view_privacy_rows(
             conn, dataset_name, version, payload.role, payload.rows
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Row snapshots
+# --------------------------------------------------------------------------- #
+
+
+@app.post(
+    "/datasets/{dataset_name}/versions/{version}/snapshots",
+    response_model=SnapshotMeta,
+    status_code=201,
+)
+def create_snapshot(
+    dataset_name: str,
+    version: int,
+    payload: SnapshotCreate,
+    conn=Depends(get_db),
+) -> SnapshotMeta:
+    return SnapshotMeta(
+        **repository.create_snapshot(conn, dataset_name, version, payload.rows)
+    )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/snapshots",
+    response_model=list[SnapshotMeta],
+)
+def list_snapshots(
+    dataset_name: str, version: int, conn=Depends(get_db)
+) -> list[SnapshotMeta]:
+    return [
+        SnapshotMeta(**snapshot)
+        for snapshot in repository.list_snapshots(conn, dataset_name, version)
+    ]
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/snapshots/at",
+    response_model=SnapshotResponse,
+)
+def get_snapshot_at(
+    dataset_name: str,
+    version: int,
+    timestamp: str | None = None,
+    conn=Depends(get_db),
+) -> SnapshotResponse:
+    if timestamp is None:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' is required and must be an ISO-8601 "
+            "date-time with a timezone offset"
+        )
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except (ValueError, TypeError):
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must be an ISO-8601 date-time with a "
+            "timezone offset"
+        )
+    if parsed.tzinfo is None:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must include a timezone offset"
+        )
+    return SnapshotResponse(
+        **repository.get_snapshot_at(conn, dataset_name, version, parsed)
+    )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/snapshots/{snapshot_id}",
+    response_model=SnapshotResponse,
+)
+def get_snapshot(
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    conn=Depends(get_db),
+) -> SnapshotResponse:
+    return SnapshotResponse(
+        **repository.get_snapshot(
+            conn, dataset_name, version, snapshot_id
+        )
+    )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/snapshots/{snapshot_id}/diff/{other_snapshot_id}",
+    response_model=SnapshotDiffResponse,
+)
+def diff_snapshots(
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    other_snapshot_id: int,
+    conn=Depends(get_db),
+) -> SnapshotDiffResponse:
+    return SnapshotDiffResponse(
+        **repository.diff_snapshots(
+            conn, dataset_name, version, snapshot_id, other_snapshot_id
         )
     )

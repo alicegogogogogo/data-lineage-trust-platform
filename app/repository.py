@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -795,4 +796,203 @@ def view_privacy_rows(
         "dataset": dataset["name"],
         "version": version_row["version"],
         "rows": masked_rows,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Row snapshots
+# --------------------------------------------------------------------------- #
+
+
+def create_snapshot(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    rows: list[dict[str, Any]],
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    # Serialize the submitted rows: the persisted JSON text is a detached deep
+    # copy of the request values and preserves their original order.
+    rows_text = json.dumps(rows)
+    created_at = utc_now_iso()
+    cursor = conn.execute(
+        "INSERT INTO row_snapshots (version_id, rows, row_count, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (version_row["id"], rows_text, len(rows), created_at),
+    )
+    return {
+        "id": cursor.lastrowid,
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "created_at": created_at,
+        "row_count": len(rows),
+    }
+
+
+def list_snapshots(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int
+) -> list[dict]:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    rows = conn.execute(
+        "SELECT id, created_at, row_count FROM row_snapshots "
+        "WHERE version_id = ? ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "dataset": dataset["name"],
+            "version": version_row["version"],
+            "created_at": row["created_at"],
+            "row_count": row["row_count"],
+        }
+        for row in rows
+    ]
+
+
+def _get_snapshot_record(
+    conn: sqlite3.Connection,
+    dataset: dict,
+    version_row: sqlite3.Row,
+    snapshot_id: int,
+) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT id, rows, row_count, created_at FROM row_snapshots "
+        "WHERE version_id = ? AND id = ?",
+        (version_row["id"], snapshot_id),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{version_row['version']} of dataset '{dataset['name']}'"
+        )
+    return row
+
+
+def get_snapshot(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    record = _get_snapshot_record(conn, dataset, version_row, snapshot_id)
+    return {
+        "id": record["id"],
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "created_at": record["created_at"],
+        "row_count": record["row_count"],
+        "rows": json.loads(record["rows"]),
+    }
+
+
+def get_snapshot_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    timestamp: datetime,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    # Stored timestamps are timezone-aware UTC ISO strings; compare on the
+    # instant they denote rather than on raw text. Scan metadata only and load
+    # the row payload of the chosen snapshot afterwards.
+    point = timestamp.astimezone(timezone.utc)
+    records = conn.execute(
+        "SELECT id, created_at FROM row_snapshots "
+        "WHERE version_id = ? ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+
+    latest_id: int | None = None
+    latest_dt: datetime | None = None
+    for record in records:
+        created_at = datetime.fromisoformat(record["created_at"])
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at <= point and (latest_dt is None or created_at >= latest_dt):
+            latest_id = record["id"]
+            latest_dt = created_at
+
+    if latest_id is None:
+        raise NotFoundError(
+            f"No snapshot of version {version_row['version']} of dataset "
+            f"'{dataset['name']}' exists at or before the requested timestamp"
+        )
+
+    record = _get_snapshot_record(conn, dataset, version_row, latest_id)
+    return {
+        "id": record["id"],
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "created_at": record["created_at"],
+        "row_count": record["row_count"],
+        "rows": json.loads(record["rows"]),
+    }
+
+
+def _normalized_row_key(row: Any) -> str:
+    # Objects compare regardless of key order; array order and value types are
+    # preserved by the JSON encoding itself.
+    return json.dumps(row, sort_keys=True, separators=(",", ":"))
+
+
+def diff_snapshots(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    from_snapshot_id: int,
+    to_snapshot_id: int,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    from_record = _get_snapshot_record(conn, dataset, version_row, from_snapshot_id)
+
+    # The other snapshot is referenced by bare id: an unknown id is a 404, while
+    # an existing snapshot of another dataset/version is a 422.
+    to_record = conn.execute(
+        "SELECT version_id, rows FROM row_snapshots WHERE id = ?",
+        (to_snapshot_id,),
+    ).fetchone()
+    if to_record is None:
+        raise NotFoundError(f"Snapshot {to_snapshot_id} does not exist")
+    if to_record["version_id"] != version_row["id"]:
+        raise RequestInvalidError(
+            "Snapshots can only be diffed when they belong to the same dataset "
+            "and schema version"
+        )
+
+    from_rows = json.loads(from_record["rows"])
+    to_rows = json.loads(to_record["rows"])
+
+    from_counts = Counter(_normalized_row_key(row) for row in from_rows)
+    to_counts = Counter(_normalized_row_key(row) for row in to_rows)
+
+    added_items: list[dict] = []
+    for key, to_count in to_counts.items():
+        delta = to_count - from_counts.get(key, 0)
+        if delta > 0:
+            added_items.append({"row": json.loads(key), "count": delta})
+
+    removed_items: list[dict] = []
+    for key, from_count in from_counts.items():
+        delta = from_count - to_counts.get(key, 0)
+        if delta > 0:
+            removed_items.append({"row": json.loads(key), "count": delta})
+
+    added_items.sort(key=lambda item: _normalized_row_key(item["row"]))
+    removed_items.sort(key=lambda item: _normalized_row_key(item["row"]))
+
+    return {
+        "from_snapshot_id": from_snapshot_id,
+        "to_snapshot_id": to_snapshot_id,
+        "added": added_items,
+        "removed": removed_items,
     }

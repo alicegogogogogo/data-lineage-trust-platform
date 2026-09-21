@@ -86,6 +86,14 @@ ok(client.patch(
     f"{paused_policy.json()['id']}",
     json={"enabled": False},
 ))
+snapshot = client.post(
+    "/datasets/target_ds/versions/1/snapshots",
+    json={"rows": [
+        {"tid": 1, "label": "a"},
+        {"tid": 2, "label": "b", "nested": [1, 2, {"k": True}]},
+    ]},
+)
+assert snapshot.status_code == 201, snapshot.text
 print("created")
 """
 
@@ -187,6 +195,53 @@ auditor_view = client.post(
 )
 assert auditor_view.status_code == 200, auditor_view.text
 assert auditor_view.json()["rows"] == [{"tid": 42, "label": "secret-label"}]
+
+# Snapshots and their rows survive the restart.
+snapshots = client.get("/datasets/target_ds/versions/1/snapshots")
+assert snapshots.status_code == 200, snapshots.text
+snapshot_list = snapshots.json()
+assert len(snapshot_list) == 1
+snapshot_meta = snapshot_list[0]
+assert snapshot_meta["dataset"] == "target_ds"
+assert snapshot_meta["version"] == 1
+assert snapshot_meta["row_count"] == 2
+assert "rows" not in snapshot_meta
+
+stored = client.get(
+    f"/datasets/target_ds/versions/1/snapshots/{snapshot_meta['id']}"
+)
+assert stored.status_code == 200, stored.text
+assert stored.json()["rows"] == [
+    {"tid": 1, "label": "a"},
+    {"tid": 2, "label": "b", "nested": [1, 2, {"k": True}]},
+]
+
+at = client.get(
+    "/datasets/target_ds/versions/1/snapshots/at",
+    params={"timestamp": "2030-01-01T00:00:00+00:00"},
+)
+assert at.status_code == 200, at.text
+assert at.json()["id"] == snapshot_meta["id"]
+assert at.json()["rows"][0]["label"] == "a"
+
+# A second snapshot after restart and a cross-snapshot diff also work.
+later = client.post(
+    "/datasets/target_ds/versions/1/snapshots",
+    json={"rows": [{"tid": 1, "label": "a"}, {"tid": 3, "label": "c"}]},
+)
+assert later.status_code == 201, later.text
+diff = client.get(
+    f"/datasets/target_ds/versions/1/snapshots/{snapshot_meta['id']}"
+    f"/diff/{later.json()['id']}"
+)
+assert diff.status_code == 200, diff.text
+diff_body = diff.json()
+assert diff_body["from_snapshot_id"] == snapshot_meta["id"]
+assert diff_body["to_snapshot_id"] == later.json()["id"]
+assert diff_body["added"] == [{"row": {"tid": 3, "label": "c"}, "count": 1}]
+assert diff_body["removed"] == [
+    {"row": {"tid": 2, "label": "b", "nested": [1, 2, {"k": True}]}, "count": 1}
+]
 print(json.dumps({"dataset_id": by_name["target_ds"]["id"]}))
 """
 

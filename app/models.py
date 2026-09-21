@@ -183,3 +183,38 @@ class PrivacyViewResponse(BaseModel):
     dataset: str
     version: int
     rows: list[dict[str, Any]]
+
+
+# --------------------------------------------------------------------------- #
+# Row snapshots
+# --------------------------------------------------------------------------- #
+
+
+class SnapshotCreate(BaseModel):
+    rows: list[dict[str, Any]] = Field(
+        description="Row objects to persist as an immutable snapshot"
+    )
+
+
+class SnapshotMeta(BaseModel):
+    id: int
+    dataset: str
+    version: int
+    created_at: str
+    row_count: int
+
+
+class SnapshotResponse(SnapshotMeta):
+    rows: list[dict[str, Any]]
+
+
+class SnapshotDiffEntry(BaseModel):
+    row: dict[str, Any]
+    count: int
+
+
+class SnapshotDiffResponse(BaseModel):
+    from_snapshot_id: int
+    to_snapshot_id: int
+    added: list[SnapshotDiffEntry]
+    removed: list[SnapshotDiffEntry]
