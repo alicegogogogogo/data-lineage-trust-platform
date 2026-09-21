@@ -79,3 +79,38 @@ schema version in a different (source) dataset.
   field (including fields without sources) together with its source references.
   Results are sorted by target field name, then source dataset name, source
   version and source field name.
+
+### Quality rules
+
+Quality rules validate rows of data against a schema version. Rules (and their
+enabled/disabled state) are persisted and survive restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/quality-rules` — create a rule.
+  Body: `{"name": "id-present", "kind": "not_null", "parameters": {"field": "id"}}`.
+  Returns `201` with `id`, `name`, `kind`, `parameters`, `enabled` (defaults to
+  `true`) and `created_at`. Rule names are unique within a version (`409`).
+  Supported kinds:
+  - `not_null` — parameters `{"field": "<existing field>"}`.
+  - `numeric_range` — parameters `{"field": "<existing field>", "min": 0, "max": 100}`;
+    `min`/`max` must be finite numbers with `min <= max`.
+  - `unique` — parameters `{"fields": ["a", "b"]}`, a non-empty list of
+    distinct, existing field names.
+
+  Unknown dataset, version or referenced field → `404`; any other semantic
+  problem (empty name, unknown kind, bad parameters) → `422`, and nothing is
+  written.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules` — list rules for
+  the version, sorted by `id`.
+- `PATCH /datasets/{dataset}/versions/{version}/quality-rules/{rule_id}` —
+  body `{"enabled": false}`; only the boolean `enabled` field is accepted.
+  Returns the updated rule. Unknown rule → `404`.
+- `POST /datasets/{dataset}/versions/{version}/quality-rules/evaluate` — body
+  `{"rows": [{...}, {...}]}`. Only enabled rules run. Returns `dataset`,
+  `version` and `results` sorted by `rule_id`; each result has `rule_id`,
+  `name`, `passed` and `violations` (ascending, zero-based row indices). An
+  empty `rows` array passes every rule.
+  - `not_null` fails on missing or `null` values.
+  - `numeric_range` fails on missing, `null`, non-numeric, boolean or
+    out-of-range values.
+  - `unique` compares the combination of the named fields; missing fields
+    count as `null`.

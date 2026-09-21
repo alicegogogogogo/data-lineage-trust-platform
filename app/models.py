@@ -1,8 +1,10 @@
-"""Pydantic models for the dataset, schema-version and lineage APIs."""
+"""Pydantic models for the dataset, schema-version, lineage and quality-rule APIs."""
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 
 class DatasetCreate(BaseModel):
@@ -79,3 +81,48 @@ class LineageResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Quality rules
+# --------------------------------------------------------------------------- #
+
+
+class QualityRuleCreate(BaseModel):
+    name: str = Field(description="Unique, non-empty rule name within the version")
+    kind: str = Field(description="One of not_null, numeric_range, unique")
+    parameters: dict[str, Any] = Field(
+        default_factory=dict, description="Kind-specific rule parameters"
+    )
+
+
+class QualityRule(BaseModel):
+    id: int
+    name: str
+    kind: str
+    parameters: dict[str, Any]
+    enabled: bool
+    created_at: str
+
+
+class QualityRuleUpdate(BaseModel):
+    enabled: StrictBool
+
+
+class QualityEvaluateRequest(BaseModel):
+    rows: list[dict[str, Any]] = Field(
+        description="Row objects to evaluate against the enabled rules"
+    )
+
+
+class QualityEvaluationItem(BaseModel):
+    rule_id: int
+    name: str
+    passed: bool
+    violations: list[int]
+
+
+class QualityEvaluationResponse(BaseModel):
+    dataset: str
+    version: int
+    results: list[QualityEvaluationItem]

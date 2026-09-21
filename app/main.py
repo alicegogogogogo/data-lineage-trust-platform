@@ -17,6 +17,11 @@ from app.models import (
     LineageCreate,
     LineageCreatedResponse,
     LineageResponse,
+    QualityEvaluateRequest,
+    QualityEvaluationResponse,
+    QualityRule,
+    QualityRuleCreate,
+    QualityRuleUpdate,
     SchemaVersion,
     SchemaVersionCreate,
 )
@@ -182,3 +187,71 @@ def get_lineage(
     return LineageResponse(
         **repository.get_lineage(conn, dataset_name, version)
     )
+
+
+# --------------------------------------------------------------------------- #
+# Quality rules
+# --------------------------------------------------------------------------- #
+
+
+@app.post(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules",
+    response_model=QualityRule,
+    status_code=201,
+)
+def create_quality_rule(
+    dataset_name: str,
+    version: int,
+    payload: QualityRuleCreate,
+    conn=Depends(get_db),
+) -> QualityRule:
+    created = repository.create_quality_rule(
+        conn, dataset_name, version, payload.name, payload.kind, payload.parameters
+    )
+    return QualityRule(**created)
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules",
+    response_model=list[QualityRule],
+)
+def list_quality_rules(
+    dataset_name: str, version: int, conn=Depends(get_db)
+) -> list[QualityRule]:
+    return [
+        QualityRule(**rule)
+        for rule in repository.list_quality_rules(conn, dataset_name, version)
+    ]
+
+
+@app.patch(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/{rule_id}",
+    response_model=QualityRule,
+)
+def update_quality_rule(
+    dataset_name: str,
+    version: int,
+    rule_id: int,
+    payload: QualityRuleUpdate,
+    conn=Depends(get_db),
+) -> QualityRule:
+    updated = repository.set_quality_rule_enabled(
+        conn, dataset_name, version, rule_id, payload.enabled
+    )
+    return QualityRule(**updated)
+
+
+@app.post(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/evaluate",
+    response_model=QualityEvaluationResponse,
+)
+def evaluate_quality_rules(
+    dataset_name: str,
+    version: int,
+    payload: QualityEvaluateRequest,
+    conn=Depends(get_db),
+) -> QualityEvaluationResponse:
+    evaluated = repository.evaluate_quality_rules(
+        conn, dataset_name, version, payload.rows
+    )
+    return QualityEvaluationResponse(**evaluated)
