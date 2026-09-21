@@ -36,9 +36,14 @@ from app.models import (
     QualityRuleEnabledUpdate,
     QualityRuleEvaluateRequest,
     QualityRuleEvaluateResponse,
+    RetentionPolicy,
+    RetentionPolicyCreate,
     SchemaVersion,
     SchemaVersionCreate,
     SnapshotCreate,
+    SnapshotDeletionConfirmation,
+    SnapshotDeletionRequest,
+    SnapshotDeletionRequestCreate,
     SnapshotDiffResponse,
     SnapshotMetadata,
     SnapshotResponse,
@@ -450,6 +455,85 @@ def diff_snapshots(
     return SnapshotDiffResponse(
         **repository.diff_snapshots(
             conn, dataset_name, version, snapshot_id, other_snapshot_id
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Retention policies and lineage-aware snapshot deletion
+# --------------------------------------------------------------------------- #
+
+
+RETENTION_POLICIES_PATH = (
+    "/datasets/{dataset_name}/versions/{version}/retention-policies"
+)
+
+
+@app.post(RETENTION_POLICIES_PATH, response_model=RetentionPolicy, status_code=201)
+def create_retention_policy(
+    dataset_name: str,
+    version: int,
+    payload: RetentionPolicyCreate,
+    conn=Depends(get_db),
+) -> RetentionPolicy:
+    return RetentionPolicy(
+        **repository.create_retention_policy(
+            conn, dataset_name, version, payload.retention_days
+        )
+    )
+
+
+DELETION_REQUESTS_PATH = f"{SNAPSHOTS_PATH}/{{snapshot_id}}/deletion-requests"
+
+
+@app.post(
+    DELETION_REQUESTS_PATH,
+    response_model=SnapshotDeletionRequest,
+    status_code=201,
+)
+def create_deletion_request(
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    payload: SnapshotDeletionRequestCreate,
+    conn=Depends(get_db),
+) -> SnapshotDeletionRequest:
+    return SnapshotDeletionRequest(
+        **repository.create_deletion_request(
+            conn, dataset_name, version, snapshot_id, payload.reason
+        )
+    )
+
+
+@app.get(DELETION_REQUESTS_PATH, response_model=list[SnapshotDeletionRequest])
+def list_deletion_requests(
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    conn=Depends(get_db),
+) -> list[SnapshotDeletionRequest]:
+    return [
+        SnapshotDeletionRequest(**request)
+        for request in repository.list_deletion_requests(
+            conn, dataset_name, version, snapshot_id
+        )
+    ]
+
+
+@app.post(
+    f"{DELETION_REQUESTS_PATH}/{{request_id}}/confirm",
+    response_model=SnapshotDeletionConfirmation,
+)
+def confirm_deletion_request(
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    request_id: int,
+    conn=Depends(get_db),
+) -> SnapshotDeletionConfirmation:
+    return SnapshotDeletionConfirmation(
+        **repository.confirm_deletion_request(
+            conn, dataset_name, version, snapshot_id, request_id
         )
     )
 

@@ -159,6 +159,41 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         dataset  TEXT NOT NULL
     )
     """,
+    # One retention policy per schema version. Deletion requests reference both
+    # the version's policy and the snapshot they target; both are kept
+    # (ON DELETE RESTRICT) so the audit trail of a request stays interpretable
+    # after the snapshot it confirmed has been deleted.
+    """
+    CREATE TABLE IF NOT EXISTS retention_policies (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id     INTEGER NOT NULL
+                       REFERENCES schema_versions(id) ON DELETE CASCADE,
+        retention_days INTEGER NOT NULL CHECK (retention_days >= 0),
+        created_at     TEXT NOT NULL,
+        UNIQUE (version_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS snapshot_deletion_requests (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id  INTEGER NOT NULL,
+        policy_id    INTEGER NOT NULL
+                     REFERENCES retention_policies(id) ON DELETE RESTRICT,
+        reason       TEXT NOT NULL,
+        status       TEXT NOT NULL
+                     CHECK (status IN ('pending', 'blocked', 'confirmed')),
+        impacted     TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        confirmed_at TEXT
+    )
+    """,
+    # Only one open request (pending or blocked) per snapshot; a confirmed
+    # request does not block a later request for the same snapshot.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_deletion_requests_open_snapshot
+    ON snapshot_deletion_requests (snapshot_id)
+    WHERE status IN ('pending', 'blocked')
+    """,
     # Audit records are an append-only proof chain: the database itself refuses
     # updates and deletes so the evidence history cannot be rewritten.
     """

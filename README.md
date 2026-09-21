@@ -198,6 +198,43 @@ time. Snapshots (including their rows) survive restarts.
   converse, each entry being `{"row": {...}, "count": <int>}` sorted by the
   canonical (key-sorted) JSON text of `row`.
 
+### Retention policies and lineage-aware snapshot deletion
+
+A retention policy gives a schema version a minimum snapshot age; deletion
+requests provide a lineage-aware, auditable workflow for removing a snapshot
+once it ages out. Policies and requests are persisted across restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/retention-policies` — create the
+  version's single policy. Body: `{"retention_days": 30}` where
+  `retention_days` is a non-negative integer. Returns `201` with `id`,
+  `dataset`, `version`, `retention_days`, `created_at`. Creating a second
+  policy for the same version returns `409`; unknown dataset/version → `404`;
+  any other invalid body → `422` and nothing is written.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/deletion-requests` —
+  request deletion of one snapshot. Body contains only a non-empty `reason`
+  string. The snapshot and the version's retention policy must both exist
+  (`404` otherwise). Lineage impact is computed from the **fields of the
+  snapshot's schema version**: every field directly or indirectly downstream
+  (along lineage mappings, cycles terminating) is collected, deduplicated and
+  sorted by `dataset`, `version`, `field` ascending. The request is `blocked`
+  when that list is non-empty and `pending` otherwise. Returns `201` with
+  `id`, `snapshot_id`, `policy_id`, `reason`, `status`, `impacted`,
+  `created_at`. Submitting another request while the snapshot already has a
+  `pending` or `blocked` request returns `409`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/deletion-requests` —
+  list the snapshot's requests sorted by `id` ascending. Unknown
+  dataset/version/snapshot → `404`; a snapshot without a policy (and hence
+  without requests) lists as `[]`.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/deletion-requests/{request_id}/confirm` —
+  takes no body. A request can only be confirmed while it is `pending` **and**
+  the snapshot's age has reached the policy's `retention_days`; otherwise the
+  response is `409` and the snapshot is left untouched (a `blocked` request can
+  never be confirmed). On success the snapshot is deleted atomically with the
+  status change: the request becomes `confirmed`, gains `confirmed_at` and the
+  deleted snapshot no longer appears in snapshot reads, listings, `at` lookups
+  or diffs (which then return `404` for it). A request id unknown under the
+  path snapshot → `404`; unknown dataset/version/snapshot → `404`.
+
 ### Processing tasks
 
 A processing task is a named unit of work attached to a schema version; each
