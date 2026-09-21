@@ -608,3 +608,191 @@ def evaluate_quality_rules(
         "version": version_row["version"],
         "results": results,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Privacy policies
+# --------------------------------------------------------------------------- #
+
+
+REDACTED = "***"
+
+
+def _policy_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "field": row["field"],
+        "classification": row["classification"],
+        "masking": row["masking"],
+        "allowed_roles": json.loads(row["allowed_roles"]),
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _clean_allowed_roles(roles: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for role in roles:
+        clean_role = role.strip()
+        if not clean_role:
+            raise RequestInvalidError(
+                "'allowed_roles' must not contain empty role names"
+            )
+        if clean_role in seen:
+            raise RequestInvalidError(
+                f"Role '{clean_role}' is listed more than once in 'allowed_roles'"
+            )
+        seen.add(clean_role)
+        cleaned.append(clean_role)
+    return cleaned
+
+
+def create_privacy_policy(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    field: str,
+    classification: str,
+    masking: str,
+    allowed_roles: list[str],
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    clean_field = field.strip()
+    if not clean_field:
+        raise RequestInvalidError("Field name must not be empty")
+
+    clean_classification = classification.strip()
+    if not clean_classification:
+        raise RequestInvalidError("Classification must not be empty")
+
+    roles = _clean_allowed_roles(allowed_roles)
+
+    field_names = _version_field_names(conn, version_row["id"])
+    if clean_field not in field_names:
+        raise NotFoundError(
+            f"Field '{clean_field}' does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO privacy_policies ("
+            "version_id, field, classification, masking, allowed_roles, "
+            "enabled, created_at"
+            ") VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (
+                version_row["id"],
+                clean_field,
+                clean_classification,
+                masking,
+                json.dumps(roles),
+                utc_now_iso(),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ConflictError(
+            f"A privacy policy for field '{clean_field}' already exists for "
+            f"version {version_number} of dataset '{dataset_name}'"
+        ) from exc
+
+    row = conn.execute(
+        "SELECT id, field, classification, masking, allowed_roles, enabled, created_at "
+        "FROM privacy_policies WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _policy_row_to_dict(row)
+
+
+def list_privacy_policies(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int
+) -> list[dict]:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    rows = conn.execute(
+        "SELECT id, field, classification, masking, allowed_roles, enabled, created_at "
+        "FROM privacy_policies WHERE version_id = ? ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+    return [_policy_row_to_dict(row) for row in rows]
+
+
+def set_privacy_policy_enabled(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    policy_id: int,
+    enabled: bool,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    row = conn.execute(
+        "SELECT id, field, classification, masking, allowed_roles, enabled, created_at "
+        "FROM privacy_policies WHERE version_id = ? AND id = ?",
+        (version_row["id"], policy_id),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"Privacy policy {policy_id} does not exist in this version")
+
+    conn.execute(
+        "UPDATE privacy_policies SET enabled = ? WHERE id = ?",
+        (1 if enabled else 0, row["id"]),
+    )
+    updated = conn.execute(
+        "SELECT id, field, classification, masking, allowed_roles, enabled, created_at "
+        "FROM privacy_policies WHERE id = ?",
+        (row["id"],),
+    ).fetchone()
+    return _policy_row_to_dict(updated)
+
+
+def _mask_value(value: Any, masking: str) -> Any:
+    if value is None:
+        return None
+    if masking == "partial" and isinstance(value, str) and len(value) > 4:
+        return value[0] + value[-2:]
+    return REDACTED
+
+
+def view_privacy_rows(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    role: str,
+    rows: list[dict[str, Any]],
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    clean_role = role.strip()
+    if not clean_role:
+        raise RequestInvalidError("Role must not be empty")
+
+    policy_rows = conn.execute(
+        "SELECT field, masking, allowed_roles FROM privacy_policies "
+        "WHERE version_id = ? AND enabled = 1",
+        (version_row["id"],),
+    ).fetchall()
+
+    policies: dict[str, tuple[str, set[str]]] = {
+        row["field"]: (row["masking"], set(json.loads(row["allowed_roles"])))
+        for row in policy_rows
+    }
+
+    masked_rows: list[dict[str, Any]] = []
+    for row in rows:
+        masked_row = dict(row)
+        for field, (masking, allowed_roles) in policies.items():
+            if field in masked_row and clean_role not in allowed_roles:
+                masked_row[field] = _mask_value(masked_row[field], masking)
+        masked_rows.append(masked_row)
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "rows": masked_rows,
+    }

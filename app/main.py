@@ -17,6 +17,11 @@ from app.models import (
     LineageCreate,
     LineageCreatedResponse,
     LineageResponse,
+    PrivacyPolicy,
+    PrivacyPolicyCreate,
+    PrivacyPolicyEnabledUpdate,
+    PrivacyViewRequest,
+    PrivacyViewResponse,
     QualityRule,
     QualityRuleCreate,
     QualityRuleEnabledUpdate,
@@ -260,5 +265,81 @@ def evaluate_quality_rules(
     return QualityRuleEvaluateResponse(
         **repository.evaluate_quality_rules(
             conn, dataset_name, version, payload.rows
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Privacy policies
+# --------------------------------------------------------------------------- #
+
+
+@app.post(
+    "/datasets/{dataset_name}/versions/{version}/privacy-policies",
+    response_model=PrivacyPolicy,
+    status_code=201,
+)
+def create_privacy_policy(
+    dataset_name: str,
+    version: int,
+    payload: PrivacyPolicyCreate,
+    conn=Depends(get_db),
+) -> PrivacyPolicy:
+    policy = repository.create_privacy_policy(
+        conn,
+        dataset_name,
+        version,
+        payload.field,
+        payload.classification,
+        payload.masking,
+        payload.allowed_roles,
+    )
+    return PrivacyPolicy(**policy)
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/privacy-policies",
+    response_model=list[PrivacyPolicy],
+)
+def list_privacy_policies(
+    dataset_name: str, version: int, conn=Depends(get_db)
+) -> list[PrivacyPolicy]:
+    return [
+        PrivacyPolicy(**policy)
+        for policy in repository.list_privacy_policies(conn, dataset_name, version)
+    ]
+
+
+@app.patch(
+    "/datasets/{dataset_name}/versions/{version}/privacy-policies/{policy_id}",
+    response_model=PrivacyPolicy,
+)
+def patch_privacy_policy(
+    dataset_name: str,
+    version: int,
+    policy_id: int,
+    payload: PrivacyPolicyEnabledUpdate,
+    conn=Depends(get_db),
+) -> PrivacyPolicy:
+    return PrivacyPolicy(
+        **repository.set_privacy_policy_enabled(
+            conn, dataset_name, version, policy_id, payload.enabled
+        )
+    )
+
+
+@app.post(
+    "/datasets/{dataset_name}/versions/{version}/privacy-policies/view",
+    response_model=PrivacyViewResponse,
+)
+def view_privacy_rows(
+    dataset_name: str,
+    version: int,
+    payload: PrivacyViewRequest,
+    conn=Depends(get_db),
+) -> PrivacyViewResponse:
+    return PrivacyViewResponse(
+        **repository.view_privacy_rows(
+            conn, dataset_name, version, payload.role, payload.rows
         )
     )

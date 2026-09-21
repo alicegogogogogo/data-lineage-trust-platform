@@ -113,3 +113,38 @@ and persisted (including their enabled state) across restarts.
     counts as `null`, and every row taking part in a duplicate group is a
     violation.
   - With an empty `rows` list every rule passes.
+
+### Privacy policies
+
+Privacy policies attach a sensitivity classification and masking strategy to a
+single field of a schema version, enabling role-based de-identification of row
+data. Policies (including their enabled state) are persisted across restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/privacy-policies` — register a
+  policy. Body:
+  `{"field": "email", "classification": "PII", "masking": "partial", "allowed_roles": ["analyst"]}`.
+  `field` must name an existing field of the version; `classification` is a
+  non-empty string; `masking` is `redact` or `partial`; `allowed_roles` is an
+  array of distinct, non-empty role names and may be empty. Returns `201` with
+  the submitted fields plus `id`, `enabled` (defaults to `true`) and
+  `created_at`. Registering two policies for the same field within one version
+  returns `409`. Unknown dataset/version/field → `404`; other invalid input →
+  `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies` — list policies
+  sorted by `id` ascending.
+- `PATCH /datasets/{dataset}/versions/{version}/privacy-policies/{policy_id}` —
+  enable or disable a policy. Body: `{"enabled": true}` (boolean only); returns
+  the updated policy. Unknown policy/dataset/version → `404`.
+- `POST /datasets/{dataset}/versions/{version}/privacy-policies/view` — return a
+  role-scoped, order-preserving copy of submitted rows. Body:
+  `{"role": "guest", "rows": [{...}, ...]}` with a non-empty `role` and a list
+  of row objects. Response: `{"dataset", "version", "rows"}`. Only enabled
+  policies whose field appears in a row mask the value when `role` is not in
+  `allowed_roles`:
+  - `redact` replaces every non-`null` value with `"***"`.
+  - `partial` keeps the first character and last two characters of strings
+    longer than 4 characters (e.g. `"alice@example.com"` → `"aom"`); every other
+    non-`null` value (short strings, numbers, booleans, …) is replaced with
+    `"***"`.
+  - `null` values and fields without a policy are returned unchanged; rows
+    missing a covered field are left without it.

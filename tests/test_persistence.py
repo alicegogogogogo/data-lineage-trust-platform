@@ -31,7 +31,10 @@ ok(client.post(
 ))
 ok(client.post(
     "/datasets/target_ds/versions",
-    json={"fields": [{"name": "tid", "type": "integer", "nullable": False}]},
+    json={"fields": [
+        {"name": "tid", "type": "integer", "nullable": False},
+        {"name": "label", "type": "string", "nullable": True},
+    ]},
 ))
 ok(client.post(
     "/datasets/target_ds/versions/1/lineage",
@@ -57,6 +60,30 @@ assert paused.status_code == 201, paused.text
 paused_id = paused.json()["id"]
 ok(client.patch(
     f"/datasets/target_ds/versions/1/quality-rules/{paused_id}",
+    json={"enabled": False},
+))
+ok(client.post(
+    "/datasets/target_ds/versions/1/privacy-policies",
+    json={
+        "field": "tid",
+        "classification": "restricted",
+        "masking": "redact",
+        "allowed_roles": ["auditor"],
+    },
+))
+paused_policy = client.post(
+    "/datasets/target_ds/versions/1/privacy-policies",
+    json={
+        "field": "label",
+        "classification": "internal",
+        "masking": "partial",
+        "allowed_roles": [],
+    },
+)
+assert paused_policy.status_code == 201, paused_policy.text
+ok(client.patch(
+    "/datasets/target_ds/versions/1/privacy-policies/"
+    f"{paused_policy.json()['id']}",
     json={"enabled": False},
 ))
 print("created")
@@ -87,11 +114,15 @@ assert lineage.status_code == 200, lineage.text
 body = lineage.json()
 assert body["fields"] == [
     {
+        "target_field": "label",
+        "sources": [],
+    },
+    {
         "target_field": "tid",
         "sources": [
             {"dataset": "source_ds", "version": 1, "field": "sid"}
         ],
-    }
+    },
 ]
 
 rules = client.get("/datasets/target_ds/versions/1/quality-rules")
@@ -113,6 +144,49 @@ assert evaluated.status_code == 200, evaluated.text
 evaluation = evaluated.json()
 assert [r["name"] for r in evaluation["results"]] == ["tid present"]
 assert evaluation["results"][0]["violations"] == [0]
+
+# Privacy policies and their enabled states survive the restart.
+policies = client.get("/datasets/target_ds/versions/1/privacy-policies")
+assert policies.status_code == 200, policies.text
+policy_rows = policies.json()
+assert [p["field"] for p in policy_rows] == ["tid", "label"]
+policies_by_field = {p["field"]: p for p in policy_rows}
+assert policies_by_field["tid"] == {
+    "id": policies_by_field["tid"]["id"],
+    "field": "tid",
+    "classification": "restricted",
+    "masking": "redact",
+    "allowed_roles": ["auditor"],
+    "enabled": True,
+    "created_at": policies_by_field["tid"]["created_at"],
+}
+assert policies_by_field["label"]["enabled"] is False
+assert policies_by_field["label"]["masking"] == "partial"
+
+viewed = client.post(
+    "/datasets/target_ds/versions/1/privacy-policies/view",
+    json={"role": "guest", "rows": [
+        {"tid": 42, "label": "secret-label"},
+        {"tid": None, "label": None},
+    ]},
+)
+assert viewed.status_code == 200, viewed.text
+view_body = viewed.json()
+assert view_body["dataset"] == "target_ds"
+assert view_body["version"] == 1
+# Enabled redact policy masks for a role outside allowed_roles; null stays null;
+# the disabled 'label' policy leaves values untouched.
+assert view_body["rows"] == [
+    {"tid": "***", "label": "secret-label"},
+    {"tid": None, "label": None},
+]
+
+auditor_view = client.post(
+    "/datasets/target_ds/versions/1/privacy-policies/view",
+    json={"role": "auditor", "rows": [{"tid": 42, "label": "secret-label"}]},
+)
+assert auditor_view.status_code == 200, auditor_view.text
+assert auditor_view.json()["rows"] == [{"tid": 42, "label": "secret-label"}]
 print(json.dumps({"dataset_id": by_name["target_ds"]["id"]}))
 """
 

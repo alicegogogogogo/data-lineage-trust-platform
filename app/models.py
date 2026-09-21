@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 
 
 class DatasetCreate(BaseModel):
@@ -135,3 +135,51 @@ class QualityRuleEvaluateResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Privacy policies
+# --------------------------------------------------------------------------- #
+
+
+PrivacyMasking = Literal["redact", "partial"]
+
+
+class PrivacyPolicyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: StrictStr = Field(description="Existing field of the schema version")
+    classification: StrictStr = Field(description="Non-empty sensitivity classification")
+    masking: PrivacyMasking
+    allowed_roles: list[StrictStr] = Field(
+        description="Distinct, non-empty role names that see the raw value; may be empty"
+    )
+
+
+class PrivacyPolicy(BaseModel):
+    id: int
+    field: str
+    classification: str
+    masking: PrivacyMasking
+    allowed_roles: list[str]
+    enabled: bool
+    created_at: str
+
+
+class PrivacyPolicyEnabledUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool
+
+
+class PrivacyViewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: StrictStr
+    rows: list[dict[str, Any]]
+
+
+class PrivacyViewResponse(BaseModel):
+    dataset: str
+    version: int
+    rows: list[dict[str, Any]]
