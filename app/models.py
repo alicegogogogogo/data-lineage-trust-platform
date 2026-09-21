@@ -226,6 +226,47 @@ class SnapshotDiffResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Retention policies and lineage-aware snapshot deletion
+# --------------------------------------------------------------------------- #
+
+
+class RetentionPolicyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    retention_days: StrictInt = Field(
+        ge=0, description="Non-negative minimum snapshot age in days"
+    )
+
+
+class RetentionPolicy(BaseModel):
+    id: int
+    dataset: str
+    version: int
+    retention_days: int
+    created_at: str
+
+
+class SnapshotDeletionRequestCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: StrictStr = Field(description="Non-empty reason for the requested deletion")
+
+
+class SnapshotDeletionRequest(BaseModel):
+    id: int
+    snapshot_id: int
+    policy_id: int
+    reason: str
+    status: Literal["pending", "blocked", "confirmed"]
+    impacted: list[LineageSourceRef]
+    created_at: str
+
+
+class ConfirmedSnapshotDeletionRequest(SnapshotDeletionRequest):
+    confirmed_at: str
+
+
+# --------------------------------------------------------------------------- #
 # Processing tasks
 # --------------------------------------------------------------------------- #
 

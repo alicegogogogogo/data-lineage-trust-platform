@@ -198,6 +198,40 @@ time. Snapshots (including their rows) survive restarts.
   converse, each entry being `{"row": {...}, "count": <int>}` sorted by the
   canonical (key-sorted) JSON text of `row`.
 
+### Retention policies and lineage-aware snapshot deletion
+
+A schema version can carry a single retention policy; snapshot deletion is a
+two-stage request/confirm flow that refuses to remove snapshots still feeding
+downstream fields. Policies and requests are persisted across restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/retention-policies` — create the
+  version's one retention policy. Body: `{"retention_days": 30}` with a
+  non-negative integer. Returns `201` with `id`, `dataset`, `version`,
+  `retention_days`, `created_at`. A second policy for the same version returns
+  `409`; unknown dataset/version → `404`; other invalid input → `422`.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/deletion-requests` —
+  request deletion. Body contains only a non-empty `reason`. The snapshot and
+  the version's retention policy must exist. Returns `201` with `id`,
+  `snapshot_id`, `policy_id`, `reason`, `status`, `impacted`, `created_at`.
+  `impacted` lists every field directly or indirectly reachable downstream of
+  any field of the snapshot's version along lineage mappings; entries are
+  deduplicated and sorted by dataset, version and field ascending. The request
+  is `blocked` when any downstream field exists and `pending` otherwise. A
+  second `pending`/`blocked` request for the same snapshot returns `409`.
+- `GET .../snapshots/{snapshot_id}/deletion-requests` — list the snapshot's
+  deletion requests sorted by `id` ascending. The collection remains
+  addressable after a confirmed request has deleted its snapshot.
+- `POST .../snapshots/{snapshot_id}/deletion-requests/{request_id}/confirm` —
+  confirm a request (no body). Confirmation succeeds only while the request is
+  `pending` and the snapshot is at least `retention_days` old; otherwise `409`
+  and nothing is deleted. On success the snapshot is deleted atomically with
+  the status change to `confirmed`, and the response adds `confirmed_at`. Once
+  deleted, the snapshot no longer appears in snapshot read, list, `at` or diff
+  responses.
+
+  Unknown dataset/version/snapshot/policy/request → `404`; other invalid input
+  → `422` and nothing is written.
+
 ### Processing tasks
 
 A processing task is a named unit of work attached to a schema version; each

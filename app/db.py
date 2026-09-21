@@ -136,6 +136,41 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (run_id, sequence)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS retention_policies (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id     INTEGER NOT NULL UNIQUE
+                       REFERENCES schema_versions(id) ON DELETE CASCADE,
+        retention_days INTEGER NOT NULL CHECK (retention_days >= 0),
+        created_at     TEXT NOT NULL
+    )
+    """,
+    # A confirmed request must survive the deletion of its snapshot, so the
+    # snapshot link is intentionally a plain integer instead of a cascading
+    # foreign key (snapshots are only deleted through a confirmed request).
+    """
+    CREATE TABLE IF NOT EXISTS snapshot_deletion_requests (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id   INTEGER NOT NULL,
+        snapshot_id  INTEGER NOT NULL,
+        policy_id    INTEGER NOT NULL
+                     REFERENCES retention_policies(id) ON DELETE CASCADE,
+        reason       TEXT NOT NULL,
+        status       TEXT NOT NULL
+                     CHECK (status IN ('pending', 'blocked', 'confirmed')),
+        impacted     TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        confirmed_at TEXT
+    )
+    """,
+    # At most one open (pending/blocked) request per snapshot; confirmed
+    # requests never block a new request once the snapshot is deleted.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_snapshot_deletion_requests_one_open
+    ON snapshot_deletion_requests (snapshot_id)
+    WHERE status IN ('pending', 'blocked')
+    """,
     # Persistent cache of field-impact query results, keyed by the source
     # field. Entries are invalidated whenever a committed write could change
     # what is reachable from the cached source (see app.repository).

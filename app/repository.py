@@ -8,7 +8,7 @@ import math
 import sqlite3
 import threading
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.errors import ConflictError, NotFoundError, RequestInvalidError
@@ -1206,6 +1206,262 @@ def diff_snapshots(
             for key in removed_keys
         ],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Retention policies and lineage-aware snapshot deletion
+# --------------------------------------------------------------------------- #
+
+
+def _retention_policy_row_to_dict(
+    row: sqlite3.Row, dataset_name: str, version_number: int
+) -> dict:
+    return {
+        "id": row["id"],
+        "dataset": dataset_name,
+        "version": version_number,
+        "retention_days": row["retention_days"],
+        "created_at": row["created_at"],
+    }
+
+
+def create_retention_policy(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    retention_days: int,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO retention_policies (version_id, retention_days, created_at) "
+            "VALUES (?, ?, ?)",
+            (version_row["id"], retention_days, utc_now_iso()),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ConflictError(
+            f"A retention policy already exists for version "
+            f"{version_number} of dataset '{dataset_name}'"
+        ) from exc
+
+    row = conn.execute(
+        "SELECT id, retention_days, created_at FROM retention_policies WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _retention_policy_row_to_dict(row, dataset["name"], version_row["version"])
+
+
+def _compute_version_field_impacted(
+    conn: sqlite3.Connection, version_id: int
+) -> list[dict]:
+    """Downstream union of every field of one schema version.
+
+    All of the version's fields seed the same reachability walk, so direct and
+    indirect downstream fields are found once, cycles terminate and the version's
+    own fields never appear in the result.
+    """
+    field_rows = conn.execute(
+        "SELECT id FROM schema_fields WHERE version_id = ?", (version_id,)
+    ).fetchall()
+    seeds = [row["id"] for row in field_rows]
+
+    edges = _lineage_forward_edges(conn)
+    visited = set(seeds)
+    impacted: dict[tuple[str, int, str], dict] = {}
+    queue = list(seeds)
+    while queue:
+        current = queue.pop()
+        for target_field_id, ref in edges.get(current, ()):
+            if target_field_id in visited:
+                continue
+            visited.add(target_field_id)
+            impacted[(ref["dataset"], ref["version"], ref["field"])] = ref
+            queue.append(target_field_id)
+    return [impacted[key] for key in sorted(impacted)]
+
+
+def _deletion_request_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "snapshot_id": row["snapshot_id"],
+        "policy_id": row["policy_id"],
+        "reason": row["reason"],
+        "status": row["status"],
+        "impacted": json.loads(row["impacted"]),
+        "created_at": row["created_at"],
+    }
+
+
+def create_snapshot_deletion_request(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+    reason: str,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    clean_reason = reason.strip()
+    if not clean_reason:
+        raise RequestInvalidError("'reason' must not be empty")
+
+    snapshot_row = _get_scoped_snapshot_row(conn, version_row["id"], snapshot_id)
+    if snapshot_row is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    policy_row = conn.execute(
+        "SELECT id FROM retention_policies WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchone()
+    if policy_row is None:
+        raise NotFoundError(
+            f"No retention policy exists for version {version_number} of "
+            f"dataset '{dataset_name}'"
+        )
+
+    open_request = conn.execute(
+        "SELECT id FROM snapshot_deletion_requests "
+        "WHERE snapshot_id = ? AND status IN ('pending', 'blocked')",
+        (snapshot_id,),
+    ).fetchone()
+    if open_request is not None:
+        raise ConflictError(
+            f"Snapshot {snapshot_id} already has an open deletion request "
+            f"({open_request['id']})"
+        )
+
+    impacted = _compute_version_field_impacted(conn, version_row["id"])
+    status = "blocked" if impacted else "pending"
+    try:
+        cursor = conn.execute(
+            "INSERT INTO snapshot_deletion_requests ("
+            "version_id, snapshot_id, policy_id, reason, status, impacted, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                version_row["id"],
+                snapshot_id,
+                policy_row["id"],
+                clean_reason,
+                status,
+                json.dumps(impacted),
+                utc_now_iso(),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        # Lost a race against a concurrent open-request insert.
+        raise ConflictError(
+            f"Snapshot {snapshot_id} already has an open deletion request"
+        ) from exc
+    row = conn.execute(
+        "SELECT * FROM snapshot_deletion_requests WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _deletion_request_row_to_dict(row)
+
+
+def list_snapshot_deletion_requests(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+) -> list[dict]:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    # The collection stays addressable after its snapshot has been confirmed
+    # away: the snapshot itself may be gone, but its request records remain.
+    # A snapshot id that never existed in this version and has no requests is an
+    # unknown resource.
+    snapshot_row = _get_scoped_snapshot_row(conn, version_row["id"], snapshot_id)
+    request_rows = conn.execute(
+        "SELECT id FROM snapshot_deletion_requests "
+        "WHERE version_id = ? AND snapshot_id = ?",
+        (version_row["id"], snapshot_id),
+    ).fetchall()
+    if snapshot_row is None and not request_rows:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM snapshot_deletion_requests "
+        "WHERE version_id = ? AND snapshot_id = ? ORDER BY id",
+        (version_row["id"], snapshot_id),
+    ).fetchall()
+    return [_deletion_request_row_to_dict(row) for row in rows]
+
+
+def confirm_snapshot_deletion_request(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+    request_id: int,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    request_row = conn.execute(
+        "SELECT * FROM snapshot_deletion_requests "
+        "WHERE id = ? AND version_id = ? AND snapshot_id = ?",
+        (request_id, version_row["id"], snapshot_id),
+    ).fetchone()
+    if request_row is None:
+        raise NotFoundError(
+            f"Snapshot deletion request {request_id} does not exist for "
+            f"snapshot {snapshot_id} in version {version_number} of dataset "
+            f"'{dataset_name}'"
+        )
+
+    if request_row["status"] != "pending":
+        raise ConflictError(
+            f"Snapshot deletion request {request_id} is "
+            f"'{request_row['status']}'; only pending requests can be confirmed"
+        )
+
+    snapshot_row = _get_scoped_snapshot_row(conn, version_row["id"], snapshot_id)
+    if snapshot_row is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    policy_row = conn.execute(
+        "SELECT retention_days FROM retention_policies WHERE id = ?",
+        (request_row["policy_id"],),
+    ).fetchone()
+    retention_days = policy_row["retention_days"] if policy_row is not None else None
+
+    created_at = datetime.fromisoformat(snapshot_row["created_at"])
+    age = datetime.now(timezone.utc) - created_at
+    if retention_days is None or age < timedelta(days=retention_days):
+        raise ConflictError(
+            f"Snapshot {snapshot_id} has not reached the retention age of "
+            f"{retention_days} day(s) yet"
+        )
+
+    # Snapshot removal and request confirmation commit together: either both
+    # take effect or neither does.
+    conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+    confirmed_at = utc_now_iso()
+    conn.execute(
+        "UPDATE snapshot_deletion_requests "
+        "SET status = 'confirmed', confirmed_at = ? WHERE id = ?",
+        (confirmed_at, request_id),
+    )
+    updated = conn.execute(
+        "SELECT * FROM snapshot_deletion_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    result = _deletion_request_row_to_dict(updated)
+    result["confirmed_at"] = updated["confirmed_at"]
+    return result
 
 
 # --------------------------------------------------------------------------- #
