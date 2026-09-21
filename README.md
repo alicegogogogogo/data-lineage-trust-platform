@@ -215,3 +215,38 @@ run records one attempt. Tasks and runs are persisted across restarts.
   does not belong to the task/version in the path → `422`; unknown
   dataset/version/task/run → `404`; other invalid input → `422` and nothing
   is written.
+
+### Run audit records (persistent evidence chain)
+
+Every run carries an append-only, hash-chained audit log. Records are
+persisted across restarts and can never be modified or deleted through the
+API; altering stored content is detectable through verification.
+
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}/audit-records` —
+  append a record. Body contains exactly `event`, `input_summary` and
+  `result_summary`, each a string that is non-empty after trimming
+  surrounding whitespace (missing/extra fields, non-strings and blank
+  strings → `422` and nothing is written). Returns `201` with the request
+  fields plus `id`, `sequence`, `run_status`, `previous_hash`,
+  `evidence_hash` and `created_at`. `sequence` starts at `1` and increases by
+  one per run; `run_status` is the run's status at write time (`running`,
+  `succeeded` or `failed`); the first record has `previous_hash` `null` and
+  every later record links to the previous record's `evidence_hash`.
+  Concurrent appends are serialized, so sequences never duplicate and links
+  never break. Unknown dataset/version/task/run → `404`; a run that does not
+  belong to the task/version in the path → `422`.
+- `GET .../audit-records` — list the run's records sorted by `sequence`
+  ascending.
+- `GET .../audit-records/verify` — return the path identifiers (`dataset`,
+  `version`, `task_id`, `run_id`) together with `valid` and
+  `checked_count`. Verification recomputes each record's `evidence_hash` and
+  checks that sequences are continuous from `1` and that every
+  `previous_hash` equals the preceding `evidence_hash` (an empty chain is
+  valid). A normal chain returns `"valid": true`; any tampering, gap or
+  broken link makes it `false`.
+
+  `evidence_hash` is the hexadecimal SHA-256 of all record fields except
+  `id`, `created_at` and the hash itself — `event`, `input_summary`,
+  `result_summary`, `sequence`, `run_status` and `previous_hash` — serialized
+  as canonical JSON: object keys sorted by Unicode code point, no
+  insignificant whitespace, UTF-8 encoded.

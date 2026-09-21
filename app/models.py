@@ -269,3 +269,37 @@ class ProcessingRunFinish(BaseModel):
 
     status: Literal["succeeded", "failed"]
     error: StrictStr | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Processing run audit records (hash-chained evidence)
+# --------------------------------------------------------------------------- #
+
+
+class AuditRecordCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event: StrictStr
+    input_summary: StrictStr
+    result_summary: StrictStr
+
+
+class AuditRecord(BaseModel):
+    id: int
+    sequence: int
+    run_status: Literal["running", "succeeded", "failed"]
+    event: str
+    input_summary: str
+    result_summary: str
+    previous_hash: str | None
+    evidence_hash: str
+    created_at: str
+
+
+class AuditChainVerifyResponse(BaseModel):
+    dataset: str
+    version: int
+    task_id: int
+    run_id: int
+    valid: bool
+    checked_count: int

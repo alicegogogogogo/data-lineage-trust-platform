@@ -119,6 +119,23 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (task_id, attempt)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS processing_run_audit_records (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id        INTEGER NOT NULL
+                      REFERENCES processing_task_runs(id) ON DELETE CASCADE,
+        sequence      INTEGER NOT NULL CHECK (sequence >= 1),
+        event         TEXT NOT NULL,
+        input_summary TEXT NOT NULL,
+        result_summary TEXT NOT NULL,
+        run_status    TEXT NOT NULL
+                      CHECK (run_status IN ('running', 'succeeded', 'failed')),
+        previous_hash TEXT,
+        evidence_hash TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        UNIQUE (run_id, sequence)
+    )
+    """,
 )
 
 

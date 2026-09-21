@@ -12,6 +12,9 @@ from app import repository
 from app.db import get_db
 from app.errors import APIError, RequestInvalidError
 from app.models import (
+    AuditChainVerifyResponse,
+    AuditRecord,
+    AuditRecordCreate,
     Dataset,
     DatasetCreate,
     LineageCreate,
@@ -516,5 +519,69 @@ def finish_task_run(
             run_id,
             payload.status,
             payload.error,
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Processing run audit records (hash-chained evidence)
+# --------------------------------------------------------------------------- #
+
+
+AUDIT_RECORDS_PATH = (
+    f"{PROCESSING_TASKS_PATH}/{{task_id}}/runs/{{run_id}}/audit-records"
+)
+
+
+@app.post(AUDIT_RECORDS_PATH, response_model=AuditRecord, status_code=201)
+def create_audit_record(
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    run_id: int,
+    payload: AuditRecordCreate,
+    conn=Depends(get_db),
+) -> AuditRecord:
+    return AuditRecord(
+        **repository.create_audit_record(
+            conn,
+            dataset_name,
+            version,
+            task_id,
+            run_id,
+            payload.event,
+            payload.input_summary,
+            payload.result_summary,
+        )
+    )
+
+
+@app.get(AUDIT_RECORDS_PATH, response_model=list[AuditRecord])
+def list_audit_records(
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    run_id: int,
+    conn=Depends(get_db),
+) -> list[AuditRecord]:
+    return [
+        AuditRecord(**record)
+        for record in repository.list_audit_records(
+            conn, dataset_name, version, task_id, run_id
+        )
+    ]
+
+
+@app.get(f"{AUDIT_RECORDS_PATH}/verify", response_model=AuditChainVerifyResponse)
+def verify_audit_chain(
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    run_id: int,
+    conn=Depends(get_db),
+) -> AuditChainVerifyResponse:
+    return AuditChainVerifyResponse(
+        **repository.verify_audit_chain(
+            conn, dataset_name, version, task_id, run_id
         )
     )

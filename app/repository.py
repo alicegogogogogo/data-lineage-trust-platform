@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -1277,3 +1278,234 @@ def finish_task_run(
         "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
     ).fetchone()
     return _run_row_to_dict(updated)
+
+
+# --------------------------------------------------------------------------- #
+# Processing run audit records (hash-chained evidence)
+# --------------------------------------------------------------------------- #
+
+
+def _audit_evidence_hash(
+    *,
+    sequence: int,
+    event: str,
+    input_summary: str,
+    result_summary: str,
+    run_status: str,
+    previous_hash: str | None,
+) -> str:
+    """SHA-256 over every record field except id, created_at and the hash itself.
+
+    The canonical form is JSON with keys sorted by Unicode code point, no
+    insignificant whitespace and UTF-8 encoding.
+    """
+    payload = {
+        "event": event,
+        "input_summary": input_summary,
+        "previous_hash": previous_hash,
+        "result_summary": result_summary,
+        "run_status": run_status,
+        "sequence": sequence,
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolve_run_scope(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+) -> tuple[dict, sqlite3.Row, sqlite3.Row, sqlite3.Row]:
+    """Resolve a run through its path dataset/version/task.
+
+    Unknown dataset, version, task or run is a 404; a run that exists but does
+    not belong to the task (and therefore version) named in the path is a 422.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, version_row, dataset_name, version_number, task_id
+    )
+    run_row = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if run_row is None:
+        raise NotFoundError(f"Processing task run {run_id} does not exist")
+    if run_row["task_id"] != task_row["id"]:
+        raise RequestInvalidError(
+            f"Processing task run {run_id} does not belong to task {task_id} "
+            f"in version {version_number} of dataset '{dataset_name}'"
+        )
+    return dataset, version_row, task_row, run_row
+
+
+def _audit_record_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "sequence": row["sequence"],
+        "run_status": row["run_status"],
+        "event": row["event"],
+        "input_summary": row["input_summary"],
+        "result_summary": row["result_summary"],
+        "previous_hash": row["previous_hash"],
+        "evidence_hash": row["evidence_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+AUDIT_RECORD_COLUMNS = (
+    "id, sequence, event, input_summary, result_summary, run_status, "
+    "previous_hash, evidence_hash, created_at"
+)
+
+
+def create_audit_record(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    event: str,
+    input_summary: str,
+    result_summary: str,
+) -> dict:
+    # Resolve the path target first so unknown resources stay 404; the
+    # non-empty-string checks are semantic validation performed afterwards.
+    _, _, _, run_row = _resolve_run_scope(
+        conn, dataset_name, version_number, task_id, run_id
+    )
+
+    clean_event = event.strip()
+    clean_input_summary = input_summary.strip()
+    clean_result_summary = result_summary.strip()
+    if not clean_event:
+        raise RequestInvalidError("'event' must not be empty")
+    if not clean_input_summary:
+        raise RequestInvalidError("'input_summary' must not be empty")
+    if not clean_result_summary:
+        raise RequestInvalidError("'result_summary' must not be empty")
+
+    # Serialize concurrent appends to the same chain: a write lock acquired up
+    # front makes the read-tail / assign-sequence / insert sequence atomic
+    # across connections, so sequences never duplicate and links never break.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+    last = conn.execute(
+        "SELECT sequence, evidence_hash FROM processing_run_audit_records "
+        "WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    sequence = 1 if last is None else last["sequence"] + 1
+    previous_hash = None if last is None else last["evidence_hash"]
+
+    current = conn.execute(
+        "SELECT status FROM processing_task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    run_status = current["status"]
+
+    evidence_hash = _audit_evidence_hash(
+        sequence=sequence,
+        event=event,
+        input_summary=input_summary,
+        result_summary=result_summary,
+        run_status=run_status,
+        previous_hash=previous_hash,
+    )
+    created_at = utc_now_iso()
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO processing_run_audit_records ("
+            "run_id, sequence, event, input_summary, result_summary, "
+            "run_status, previous_hash, evidence_hash, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_row["id"],
+                sequence,
+                event,
+                input_summary,
+                result_summary,
+                run_status,
+                previous_hash,
+                evidence_hash,
+                created_at,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ConflictError(
+            "An audit record with this sequence was written concurrently; "
+            "retry to append the next record"
+        ) from exc
+
+    row = conn.execute(
+        f"SELECT {AUDIT_RECORD_COLUMNS} FROM processing_run_audit_records WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _audit_record_row_to_dict(row)
+
+
+def list_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+) -> list[dict]:
+    _resolve_run_scope(conn, dataset_name, version_number, task_id, run_id)
+    rows = conn.execute(
+        f"SELECT {AUDIT_RECORD_COLUMNS} FROM processing_run_audit_records "
+        "WHERE run_id = ? ORDER BY sequence",
+        (run_id,),
+    ).fetchall()
+    return [_audit_record_row_to_dict(row) for row in rows]
+
+
+def verify_audit_chain(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+) -> dict:
+    _resolve_run_scope(conn, dataset_name, version_number, task_id, run_id)
+    rows = conn.execute(
+        "SELECT sequence, event, input_summary, result_summary, run_status, "
+        "previous_hash, evidence_hash FROM processing_run_audit_records "
+        "WHERE run_id = ? ORDER BY sequence",
+        (run_id,),
+    ).fetchall()
+
+    valid = True
+    expected_sequence = 1
+    previous_hash: str | None = None
+    for row in rows:
+        recomputed = _audit_evidence_hash(
+            sequence=row["sequence"],
+            event=row["event"],
+            input_summary=row["input_summary"],
+            result_summary=row["result_summary"],
+            run_status=row["run_status"],
+            previous_hash=row["previous_hash"],
+        )
+        if row["sequence"] != expected_sequence:
+            valid = False
+        if row["previous_hash"] != previous_hash:
+            valid = False
+        if recomputed != row["evidence_hash"]:
+            valid = False
+        previous_hash = row["evidence_hash"]
+        expected_sequence += 1
+
+    return {
+        "dataset": dataset_name,
+        "version": version_number,
+        "task_id": task_id,
+        "run_id": run_id,
+        "valid": valid,
+        "checked_count": len(rows),
+    }
