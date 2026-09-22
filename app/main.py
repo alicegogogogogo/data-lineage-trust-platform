@@ -35,6 +35,7 @@ from app.models import (
     ProcessingTaskRun,
     ProcessingTaskWithRuns,
     ProcessingScheduleResponse,
+    ProcessingAuditReportResponse,
     QualityRule,
     QualityRuleCreate,
     QualityRuleEnabledUpdate,
@@ -662,6 +663,37 @@ def get_processing_schedule(
 ) -> ProcessingScheduleResponse:
     return ProcessingScheduleResponse(
         **repository.get_processing_schedule(conn, dataset_name, version)
+    )
+
+
+# The report is a parameterless read of the whole task collection, so the
+# literal "audit-report" segment must likewise be declared before "/{task_id}".
+async def _read_request_body(request: Request) -> bytes:
+    return await request.body()
+
+
+@app.get(
+    f"{PROCESSING_TASKS_PATH}/audit-report",
+    response_model=ProcessingAuditReportResponse,
+)
+def get_processing_audit_report(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> ProcessingAuditReportResponse:
+    # The endpoint is parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/version is known,
+    # preserving 404 precedence.
+    return ProcessingAuditReportResponse(
+        **repository.get_processing_audit_report(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
     )
 
 

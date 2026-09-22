@@ -306,6 +306,25 @@ run records one attempt. Tasks and runs are persisted across restarts.
   have not succeeded, sorted ascending; it is empty for non-pending tasks.
   States are recomputed on every read (including after a successful retry)
   and both the dependency graph and the schedule survive restarts.
+- `GET /datasets/{dataset}/versions/{version}/processing-tasks/audit-report` —
+  read-only audit report for the whole version; the endpoint takes no request
+  body and no query parameters (both are rejected with `422`; unknown
+  dataset/version → `404`). Returns
+  `{"dataset", "version", "summary", "tasks"}`. `summary` contains
+  `task_count`, `run_count`, `pending_tasks`, `running_tasks`,
+  `succeeded_tasks`, `failed_tasks`, `exhausted_tasks` and
+  `invalid_audit_runs`; status counters count tasks by their stored status,
+  `exhausted_tasks` counts `failed` tasks that have used up
+  `max_attempts`, and `invalid_audit_runs` counts runs whose audit chain fails
+  re-verification. `tasks` is sorted by task `id` and each task carries every
+  processing-task field plus `runs`; `runs` is sorted by `attempt` and each
+  run carries its run fields plus `proof`. `proof` re-runs the same checks as
+  the per-run verify endpoint over that run's audit chain and is
+  `{"valid", "checked_count", "last_evidence_hash"}`; `last_evidence_hash` is
+  the stored evidence hash of the chain's final record and is `null` only for
+  an empty chain — it is still returned when `valid` is `false`, and the run
+  details are retained. Summary counters always agree with the returned
+  details and the report is deterministic across restarts.
 
 ### Processing run audit records (append-only proof chain)
 

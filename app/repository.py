@@ -2467,20 +2467,16 @@ def list_audit_records(
     return [_audit_record_row_to_dict(row) for row in rows]
 
 
-def verify_audit_chain(
-    conn: sqlite3.Connection,
-    dataset_name: str,
-    version_number: int,
-    task_id: int,
-    run_id: int,
-) -> dict:
-    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
-    rows = conn.execute(
-        "SELECT * FROM processing_task_audit_records WHERE run_id = ? "
-        "ORDER BY sequence ASC",
-        (run_id,),
-    ).fetchall()
+def _verify_run_audit_rows(rows: list[sqlite3.Row]) -> tuple[bool, int, str | None]:
+    """Re-verify one run's stored audit chain.
 
+    Recomputes every ``evidence_hash`` and checks that ``sequence`` values are
+    continuous from ``1`` and each ``previous_hash`` equals the preceding
+    record's ``evidence_hash`` (the first must be null). Returns
+    ``(valid, checked_count, last_evidence_hash)``; the trailing hash is the
+    stored evidence hash of the final record and is null only for an empty
+    chain, so even a failed verification still reports the stored chain tail.
+    """
     valid = True
     expected_sequence = 1
     previous_hash: str | None = None
@@ -2495,11 +2491,121 @@ def verify_audit_chain(
         previous_hash = record["evidence_hash"]
         expected_sequence += 1
 
+    last_evidence_hash = rows[-1]["evidence_hash"] if rows else None
+    return valid, len(rows), last_evidence_hash
+
+
+def verify_audit_chain(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+) -> dict:
+    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+    rows = conn.execute(
+        "SELECT * FROM processing_task_audit_records WHERE run_id = ? "
+        "ORDER BY sequence ASC",
+        (run_id,),
+    ).fetchall()
+
+    valid, checked_count, _last_hash = _verify_run_audit_rows(rows)
+
     return {
         "dataset": dataset_name,
         "version": version_number,
         "task_id": task_id,
         "run_id": run_id,
         "valid": valid,
-        "checked_count": len(rows),
+        "checked_count": checked_count,
+    }
+
+
+def get_processing_audit_report(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only audit report over every task and run of one version.
+
+    The endpoint takes no parameters: a non-empty request body or any query
+    parameter is rejected (422) only after the path dataset/version has been
+    resolved, so an unknown dataset/version stays a 404. The summary and the
+    task/run details are then computed in the same pass, so the counters always
+    agree with the returned details. Each run's ``proof`` re-verifies its
+    append-only audit chain (see ``_verify_run_audit_rows``); an empty chain
+    verifies with a null ``last_evidence_hash``.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The audit report endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The audit report endpoint does not accept query parameters"
+        )
+
+    task_rows = _version_task_rows(conn, version_row["id"])
+    tasks: list[dict] = []
+    run_count = 0
+    invalid_audit_runs = 0
+    status_counts = {"pending": 0, "running": 0, "succeeded": 0, "failed": 0}
+    exhausted_tasks = 0
+
+    for task_row in task_rows:
+        task = _task_row_to_dict(
+            task_row, dataset["name"], version_row["version"]
+        )
+        run_rows = conn.execute(
+            "SELECT * FROM processing_task_runs WHERE task_id = ? ORDER BY attempt",
+            (task_row["id"],),
+        ).fetchall()
+        runs: list[dict] = []
+        for run_row in run_rows:
+            run = _run_row_to_dict(run_row)
+            audit_rows = conn.execute(
+                "SELECT * FROM processing_task_audit_records WHERE run_id = ? "
+                "ORDER BY sequence ASC",
+                (run_row["id"],),
+            ).fetchall()
+            valid, checked_count, last_hash = _verify_run_audit_rows(audit_rows)
+            if not valid:
+                invalid_audit_runs += 1
+            run["proof"] = {
+                "valid": valid,
+                "checked_count": checked_count,
+                "last_evidence_hash": last_hash,
+            }
+            runs.append(run)
+
+        run_count += len(runs)
+        status_counts[task["status"]] += 1
+        if (
+            task["status"] == "failed"
+            and task["attempt_count"] >= task["max_attempts"]
+        ):
+            exhausted_tasks += 1
+        task["runs"] = runs
+        tasks.append(task)
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "summary": {
+            "task_count": len(tasks),
+            "run_count": run_count,
+            "pending_tasks": status_counts["pending"],
+            "running_tasks": status_counts["running"],
+            "succeeded_tasks": status_counts["succeeded"],
+            "failed_tasks": status_counts["failed"],
+            "exhausted_tasks": exhausted_tasks,
+            "invalid_audit_runs": invalid_audit_runs,
+        },
+        "tasks": tasks,
     }

@@ -427,3 +427,44 @@ class AuditChainVerifyResponse(BaseModel):
     run_id: int
     valid: bool
     checked_count: int
+
+
+# --------------------------------------------------------------------------- #
+# Read-only per-version processing audit report
+# --------------------------------------------------------------------------- #
+
+
+class AuditChainProof(BaseModel):
+    valid: bool
+    checked_count: int
+    # Stored evidence hash of the chain's final record; null only when the
+    # chain is empty (it is still reported when valid is false).
+    last_evidence_hash: str | None
+
+
+class AuditReportRun(ProcessingTaskRun):
+    proof: AuditChainProof
+
+
+class AuditReportTask(ProcessingTask):
+    runs: list[AuditReportRun]
+
+
+class ProcessingAuditReportSummary(BaseModel):
+    task_count: int
+    run_count: int
+    pending_tasks: int
+    running_tasks: int
+    succeeded_tasks: int
+    failed_tasks: int
+    # Subset of failed_tasks whose attempt budget is used up.
+    exhausted_tasks: int
+    # Runs whose audit chain failed re-verification.
+    invalid_audit_runs: int
+
+
+class ProcessingAuditReportResponse(BaseModel):
+    dataset: str
+    version: int
+    summary: ProcessingAuditReportSummary
+    tasks: list[AuditReportTask]
