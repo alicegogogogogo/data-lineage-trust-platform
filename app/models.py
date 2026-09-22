@@ -267,6 +267,41 @@ class ConfirmedSnapshotDeletionRequest(SnapshotDeletionRequest):
 
 
 # --------------------------------------------------------------------------- #
+# Retention exceptions (compliance holds blocking snapshot deletion)
+# --------------------------------------------------------------------------- #
+
+
+RetentionExceptionScope = Literal["version", "snapshot"]
+
+
+class RetentionExceptionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: RetentionExceptionScope
+    snapshot_id: StrictInt | None = Field(
+        description="Null for scope 'version'; an existing snapshot id of this "
+        "version for scope 'snapshot'"
+    )
+    reason: StrictStr = Field(description="Non-empty justification for the hold")
+    expires_at: StrictStr = Field(
+        description="Future ISO-8601 date-time including a timezone"
+    )
+
+
+class RetentionException(BaseModel):
+    id: int
+    dataset: str
+    version: int
+    scope: RetentionExceptionScope
+    snapshot_id: int | None
+    reason: str
+    expires_at: str
+    status: Literal["active", "expired", "released"]
+    created_at: str
+    released_at: str | None
+
+
+# --------------------------------------------------------------------------- #
 # Processing tasks
 # --------------------------------------------------------------------------- #
 

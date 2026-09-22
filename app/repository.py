@@ -1336,6 +1336,13 @@ def create_snapshot_deletion_request(
             f"({open_request['id']})"
         )
 
+    # An active retention exception (version- or snapshot-scoped) forbids
+    # opening a deletion request; the check shares this transaction with the
+    # insert below, so the two commit atomically.
+    _require_no_active_retention_exception(
+        conn, version_row, snapshot_id, dataset_name, version_number
+    )
+
     impacted = _compute_version_field_impacted(conn, version_row["id"])
     status = "blocked" if impacted else "pending"
     try:
@@ -1447,6 +1454,13 @@ def confirm_snapshot_deletion_request(
             f"{retention_days} day(s) yet"
         )
 
+    # An active retention exception (version- or snapshot-scoped) forbids the
+    # deletion; the check shares this transaction with the delete below, so the
+    # two commit atomically.
+    _require_no_active_retention_exception(
+        conn, version_row, snapshot_id, dataset_name, version_number
+    )
+
     # Snapshot removal and request confirmation commit together: either both
     # take effect or neither does.
     conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
@@ -1462,6 +1476,205 @@ def confirm_snapshot_deletion_request(
     result = _deletion_request_row_to_dict(updated)
     result["confirmed_at"] = updated["confirmed_at"]
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Retention exceptions (compliance holds blocking snapshot deletion)
+# --------------------------------------------------------------------------- #
+
+
+def _parse_expires_at(raw: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise RequestInvalidError(
+            "'expires_at' must be an ISO-8601 date-time"
+        ) from exc
+    # A trailing timezone designator (offset or 'Z') is mandatory.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RequestInvalidError("'expires_at' must include a timezone")
+    if parsed <= datetime.now(timezone.utc):
+        raise RequestInvalidError("'expires_at' must be in the future")
+    return parsed
+
+
+def _retention_exception_status(row: sqlite3.Row, now: datetime) -> str:
+    if row["status"] == "released":
+        return "released"
+    if datetime.fromisoformat(row["expires_at"]) <= now:
+        return "expired"
+    return "active"
+
+
+def _retention_exception_row_to_dict(
+    row: sqlite3.Row, dataset_name: str, version_number: int, now: datetime
+) -> dict:
+    return {
+        "id": row["id"],
+        "dataset": dataset_name,
+        "version": version_number,
+        "scope": row["scope"],
+        "snapshot_id": row["snapshot_id"],
+        "reason": row["reason"],
+        "expires_at": row["expires_at"],
+        "status": _retention_exception_status(row, now),
+        "created_at": row["created_at"],
+        "released_at": row["released_at"],
+    }
+
+
+def create_retention_exception(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    scope: str,
+    snapshot_id: int | None,
+    reason: str,
+    expires_at: str,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if scope == "version":
+        if snapshot_id is not None:
+            raise RequestInvalidError(
+                "'snapshot_id' must be null when 'scope' is 'version'"
+            )
+    else:
+        if snapshot_id is None:
+            raise RequestInvalidError(
+                "'snapshot_id' is required when 'scope' is 'snapshot'"
+            )
+
+    clean_reason = reason.strip()
+    if not clean_reason:
+        raise RequestInvalidError("'reason' must not be empty")
+
+    _parse_expires_at(expires_at)
+
+    if scope == "snapshot":
+        snapshot_row = _get_scoped_snapshot_row(conn, version_row["id"], snapshot_id)
+        if snapshot_row is None:
+            raise NotFoundError(
+                f"Snapshot {snapshot_id} does not exist in version "
+                f"{version_number} of dataset '{dataset_name}'"
+            )
+
+    cursor = conn.execute(
+        "INSERT INTO retention_exceptions ("
+        "version_id, scope, snapshot_id, reason, expires_at, status, "
+        "created_at, released_at"
+        ") VALUES (?, ?, ?, ?, ?, 'active', ?, NULL)",
+        (
+            version_row["id"],
+            scope,
+            snapshot_id,
+            clean_reason,
+            expires_at,
+            utc_now_iso(),
+        ),
+    )
+    row = conn.execute(
+        "SELECT * FROM retention_exceptions WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _retention_exception_row_to_dict(
+        row, dataset["name"], version_row["version"], datetime.now(timezone.utc)
+    )
+
+
+def list_retention_exceptions(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int
+) -> list[dict]:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    rows = conn.execute(
+        "SELECT * FROM retention_exceptions WHERE version_id = ? ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+    now = datetime.now(timezone.utc)
+    return [
+        _retention_exception_row_to_dict(
+            row, dataset["name"], version_row["version"], now
+        )
+        for row in rows
+    ]
+
+
+def release_retention_exception(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    exception_id: int,
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    row = conn.execute(
+        "SELECT * FROM retention_exceptions WHERE version_id = ? AND id = ?",
+        (version_row["id"], exception_id),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"Retention exception {exception_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    now = datetime.now(timezone.utc)
+    status = _retention_exception_status(row, now)
+    if status != "active":
+        raise ConflictError(
+            f"Retention exception {exception_id} is '{status}'; only active "
+            "exceptions can be released"
+        )
+
+    released_at = utc_now_iso()
+    conn.execute(
+        "UPDATE retention_exceptions SET status = 'released', released_at = ? "
+        "WHERE id = ?",
+        (released_at, row["id"]),
+    )
+    updated = conn.execute(
+        "SELECT * FROM retention_exceptions WHERE id = ?", (row["id"],)
+    ).fetchone()
+    return _retention_exception_row_to_dict(
+        updated, dataset["name"], version_row["version"], now
+    )
+
+
+def _require_no_active_retention_exception(
+    conn: sqlite3.Connection,
+    version_row: sqlite3.Row,
+    snapshot_id: int,
+    dataset_name: str,
+    version_number: int,
+) -> None:
+    """Reject with 409 when an active exception protects the snapshot.
+
+    Both version-scoped exceptions of this version and snapshot-scoped
+    exceptions naming this snapshot block; expired and released exceptions
+    never do. The caller runs this inside the same transaction as the write it
+    protects, so the check and the write commit atomically.
+    """
+    rows = conn.execute(
+        "SELECT id, scope, expires_at FROM retention_exceptions "
+        "WHERE version_id = ? AND status = 'active' "
+        "AND (scope = 'version' OR snapshot_id = ?)",
+        (version_row["id"], snapshot_id),
+    ).fetchall()
+    now = datetime.now(timezone.utc)
+    blocking = [
+        row["id"]
+        for row in rows
+        if datetime.fromisoformat(row["expires_at"]) > now
+    ]
+    if blocking:
+        raise ConflictError(
+            f"Snapshot {snapshot_id} of version {version_number} of dataset "
+            f"'{dataset_name}' is protected by active retention exception(s) "
+            + ", ".join(str(exception_id) for exception_id in sorted(blocking))
+        )
 
 
 # --------------------------------------------------------------------------- #
