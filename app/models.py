@@ -267,6 +267,38 @@ class ConfirmedSnapshotDeletionRequest(SnapshotDeletionRequest):
 
 
 # --------------------------------------------------------------------------- #
+# Retention exceptions (compliance holds on snapshot deletion)
+# --------------------------------------------------------------------------- #
+
+
+class RetentionExceptionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["version", "snapshot"]
+    snapshot_id: StrictInt | None = Field(
+        description="Null for scope 'version'; an existing snapshot id of this "
+        "version for scope 'snapshot'"
+    )
+    reason: StrictStr = Field(description="Non-empty justification for the exception")
+    expires_at: StrictStr = Field(
+        description="Future timezone-aware ISO-8601 date-time"
+    )
+
+
+class RetentionException(BaseModel):
+    id: int
+    dataset: str
+    version: int
+    scope: Literal["version", "snapshot"]
+    snapshot_id: int | None
+    reason: str
+    expires_at: str
+    status: Literal["active", "expired", "released"]
+    created_at: str
+    released_at: str | None
+
+
+# --------------------------------------------------------------------------- #
 # Processing tasks
 # --------------------------------------------------------------------------- #
 

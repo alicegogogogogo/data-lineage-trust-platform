@@ -232,6 +232,38 @@ downstream fields. Policies and requests are persisted across restarts.
   Unknown dataset/version/snapshot/policy/request → `404`; other invalid input
   → `422` and nothing is written.
 
+### Retention exceptions (compliance holds)
+
+A retention exception preserves a whole schema version or one snapshot from
+deletion until it expires or is released. Exceptions are persisted across
+restarts; their `status` is derived in UTC at read time: `active` until
+`expires_at`, `expired` afterwards, `released` once released (a released
+exception stays released even after its expiry).
+
+- `POST /datasets/{dataset}/versions/{version}/retention-exceptions` — create
+  an exception. Body contains exactly `scope`, `snapshot_id`, `reason` and
+  `expires_at`: `scope` is `version` or `snapshot`; `snapshot_id` is `null`
+  for `version` scope and an existing snapshot id of this version for
+  `snapshot` scope; `reason` is a non-empty string; `expires_at` is a future
+  timezone-aware ISO-8601 date-time. Returns `201` with `id`, `dataset`,
+  `version`, `scope`, `snapshot_id`, `reason`, `expires_at`, `status`
+  (`active`), `created_at` and `released_at` (`null`). Unknown
+  dataset/version/snapshot → `404`; missing, extra, wrongly typed or
+  illegally combined fields → `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/retention-exceptions` — list
+  the version's exceptions sorted by `id` ascending.
+- `POST .../retention-exceptions/{exception_id}/release` — release an
+  exception (no body). Only `active` exceptions can be released; `expired` or
+  `released` ones return `409` and nothing is written. Returns `200` with the
+  record, now `released` with `released_at` set. Unknown
+  dataset/version/exception → `404`.
+
+While any `active` exception covers a snapshot (version scope covers every
+snapshot of the version), creating or confirming a deletion request for that
+snapshot fails with `409` and nothing is written or deleted; the check is
+atomic with the write. `expired` and `released` exceptions never block, and
+exceptions do not change lineage impact or retention-period rules.
+
 ### Processing tasks
 
 A processing task is a named unit of work attached to a schema version; each

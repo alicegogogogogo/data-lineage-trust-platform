@@ -171,6 +171,22 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     ON snapshot_deletion_requests (snapshot_id)
     WHERE status IN ('pending', 'blocked')
     """,
+    # Compliance exceptions that preserve a whole version or one snapshot from
+    # deletion until they expire or are released. The status (active / expired /
+    # released) is derived from expires_at and released_at at read time.
+    """
+    CREATE TABLE IF NOT EXISTS retention_exceptions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id  INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        scope       TEXT NOT NULL CHECK (scope IN ('version', 'snapshot')),
+        snapshot_id INTEGER,
+        reason      TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        released_at TEXT,
+        created_at  TEXT NOT NULL,
+        CHECK ((scope = 'version') = (snapshot_id IS NULL))
+    )
+    """,
     # Persistent cache of field-impact query results, keyed by the source
     # field. Entries are invalidated whenever a committed write could change
     # what is reachable from the cached source (see app.repository).

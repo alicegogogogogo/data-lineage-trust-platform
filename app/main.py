@@ -38,6 +38,8 @@ from app.models import (
     QualityRuleEvaluateResponse,
     RetentionPolicy,
     RetentionPolicyCreate,
+    RetentionException,
+    RetentionExceptionCreate,
     SchemaVersion,
     SchemaVersionCreate,
     SnapshotCreate,
@@ -541,6 +543,69 @@ def confirm_snapshot_deletion_request(
     return ConfirmedSnapshotDeletionRequest(
         **repository.confirm_snapshot_deletion_request(
             conn, dataset_name, version, snapshot_id, request_id
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Retention exceptions (compliance holds on snapshot deletion)
+# --------------------------------------------------------------------------- #
+
+
+RETENTION_EXCEPTIONS_PATH = (
+    "/datasets/{dataset_name}/versions/{version}/retention-exceptions"
+)
+
+
+@app.post(
+    RETENTION_EXCEPTIONS_PATH,
+    response_model=RetentionException,
+    status_code=201,
+)
+def create_retention_exception(
+    dataset_name: str,
+    version: int,
+    payload: RetentionExceptionCreate,
+    conn=Depends(get_db),
+) -> RetentionException:
+    return RetentionException(
+        **repository.create_retention_exception(
+            conn,
+            dataset_name,
+            version,
+            payload.scope,
+            payload.snapshot_id,
+            payload.reason,
+            payload.expires_at,
+        )
+    )
+
+
+@app.get(RETENTION_EXCEPTIONS_PATH, response_model=list[RetentionException])
+def list_retention_exceptions(
+    dataset_name: str, version: int, conn=Depends(get_db)
+) -> list[RetentionException]:
+    return [
+        RetentionException(**exception)
+        for exception in repository.list_retention_exceptions(
+            conn, dataset_name, version
+        )
+    ]
+
+
+@app.post(
+    f"{RETENTION_EXCEPTIONS_PATH}/{{exception_id}}/release",
+    response_model=RetentionException,
+)
+def release_retention_exception(
+    dataset_name: str,
+    version: int,
+    exception_id: int,
+    conn=Depends(get_db),
+) -> RetentionException:
+    return RetentionException(
+        **repository.release_retention_exception(
+            conn, dataset_name, version, exception_id
         )
     )
 
