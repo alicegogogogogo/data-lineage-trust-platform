@@ -352,6 +352,37 @@ class ProcessingRunFinish(BaseModel):
     error: StrictStr | None = None
 
 
+class ProcessingTaskDependenciesUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    depends_on: list[StrictInt] = Field(
+        description="Ids of tasks in the same version that must succeed first; "
+        "replaces the current dependency set atomically (may be empty)"
+    )
+
+
+ScheduleState = Literal[
+    "ready",
+    "blocked",
+    "upstream_failed",
+    "running",
+    "succeeded",
+    "retryable",
+    "exhausted",
+]
+
+
+class ScheduledProcessingTask(ProcessingTask):
+    schedule_state: ScheduleState
+    blocking_task_ids: list[int]
+
+
+class ProcessingSchedule(BaseModel):
+    dataset: str
+    version: int
+    tasks: list[ScheduledProcessingTask]
+
+
 # --------------------------------------------------------------------------- #
 # Processing task run audit records
 # --------------------------------------------------------------------------- #

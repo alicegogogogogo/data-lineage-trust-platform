@@ -27,8 +27,10 @@ from app.models import (
     PrivacyViewRequest,
     PrivacyViewResponse,
     ProcessingRunFinish,
+    ProcessingSchedule,
     ProcessingTask,
     ProcessingTaskCreate,
+    ProcessingTaskDependenciesUpdate,
     ProcessingTaskRun,
     ProcessingTaskWithRuns,
     QualityRule,
@@ -647,6 +649,17 @@ def list_processing_tasks(
     ]
 
 
+# Declared before the "/{task_id}" route so the literal "schedule" segment is
+# matched here rather than parsed as a task id.
+@app.get(f"{PROCESSING_TASKS_PATH}/schedule", response_model=ProcessingSchedule)
+def get_processing_schedule(
+    dataset_name: str, version: int, conn=Depends(get_db)
+) -> ProcessingSchedule:
+    return ProcessingSchedule(
+        **repository.get_processing_schedule(conn, dataset_name, version)
+    )
+
+
 @app.get(
     f"{PROCESSING_TASKS_PATH}/{{task_id}}", response_model=ProcessingTaskWithRuns
 )
@@ -658,6 +671,24 @@ def get_processing_task(
 ) -> ProcessingTaskWithRuns:
     return ProcessingTaskWithRuns(
         **repository.get_processing_task(conn, dataset_name, version, task_id)
+    )
+
+
+@app.put(
+    f"{PROCESSING_TASKS_PATH}/{{task_id}}/dependencies",
+    response_model=ProcessingTask,
+)
+def replace_task_dependencies(
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    payload: ProcessingTaskDependenciesUpdate,
+    conn=Depends(get_db),
+) -> ProcessingTask:
+    return ProcessingTask(
+        **repository.replace_task_dependencies(
+            conn, dataset_name, version, task_id, payload.depends_on
+        )
     )
 
 

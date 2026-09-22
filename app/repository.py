@@ -1933,6 +1933,156 @@ def finish_task_run(
     return _run_row_to_dict(updated)
 
 
+def _version_dependency_edges(
+    conn: sqlite3.Connection, version_id: int
+) -> dict[int, list[int]]:
+    """Dependency edges of one version: task id -> ids it depends on."""
+    rows = conn.execute(
+        "SELECT id, depends_on FROM processing_tasks WHERE version_id = ?",
+        (version_id,),
+    ).fetchall()
+    return {row["id"]: json.loads(row["depends_on"]) for row in rows}
+
+
+def replace_task_dependencies(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    depends_on: list[int],
+) -> dict:
+    """Atomically replace a pending task's dependency set.
+
+    Unknown dataset/version/task/dependency ids are 404; a self-dependency, a
+    resulting cycle or a non-pending target task are 409; anything else wrong
+    with the body (e.g. duplicate ids) is 422 and writes nothing.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, version_row, dataset_name, version_number, task_id
+    )
+
+    if len(set(depends_on)) != len(depends_on):
+        raise RequestInvalidError("'depends_on' must not contain duplicate task ids")
+    for dependency_id in depends_on:
+        dependency = conn.execute(
+            "SELECT id FROM processing_tasks WHERE version_id = ? AND id = ?",
+            (version_row["id"], dependency_id),
+        ).fetchone()
+        if dependency is None:
+            raise NotFoundError(
+                f"Dependency task {dependency_id} does not exist in version "
+                f"{version_number} of dataset '{dataset_name}'"
+            )
+
+    if task_id in depends_on:
+        raise ConflictError(
+            f"Processing task {task_id} must not depend on itself"
+        )
+    if task_row["status"] != "pending":
+        raise ConflictError(
+            f"Processing task {task_id} is '{task_row['status']}'; only "
+            "pending tasks can have their dependencies edited"
+        )
+
+    # Only this task's outgoing edges change, so a new cycle must pass through
+    # it: reject when one of the new dependencies can reach the task again.
+    edges = _version_dependency_edges(conn, version_row["id"])
+    edges[task_id] = list(depends_on)
+    visited: set[int] = set()
+    stack = list(depends_on)
+    while stack:
+        current = stack.pop()
+        if current == task_id:
+            raise ConflictError(
+                f"Depending on task(s) {depends_on} would introduce a "
+                f"dependency cycle involving task {task_id}"
+            )
+        if current in visited:
+            continue
+        visited.add(current)
+        stack.extend(edges.get(current, ()))
+
+    conn.execute(
+        "UPDATE processing_tasks SET depends_on = ? WHERE id = ?",
+        (json.dumps(list(depends_on)), task_row["id"]),
+    )
+    updated = conn.execute(
+        "SELECT * FROM processing_tasks WHERE id = ?", (task_row["id"],)
+    ).fetchone()
+    return _task_row_to_dict(updated, dataset["name"], version_row["version"])
+
+
+def get_processing_schedule(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int
+) -> dict:
+    """Scheduling view of every task of one version, ordered by task id."""
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    rows = conn.execute(
+        "SELECT * FROM processing_tasks WHERE version_id = ? ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+    tasks = [
+        _task_row_to_dict(row, dataset["name"], version_row["version"])
+        for row in rows
+    ]
+    by_id = {task["id"]: task for task in tasks}
+
+    states: dict[int, str] = {}
+
+    def state_of(task: dict) -> str:
+        """Memoized schedule state; safe against legacy cyclic graphs."""
+        cached = states.get(task["id"])
+        if cached is not None:
+            return cached
+        status = task["status"]
+        if status in ("running", "succeeded"):
+            state = status
+        elif status == "failed":
+            state = (
+                "retryable"
+                if task["attempt_count"] < task["max_attempts"]
+                else "exhausted"
+            )
+        elif all(by_id[dep]["status"] == "succeeded" for dep in task["depends_on"]):
+            state = "ready"
+        else:
+            # Guard against cycles (only possible for tasks created before
+            # dependency editing existed): a task on the current DFS stack is
+            # optimistically treated as 'blocked' so the walk terminates.
+            states[task["id"]] = "blocked"
+            state = "blocked"
+            for dep in task["depends_on"]:
+                if state_of(by_id[dep]) in ("exhausted", "upstream_failed"):
+                    state = "upstream_failed"
+                    break
+        states[task["id"]] = state
+        return state
+
+    scheduled: list[dict] = []
+    for task in tasks:
+        entry = dict(task)
+        entry["schedule_state"] = state_of(task)
+        if task["status"] == "pending":
+            entry["blocking_task_ids"] = sorted(
+                dep
+                for dep in task["depends_on"]
+                if by_id[dep]["status"] != "succeeded"
+            )
+        else:
+            entry["blocking_task_ids"] = []
+        scheduled.append(entry)
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "tasks": scheduled,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Processing task run audit records (append-only proof chain)
 # --------------------------------------------------------------------------- #
