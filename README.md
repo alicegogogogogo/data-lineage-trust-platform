@@ -265,6 +265,28 @@ run records one attempt. Tasks and runs are persisted across restarts.
   does not belong to the task/version in the path → `422`; unknown
   dataset/version/task/run → `404`; other invalid input → `422` and nothing
   is written.
+- `PUT /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/dependencies` —
+  atomically replace the task's dependency list. Body contains only
+  `{"depends_on": [<task id>, ...]}` (the array may be empty); the ids must
+  reference existing tasks of the same version without duplicates and must not
+  include the target task itself. The replacement is rejected when the target
+  task is not `pending` or when it would introduce a cycle in the dependency
+  graph; on success the updated task is returned. Unknown
+  dataset/version/task/dependency → `404`; a self dependency, a cycle or a
+  non-`pending` target → `409`; any other invalid body → `422` and nothing is
+  written. The existing run-start rule uses the updated dependencies.
+- `GET /datasets/{dataset}/versions/{version}/processing-tasks/schedule` —
+  return `{"dataset", "version", "tasks"}` with tasks sorted by `id` ascending.
+  Each task carries every processing-task field plus `schedule_state` and
+  `blocking_task_ids`. `schedule_state` is `running` or `succeeded` for tasks
+  in those states; a `failed` task is `retryable` while attempts remain and
+  `exhausted` once they are used up; a `pending` task is `ready` when all of
+  its direct dependencies have succeeded, `upstream_failed` when any
+  dependency chain contains an `exhausted` or `upstream_failed` task, and
+  `blocked` otherwise. `blocking_task_ids` lists the direct dependencies that
+  have not succeeded, sorted ascending; it is empty for non-pending tasks.
+  States are recomputed on every read (including after a successful retry)
+  and both the dependency graph and the schedule survive restarts.
 
 ### Processing run audit records (append-only proof chain)
 

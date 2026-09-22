@@ -1934,6 +1934,191 @@ def finish_task_run(
 
 
 # --------------------------------------------------------------------------- #
+# Dependency graph editing and the scheduling view
+# --------------------------------------------------------------------------- #
+
+
+def _version_task_rows(
+    conn: sqlite3.Connection, version_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM processing_tasks WHERE version_id = ? ORDER BY id",
+        (version_id,),
+    ).fetchall()
+
+
+def _task_dependency_graph(rows: list[sqlite3.Row]) -> dict[int, list[int]]:
+    """Adjacency task id -> its direct dependency ids for one version."""
+    return {row["id"]: json.loads(row["depends_on"]) for row in rows}
+
+
+def _graph_reaches_target(
+    graph: dict[int, list[int]], start: int, target: int
+) -> bool:
+    """Whether ``target`` is reachable from ``start`` along dependency edges."""
+    visited = {start}
+    stack = [start]
+    while stack:
+        current = stack.pop()
+        for dependency in graph.get(current, ()):
+            if dependency == target:
+                return True
+            if dependency not in visited:
+                visited.add(dependency)
+                stack.append(dependency)
+    return False
+
+
+def replace_task_dependencies(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    depends_on: list[int],
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, version_row, dataset_name, version_number, task_id
+    )
+
+    if len(set(depends_on)) != len(depends_on):
+        raise RequestInvalidError("'depends_on' must not contain duplicate task ids")
+    if task_id in depends_on:
+        raise ConflictError(
+            f"Processing task {task_id} must not depend on itself"
+        )
+
+    task_rows = _version_task_rows(conn, version_row["id"])
+    existing_ids = {row["id"] for row in task_rows}
+    unknown = [dependency_id for dependency_id in depends_on if dependency_id not in existing_ids]
+    if unknown:
+        raise NotFoundError(
+            f"Dependency task {unknown[0]} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    if task_row["status"] != "pending":
+        raise ConflictError(
+            f"Processing task {task_id} is '{task_row['status']}'; only pending "
+            "tasks can have their dependencies replaced"
+        )
+
+    # Build the prospective graph (the target task's edges replaced, every other
+    # task unchanged) and reject cycles. Only the target's edges change, so any
+    # newly introduced cycle must pass through the target: it exists iff a new
+    # dependency can already reach the target.
+    graph = _task_dependency_graph(task_rows)
+    graph[task_row["id"]] = list(depends_on)
+    if any(
+        _graph_reaches_target(graph, dependency_id, task_row["id"])
+        for dependency_id in depends_on
+    ):
+        raise ConflictError(
+            "Replacing the dependencies would introduce a cycle in the task graph"
+        )
+
+    # Validation above shares this transaction with the write, so the replacement
+    # either commits atomically or leaves the graph untouched.
+    conn.execute(
+        "UPDATE processing_tasks SET depends_on = ? WHERE id = ?",
+        (json.dumps(list(depends_on)), task_row["id"]),
+    )
+    updated = conn.execute(
+        "SELECT * FROM processing_tasks WHERE id = ?", (task_row["id"],)
+    ).fetchone()
+    return _task_row_to_dict(updated, dataset["name"], version_row["version"])
+
+
+def _schedule_states(
+    graph: dict[int, tuple[str, int, int, list[int]]],
+) -> dict[int, str]:
+    """Derive the schedule state of every task in one version.
+
+    Non-pending tasks map directly from their stored status (``failed`` splits
+    into ``retryable``/``exhausted`` on remaining attempts). Pending tasks are
+    resolved against their dependencies by fixed-point propagation: all direct
+    dependencies succeeded -> ``ready``; any dependency chain exhausted or
+    already ``upstream_failed`` -> ``upstream_failed``; otherwise ``blocked``.
+    The graph is acyclic (enforced at creation and on every replacement), so
+    the propagation terminates.
+    """
+    states: dict[int, str] = {}
+    for task_id, (status, attempt_count, max_attempts, _deps) in graph.items():
+        if status == "pending":
+            continue
+        if status == "failed":
+            states[task_id] = (
+                "retryable" if attempt_count < max_attempts else "exhausted"
+            )
+        else:
+            states[task_id] = status
+
+    changed = True
+    while changed:
+        changed = False
+        for task_id, (status, _attempt_count, _max_attempts, deps) in graph.items():
+            if status != "pending":
+                continue
+            if any(
+                states.get(dependency_id) in ("exhausted", "upstream_failed")
+                for dependency_id in deps
+            ):
+                new_state = "upstream_failed"
+            elif all(
+                states.get(dependency_id) == "succeeded" for dependency_id in deps
+            ):
+                # An empty dependency list vacuously satisfies "all succeeded".
+                new_state = "ready"
+            else:
+                new_state = "blocked"
+            if states.get(task_id) != new_state:
+                states[task_id] = new_state
+                changed = True
+    return states
+
+
+def get_processing_schedule(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    rows = _version_task_rows(conn, version_row["id"])
+    graph: dict[int, tuple[str, int, int, list[int]]] = {
+        row["id"]: (
+            row["status"],
+            row["attempt_count"],
+            row["max_attempts"],
+            json.loads(row["depends_on"]),
+        )
+        for row in rows
+    }
+    states = _schedule_states(graph)
+
+    tasks: list[dict] = []
+    for row in rows:
+        task = _task_row_to_dict(row, dataset["name"], version_row["version"])
+        task["schedule_state"] = states[row["id"]]
+        if row["status"] == "pending":
+            deps = graph[row["id"]][3]
+            task["blocking_task_ids"] = sorted(
+                dependency_id
+                for dependency_id in deps
+                if states.get(dependency_id) != "succeeded"
+            )
+        else:
+            task["blocking_task_ids"] = []
+        tasks.append(task)
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "tasks": tasks,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Processing task run audit records (append-only proof chain)
 # --------------------------------------------------------------------------- #
 

@@ -29,8 +29,10 @@ from app.models import (
     ProcessingRunFinish,
     ProcessingTask,
     ProcessingTaskCreate,
+    ProcessingTaskDependenciesUpdate,
     ProcessingTaskRun,
     ProcessingTaskWithRuns,
+    ProcessingScheduleResponse,
     QualityRule,
     QualityRuleCreate,
     QualityRuleEnabledUpdate,
@@ -645,6 +647,38 @@ def list_processing_tasks(
         ProcessingTask(**task)
         for task in repository.list_processing_tasks(conn, dataset_name, version)
     ]
+
+
+# Declared before the "/{task_id}" route so the literal "schedule" segment is not
+# parsed as a task id (mirrors the snapshots "/at" route).
+@app.get(
+    f"{PROCESSING_TASKS_PATH}/schedule",
+    response_model=ProcessingScheduleResponse,
+)
+def get_processing_schedule(
+    dataset_name: str, version: int, conn=Depends(get_db)
+) -> ProcessingScheduleResponse:
+    return ProcessingScheduleResponse(
+        **repository.get_processing_schedule(conn, dataset_name, version)
+    )
+
+
+@app.put(
+    f"{PROCESSING_TASKS_PATH}/{{task_id}}/dependencies",
+    response_model=ProcessingTask,
+)
+def replace_processing_task_dependencies(
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    payload: ProcessingTaskDependenciesUpdate,
+    conn=Depends(get_db),
+) -> ProcessingTask:
+    return ProcessingTask(
+        **repository.replace_task_dependencies(
+            conn, dataset_name, version, task_id, payload.depends_on
+        )
+    )
 
 
 @app.get(
