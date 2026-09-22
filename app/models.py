@@ -352,6 +352,24 @@ class ProcessingRunFinish(BaseModel):
     error: StrictStr | None = None
 
 
+class ProcessingTaskDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Non-optional with a default: omission yields 1, while an explicit null is
+    # rejected like any other non-integer ("given" values must be positive ints).
+    limit: StrictInt = Field(
+        default=1,
+        ge=1,
+        description="Maximum number of tasks to start; defaults to 1 when omitted",
+    )
+
+
+class ProcessingTaskDispatchResponse(BaseModel):
+    dataset: str
+    version: int
+    runs: list[ProcessingTaskRun]
+
+
 class ProcessingTaskDependenciesUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -257,6 +257,25 @@ run records one attempt. Tasks and runs are persisted across restarts.
   `depends_on` has status `succeeded`; otherwise `409` and nothing is written.
   Returns `201` with the new `running` run and increments the task's
   `attempt_count` (the task becomes `running`).
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/dispatch` —
+  worker batch claim. The body is optional and contains only an optional
+  `limit`: omit the body (or send `{}`) to claim one task, or send
+  `{"limit": <positive integer>}`. Within a single transaction, up to `limit`
+  startable tasks are selected by task id ascending; a task is startable when
+  it is `pending`, or `failed` with attempts left, and every direct dependency
+  is `succeeded` at selection time. Each selected task gets a new `running`
+  run for its next attempt, `attempt_count` is incremented and the task becomes
+  `running`. `running`, `succeeded`, attempt-exhausted and dependency-blocked
+  tasks are skipped; a task started earlier in the same request is only
+  `running`, so its dependents are not selectable until a later request.
+  Returns `201` with `{"dataset", "version", "runs"}`; `runs` is sorted by
+  task id ascending and each run has the same fields as the single-task start
+  endpoint. When no task is startable the response is still `201` with an
+  empty `runs` list. Concurrent dispatches (and dispatches interleaved with
+  single-task starts) never create a duplicate attempt or two running runs for
+  the same task, and a single response never exceeds `limit`. Unknown
+  dataset/version → `404`; extra body fields, a non-integer (including
+  boolean) or non-positive `limit` → `422` and nothing is written.
 - `PATCH /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}` —
   finish the currently running run. Body: `{"status": "succeeded"}` or
   `{"status": "failed", "error": "<non-empty message>"}`. Writes `finished_at`

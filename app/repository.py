@@ -8,6 +8,7 @@ import math
 import sqlite3
 import threading
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1682,6 +1683,23 @@ def _require_no_active_retention_exception(
 # --------------------------------------------------------------------------- #
 
 
+# Serializes the read-eligible-tasks -> start-runs sequence within this
+# process, so concurrent dispatch requests and single-task starts interleave as
+# whole transactions and never start the same task twice. The conditional
+# UPDATE in _start_task_run and the UNIQUE(task_id, attempt) constraint remain
+# the hard guards against writers in other processes.
+_processing_start_lock = threading.Lock()
+
+
+@contextmanager
+def _processing_write_section():
+    _processing_start_lock.acquire()
+    try:
+        yield
+    finally:
+        _processing_start_lock.release()
+
+
 def _task_row_to_dict(
     row: sqlite3.Row, dataset_name: str, version_number: int
 ) -> dict:
@@ -1820,7 +1838,73 @@ def get_processing_task(
     return result
 
 
+def _insert_task_run(
+    conn: sqlite3.Connection, task_id: int, attempt: int
+) -> sqlite3.Row:
+    """Insert one ``running`` run and return its stored row.
+
+    The UNIQUE(task_id, attempt) constraint is the hard guard against a
+    duplicate attempt created by a competing transaction (the dispatch
+    endpoint or a concurrent single-task start).
+    """
+    cursor = conn.execute(
+        "INSERT INTO processing_task_runs (task_id, attempt, status, started_at) "
+        "VALUES (?, ?, 'running', ?)",
+        (task_id, attempt, utc_now_iso()),
+    )
+    return conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+
+
+def _start_task_run(conn: sqlite3.Connection, task_row: sqlite3.Row) -> dict:
+    """Flip one eligible task to ``running`` and create its next attempt.
+
+    The conditional UPDATE re-checks status and attempt budget against the
+    current row so a task selected earlier in the same transaction (a
+    dependency started by this very dispatch) or by a concurrent transaction
+    cannot be started twice: it only matches a row still in the state read
+    during eligibility checks.
+    """
+    attempt = task_row["attempt_count"] + 1
+    cursor = conn.execute(
+        "UPDATE processing_tasks SET attempt_count = ?, status = 'running' "
+        "WHERE id = ? AND status = ? AND attempt_count = ? "
+        "AND attempt_count < max_attempts",
+        (attempt, task_row["id"], task_row["status"], task_row["attempt_count"]),
+    )
+    if cursor.rowcount != 1:
+        # Lost a race against another transaction that started this task.
+        raise ConflictError(
+            f"Processing task {task_row['id']} was started concurrently"
+        )
+    return _run_row_to_dict(_insert_task_run(conn, task_row["id"], attempt))
+
+
 def create_task_run(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+) -> dict:
+    # Take the write lock before any read on this fresh connection: a writer
+    # transaction established up front never has to upgrade a shared lock
+    # later (which can deadlock against another holder), and every eligibility
+    # read already sees the most recently committed state. The process-wide
+    # lock additionally makes concurrent starts in this process interleave as
+    # whole request transactions.
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            return _create_task_run_locked(
+                conn, dataset_name, version_number, task_id
+            )
+        except BaseException:
+            conn.rollback()
+            raise
+
+
+def _create_task_run_locked(
     conn: sqlite3.Connection,
     dataset_name: str,
     version_number: int,
@@ -1859,21 +1943,68 @@ def create_task_run(
                 + " have not succeeded"
             )
 
-    attempt = task_row["attempt_count"] + 1
-    cursor = conn.execute(
-        "INSERT INTO processing_task_runs (task_id, attempt, status, started_at) "
-        "VALUES (?, ?, 'running', ?)",
-        (task_row["id"], attempt, utc_now_iso()),
-    )
-    conn.execute(
-        "UPDATE processing_tasks SET attempt_count = ?, status = 'running' "
-        "WHERE id = ?",
-        (attempt, task_row["id"]),
-    )
-    row = conn.execute(
-        "SELECT * FROM processing_task_runs WHERE id = ?", (cursor.lastrowid,)
-    ).fetchone()
-    return _run_row_to_dict(row)
+    # The conditional UPDATE and UNIQUE(task_id, attempt) remain the hard
+    # guards against a writer in another process that won the IMMEDIATE race.
+    return _start_task_run(conn, task_row)
+
+
+def dispatch_processing_tasks(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    limit: int,
+) -> dict:
+    """Start up to ``limit`` startable tasks of one version in one transaction.
+
+    A task is startable when it is ``pending``, or ``failed`` with attempts
+    left, and every direct dependency has ``succeeded`` at the moment of
+    selection. Tasks are considered by id ascending and a task started earlier
+    in this request is no longer ``succeeded``, so tasks that only become
+    eligible through a same-request start are never selected. ``running``,
+    ``succeeded``, attempt-exhausted and dependency-blocked tasks are skipped.
+
+    The whole selection and every run insert share one transaction: either all
+    selected starts commit together or none do.
+    """
+    with _processing_write_section():
+        # BEGIN IMMEDIATE takes the SQLite write (RESERVED) lock up front, so a
+        # concurrent dispatch (or single-task start) blocks here until the
+        # holder commits instead of failing with a busy error deep in its
+        # writes. The lock is released by the request transaction's
+        # commit/rollback in db_session.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+
+            rows = _version_task_rows(conn, version_row["id"])
+            statuses: dict[int, str] = {row["id"]: row["status"] for row in rows}
+            started: list[dict] = []
+            for row in rows:
+                if len(started) >= limit:
+                    break
+                if row["status"] not in ("pending", "failed"):
+                    continue
+                if row["attempt_count"] >= row["max_attempts"]:
+                    continue
+                dependencies = json.loads(row["depends_on"])
+                # Reflect tasks started earlier in this very request: their
+                # status is now 'running', so a dependent task is not (yet)
+                # eligible.
+                if any(statuses.get(dep_id) != "succeeded" for dep_id in dependencies):
+                    continue
+                started.append(_start_task_run(conn, row))
+                statuses[row["id"]] = "running"
+        except BaseException:
+            conn.rollback()
+            raise
+
+    started.sort(key=lambda run: run["task_id"])
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "runs": started,
+    }
 
 
 def finish_task_run(
