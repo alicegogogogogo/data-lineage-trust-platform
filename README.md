@@ -287,6 +287,24 @@ run records one attempt. Tasks and runs are persisted across restarts.
   have not succeeded, sorted ascending; it is empty for non-pending tasks.
   States are recomputed on every read (including after a successful retry)
   and both the dependency graph and the schedule survive restarts.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/dispatch` —
+  atomically claim a batch of startable tasks for a worker. The body may
+  contain only an optional `limit` (a positive integer, default `1`); extra
+  fields, a non-integer, a boolean or a non-positive `limit` → `422` and
+  nothing is written. In a single transaction, up to `limit` tasks are
+  selected by ascending task id: a task qualifies when it is `pending`, or
+  `failed` with `attempt_count < max_attempts`, and every task in its
+  `depends_on` has status `succeeded`. `running`, `succeeded`, exhausted and
+  dependency-blocked tasks are skipped, and a task started by this dispatch
+  does not unblock its dependents within the same request. Each selected task
+  gets a new `running` run for its next attempt, its `attempt_count` is
+  incremented and it becomes `running`. Returns `201` with `{"dataset",
+  "version", "runs"}`; `runs` is sorted by task id ascending, each entry has
+  the same fields as the single-task run-start response, and it is empty when
+  no task can start. Concurrent dispatches (and interleaved single-task run
+  starts) never produce a duplicate attempt or two `running` runs of the same
+  task, and a single response never exceeds `limit`. Unknown dataset/version
+  → `404`.
 
 ### Processing run audit records (append-only proof chain)
 

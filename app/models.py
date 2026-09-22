@@ -345,6 +345,22 @@ class ProcessingTaskWithRuns(ProcessingTask):
     runs: list[ProcessingTaskRun]
 
 
+class ProcessingTaskDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    limit: StrictInt = Field(
+        default=1,
+        ge=1,
+        description="Maximum number of tasks to start in this dispatch",
+    )
+
+
+class ProcessingTaskDispatchResponse(BaseModel):
+    dataset: str
+    version: int
+    runs: list[ProcessingTaskRun]
+
+
 class ProcessingRunFinish(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

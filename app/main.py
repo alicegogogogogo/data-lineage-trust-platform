@@ -30,6 +30,8 @@ from app.models import (
     ProcessingTask,
     ProcessingTaskCreate,
     ProcessingTaskDependenciesUpdate,
+    ProcessingTaskDispatchRequest,
+    ProcessingTaskDispatchResponse,
     ProcessingTaskRun,
     ProcessingTaskWithRuns,
     ProcessingScheduleResponse,
@@ -660,6 +662,25 @@ def get_processing_schedule(
 ) -> ProcessingScheduleResponse:
     return ProcessingScheduleResponse(
         **repository.get_processing_schedule(conn, dataset_name, version)
+    )
+
+
+# Declared before the "/{task_id}" routes so the literal "dispatch" segment is
+# never parsed as a task id (mirrors the "schedule" route).
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/dispatch",
+    response_model=ProcessingTaskDispatchResponse,
+    status_code=201,
+)
+def dispatch_processing_tasks(
+    dataset_name: str,
+    version: int,
+    payload: ProcessingTaskDispatchRequest | None = None,
+    conn=Depends(get_db),
+) -> ProcessingTaskDispatchResponse:
+    limit = payload.limit if payload is not None else 1
+    return ProcessingTaskDispatchResponse(
+        **repository.dispatch_task_runs(conn, dataset_name, version, limit)
     )
 
 

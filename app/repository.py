@@ -1820,45 +1820,33 @@ def get_processing_task(
     return result
 
 
-def create_task_run(
-    conn: sqlite3.Connection,
-    dataset_name: str,
-    version_number: int,
-    task_id: int,
-) -> dict:
-    dataset = require_dataset(conn, dataset_name)
-    version_row = _require_schema_version(conn, dataset, version_number)
-    task_row = _require_task(
-        conn, version_row, dataset_name, version_number, task_id
-    )
+# Serializes run starts (single-task and batch dispatch) within this process,
+# so concurrent requests can never start two runs of the same task or reuse an
+# attempt number (FastAPI runs these synchronous endpoints in one process's
+# threadpool). The UNIQUE(task_id, attempt) constraint is the hard guard
+# against writers in other processes.
+_task_start_lock = threading.Lock()
 
-    if task_row["status"] not in ("pending", "failed"):
-        raise ConflictError(
-            f"Processing task {task_id} is '{task_row['status']}' and cannot "
-            "start a new run"
-        )
-    if task_row["attempt_count"] >= task_row["max_attempts"]:
-        raise ConflictError(
-            f"Processing task {task_id} has exhausted its "
-            f"{task_row['max_attempts']} attempt(s)"
-        )
 
-    depends_on = json.loads(task_row["depends_on"])
-    if depends_on:
-        placeholders = ", ".join("?" for _ in depends_on)
-        dependency_rows = conn.execute(
-            f"SELECT id, status FROM processing_tasks WHERE id IN ({placeholders})",
-            depends_on,
-        ).fetchall()
-        blocking = [row["id"] for row in dependency_rows if row["status"] != "succeeded"]
-        if blocking:
-            raise ConflictError(
-                "Processing task "
-                f"{task_id} cannot start: dependency task(s) "
-                + ", ".join(str(dep_id) for dep_id in sorted(blocking))
-                + " have not succeeded"
-            )
+def _begin_start_transaction(conn: sqlite3.Connection) -> None:
+    """Take the SQLite write lock before any read of the task state.
 
+    A deferred (default) transaction would read a snapshot first and could then
+    fail to upgrade to a write transaction once a concurrent starter commits.
+    Beginning immediate makes concurrent starters — in this process or any
+    other — queue on the database lock instead, so each one reads a snapshot
+    that already includes the previous starter's committed runs.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+
+
+def _start_task_run(conn: sqlite3.Connection, task_row: sqlite3.Row) -> dict:
+    """Insert the next running attempt and mark the task running.
+
+    The caller must hold ``_task_start_lock`` and must have validated that the
+    task is startable; both run inside the request's transaction, so the run
+    insert and the task update commit atomically.
+    """
     attempt = task_row["attempt_count"] + 1
     cursor = conn.execute(
         "INSERT INTO processing_task_runs (task_id, attempt, status, started_at) "
@@ -1874,6 +1862,95 @@ def create_task_run(
         "SELECT * FROM processing_task_runs WHERE id = ?", (cursor.lastrowid,)
     ).fetchone()
     return _run_row_to_dict(row)
+
+
+def create_task_run(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+) -> dict:
+    with _task_start_lock:
+        _begin_start_transaction(conn)
+        dataset = require_dataset(conn, dataset_name)
+        version_row = _require_schema_version(conn, dataset, version_number)
+        task_row = _require_task(
+            conn, version_row, dataset_name, version_number, task_id
+        )
+
+        if task_row["status"] not in ("pending", "failed"):
+            raise ConflictError(
+                f"Processing task {task_id} is '{task_row['status']}' and cannot "
+                "start a new run"
+            )
+        if task_row["attempt_count"] >= task_row["max_attempts"]:
+            raise ConflictError(
+                f"Processing task {task_id} has exhausted its "
+                f"{task_row['max_attempts']} attempt(s)"
+            )
+
+        depends_on = json.loads(task_row["depends_on"])
+        if depends_on:
+            placeholders = ", ".join("?" for _ in depends_on)
+            dependency_rows = conn.execute(
+                f"SELECT id, status FROM processing_tasks WHERE id IN ({placeholders})",
+                depends_on,
+            ).fetchall()
+            blocking = [row["id"] for row in dependency_rows if row["status"] != "succeeded"]
+            if blocking:
+                raise ConflictError(
+                    "Processing task "
+                    f"{task_id} cannot start: dependency task(s) "
+                    + ", ".join(str(dep_id) for dep_id in sorted(blocking))
+                    + " have not succeeded"
+                )
+
+        return _start_task_run(conn, task_row)
+
+
+def _task_startable(row: sqlite3.Row, status_by_id: dict[int, str]) -> bool:
+    """Whether a task may start a run, given the version's status snapshot."""
+    status = row["status"]
+    if status == "failed":
+        # A failed task is retryable only while attempts remain.
+        if row["attempt_count"] >= row["max_attempts"]:
+            return False
+    elif status != "pending":
+        return False
+    return all(
+        status_by_id.get(dependency_id) == "succeeded"
+        for dependency_id in json.loads(row["depends_on"])
+    )
+
+
+def dispatch_task_runs(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    limit: int,
+) -> dict:
+    with _task_start_lock:
+        _begin_start_transaction(conn)
+        dataset = require_dataset(conn, dataset_name)
+        version_row = _require_schema_version(conn, dataset, version_number)
+        rows = _version_task_rows(conn, version_row["id"])
+        # Eligibility is evaluated against this single snapshot: tasks started
+        # below become 'running' (never 'succeeded'), so a task started by this
+        # dispatch cannot unblock its dependents within the same request.
+        status_by_id = {row["id"]: row["status"] for row in rows}
+        runs: list[dict] = []
+        for row in rows:  # ascending task id order
+            if len(runs) >= limit:
+                break
+            if not _task_startable(row, status_by_id):
+                continue
+            runs.append(_start_task_run(conn, row))
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "runs": runs,
+    }
 
 
 def finish_task_run(
