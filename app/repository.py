@@ -2467,14 +2467,16 @@ def list_audit_records(
     return [_audit_record_row_to_dict(row) for row in rows]
 
 
-def verify_audit_chain(
-    conn: sqlite3.Connection,
-    dataset_name: str,
-    version_number: int,
-    task_id: int,
-    run_id: int,
-) -> dict:
-    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+def _verify_run_audit_records(conn: sqlite3.Connection, run_id: int) -> dict:
+    """Re-verify one run's audit chain.
+
+    Recomputes every ``evidence_hash`` and checks that ``sequence`` values are
+    continuous from ``1`` and that each ``previous_hash`` equals the preceding
+    record's ``evidence_hash`` (the first must be ``None``). Verification
+    always walks every record, so a failure on an early record keeps the
+    following detail visible; ``last_evidence_hash`` is the stored hash of the
+    final record (``None`` for an empty chain).
+    """
     rows = conn.execute(
         "SELECT * FROM processing_task_audit_records WHERE run_id = ? "
         "ORDER BY sequence ASC",
@@ -2484,6 +2486,7 @@ def verify_audit_chain(
     valid = True
     expected_sequence = 1
     previous_hash: str | None = None
+    last_evidence_hash: str | None = None
     for row in rows:
         record = _audit_record_row_to_dict(row)
         if record["sequence"] != expected_sequence:
@@ -2493,13 +2496,94 @@ def verify_audit_chain(
         if _audit_evidence_hash(record) != record["evidence_hash"]:
             valid = False
         previous_hash = record["evidence_hash"]
+        last_evidence_hash = record["evidence_hash"]
         expected_sequence += 1
 
+    return {
+        "valid": valid,
+        "checked_count": len(rows),
+        "last_evidence_hash": last_evidence_hash,
+    }
+
+
+def verify_audit_chain(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+) -> dict:
+    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+    proof = _verify_run_audit_records(conn, run_id)
     return {
         "dataset": dataset_name,
         "version": version_number,
         "task_id": task_id,
         "run_id": run_id,
-        "valid": valid,
-        "checked_count": len(rows),
+        "valid": proof["valid"],
+        "checked_count": proof["checked_count"],
+    }
+
+
+def get_processing_audit_report(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int
+) -> dict:
+    """Read-only audit report for every task and run of one schema version.
+
+    Tasks are returned by id ascending and each task's runs by attempt
+    ascending. Every run carries a ``proof`` obtained by re-verifying its audit
+    chain on the spot (``null`` when the run has no audit records). The summary
+    counts are accumulated from the very same task/run rows and proofs, so the
+    totals always agree with the detail. A failed task counts as exhausted when
+    it has used every allowed attempt.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    task_rows = _version_task_rows(conn, version_row["id"])
+    tasks: list[dict] = []
+    status_counts = {"pending": 0, "running": 0, "succeeded": 0, "failed": 0}
+    exhausted_tasks = 0
+    run_count = 0
+    invalid_audit_runs = 0
+
+    for task_row in task_rows:
+        task = _task_row_to_dict(
+            task_row, dataset["name"], version_row["version"]
+        )
+        status_counts[task["status"]] += 1
+        if task["status"] == "failed" and task["attempt_count"] >= task["max_attempts"]:
+            exhausted_tasks += 1
+
+        run_rows = conn.execute(
+            "SELECT * FROM processing_task_runs WHERE task_id = ? ORDER BY attempt",
+            (task_row["id"],),
+        ).fetchall()
+        runs: list[dict] = []
+        for run_row in run_rows:
+            run = _run_row_to_dict(run_row)
+            run_count += 1
+            proof = _verify_run_audit_records(conn, run_row["id"])
+            if not proof["valid"]:
+                invalid_audit_runs += 1
+            # An empty chain is not a chain at all: no proof is reported.
+            run["proof"] = proof if proof["checked_count"] else None
+            runs.append(run)
+        task["runs"] = runs
+        tasks.append(task)
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "summary": {
+            "task_count": len(tasks),
+            "run_count": run_count,
+            "pending_tasks": status_counts["pending"],
+            "running_tasks": status_counts["running"],
+            "succeeded_tasks": status_counts["succeeded"],
+            "failed_tasks": status_counts["failed"],
+            "exhausted_tasks": exhausted_tasks,
+            "invalid_audit_runs": invalid_audit_runs,
+        },
+        "tasks": tasks,
     }

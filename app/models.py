@@ -427,3 +427,41 @@ class AuditChainVerifyResponse(BaseModel):
     run_id: int
     valid: bool
     checked_count: int
+
+
+class AuditChainProof(BaseModel):
+    valid: bool
+    checked_count: int
+    last_evidence_hash: str | None
+
+
+class AuditReportRun(ProcessingTaskRun):
+    proof: AuditChainProof | None
+
+
+class AuditReportTask(ProcessingTask):
+    runs: list[AuditReportRun]
+
+
+class ProcessingAuditReportSummary(BaseModel):
+    task_count: int
+    run_count: int
+    pending_tasks: int
+    running_tasks: int
+    succeeded_tasks: int
+    failed_tasks: int
+    exhausted_tasks: int
+    invalid_audit_runs: int
+
+
+class ProcessingAuditReportResponse(BaseModel):
+    dataset: str
+    version: int
+    summary: ProcessingAuditReportSummary
+    tasks: list[AuditReportTask]
+
+
+class AuditReportRequest(BaseModel):
+    # The report is parameterless; an empty object is the only accepted body
+    # and any member makes the request malformed (422, nothing is read/written).
+    model_config = ConfigDict(extra="forbid")

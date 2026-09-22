@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Body, Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -15,6 +15,7 @@ from app.models import (
     AuditChainVerifyResponse,
     AuditRecord,
     AuditRecordCreate,
+    AuditReportRequest,
     Dataset,
     DatasetCreate,
     LineageCreate,
@@ -35,6 +36,7 @@ from app.models import (
     ProcessingTaskRun,
     ProcessingTaskWithRuns,
     ProcessingScheduleResponse,
+    ProcessingAuditReportResponse,
     QualityRule,
     QualityRuleCreate,
     QualityRuleEnabledUpdate,
@@ -683,6 +685,30 @@ def dispatch_processing_tasks(
             conn, dataset_name, version, payload.limit
         )
     )
+
+
+# The literal "audit-report" segment must not be parsed as a task id (mirrors
+# the "schedule" and "dispatch" routes). The report takes no parameters: the
+# body must be absent or an empty object and no query parameters are allowed.
+@app.get(
+    f"{PROCESSING_TASKS_PATH}/audit-report",
+    response_model=ProcessingAuditReportResponse,
+)
+def get_processing_audit_report(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    payload: AuditReportRequest | None = Body(default=None),
+    conn=Depends(get_db),
+) -> ProcessingAuditReportResponse:
+    # Resolve the path target first so an unknown dataset/version stays 404
+    # even when junk query parameters are attached; the report is read-only.
+    report = repository.get_processing_audit_report(conn, dataset_name, version)
+    if request.query_params:
+        raise RequestInvalidError(
+            "The audit report does not accept query parameters"
+        )
+    return ProcessingAuditReportResponse(**report)
 
 
 @app.put(

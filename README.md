@@ -334,6 +334,26 @@ SHA-256 evidence hashes. They persist across restarts.
   are continuous from `1` and that each `previous_hash` equals the preceding
   record's `evidence_hash` (the first must be `null`). An intact chain returns
   `"valid": true` (also for an empty chain).
+- `GET /datasets/{dataset}/versions/{version}/processing-tasks/audit-report` —
+  read-only audit report for the whole version. Takes no parameters: the
+  request body must be absent or `{}`, query parameters are rejected and a
+  malformed/non-empty body is `422` with nothing written; unknown
+  dataset/version → `404`. Returns
+  `{"dataset", "version", "summary", "tasks"}`. `summary` contains
+  `task_count`, `run_count`, `pending_tasks`, `running_tasks`,
+  `succeeded_tasks`, `failed_tasks`, `exhausted_tasks` (failed tasks that have
+  used every allowed attempt) and `invalid_audit_runs` (runs whose audit chain
+  fails re-verification); the totals are accumulated from the same rows as the
+  detail. `tasks` is sorted by task id ascending and each task carries every
+  processing-task field plus `runs`; `runs` is sorted by `attempt` ascending,
+  carries every run field plus `proof`. `proof` re-verifies that run's chain
+  in the same way as the `/verify` endpoint and is
+  `{"valid", "checked_count", "last_evidence_hash"}`, where
+  `last_evidence_hash` is the stored hash of the final record (`null` for an
+  empty chain, which reports `proof: null`); a failed verification keeps all
+  detail and simply reports `"valid": false`. The report is recomputed from
+  persisted state on every read, so repeated reads and reads after a restart
+  return identical results.
 
 `evidence_hash` is the hexadecimal SHA-256 of a canonical JSON document built
 from every stored field except `id`, `created_at` and `evidence_hash` itself
