@@ -279,6 +279,32 @@ stable ids) persist across restarts.
   scalars (objects and arrays included), an empty body, malformed JSON or any
   query parameter → `422` and nothing is written.
 
+#### Masking strategy suggestions
+
+- `GET /datasets/{dataset}/versions/{version}/sensitive-identifications/masking-suggestions`
+  — read-only advisory masking-strategy candidates derived from the version's
+  identification records. The endpoint takes no request body and no query
+  parameters (`422` if either is present, with nothing written); unknown
+  dataset/version → `404`. A version without identification records returns an
+  empty list rather than an error.
+
+  Each candidate has exactly `field`, `classification`, `masking` and
+  `allowed_roles`. Only records whose name or samples hit produce a candidate;
+  a record with empty evidence is omitted. Candidates follow the identification
+  records' `id` ascending and are recomputed on every read, so refreshing an
+  identification changes the suggestion on the next request. The endpoint
+  writes nothing, never registers a privacy policy and leaves the
+  identification records' fields, ordering and refresh semantics untouched;
+  the privacy view continues to mask according to registered policies only.
+
+  - `classification` is `PII` for email, phone, id-card and birthday hits, and
+    `CREDENTIAL` for password and token hits. A field hitting both is `PII`.
+  - `masking` reuses the privacy-view vocabulary: `partial` for `PII`
+    candidates and `redact` for `CREDENTIAL` candidates (a both-kinds field
+    takes `partial`); no new masking format is introduced.
+  - `allowed_roles` is always an empty list: the suggested masking applies to
+    every role, granting none an unmasked view.
+
 ### Row snapshots
 
 A row snapshot persistently records the rows of a schema version at one point in

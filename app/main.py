@@ -21,6 +21,7 @@ from app.models import (
     LineageCreatedResponse,
     LineageImpactResponse,
     LineageResponse,
+    MaskingSuggestion,
     PrivacyPolicy,
     PrivacyPolicyCreate,
     PrivacyPolicyEnabledUpdate,
@@ -644,6 +645,34 @@ def list_sensitive_identifications(
     return [
         SensitiveIdentification(**record)
         for record in repository.list_sensitive_identifications(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
+@app.get(
+    f"{SENSITIVE_IDENTIFICATIONS_PATH}/masking-suggestions",
+    response_model=list[MaskingSuggestion],
+)
+def list_masking_suggestions(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[MaskingSuggestion]:
+    # Read-only advisory candidates recomputed from the current identification
+    # records; they never register a privacy policy. The endpoint takes no
+    # request body and no query parameters (422), validated after the path
+    # dataset/version resolves so 404 keeps precedence (mirrors the
+    # identifications list endpoint).
+    return [
+        MaskingSuggestion(**suggestion)
+        for suggestion in repository.list_masking_suggestions(
             conn,
             dataset_name,
             version,

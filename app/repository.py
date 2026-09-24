@@ -1887,6 +1887,93 @@ def list_sensitive_identifications(
     ]
 
 
+# Evidence kinds that place an identified field in the PII classification
+# (email, phone, id card, birthday). Credential kinds are passwords and tokens.
+# A field hitting both groups stays PII (see ``_identification_suggestion``).
+_PII_EVIDENCE_KINDS: frozenset[str] = frozenset(
+    {
+        "name:email",
+        "name:phone",
+        "name:id_card",
+        "name:birth",
+        "sample:email",
+        "sample:phone",
+    }
+)
+_CREDENTIAL_EVIDENCE_KINDS: frozenset[str] = frozenset(
+    {"name:password", "name:token"}
+)
+
+
+def _identification_suggestion(row: sqlite3.Row) -> dict | None:
+    """Build the advisory masking suggestion for one identification record.
+
+    Returns ``None`` for a record with no evidence (neither the name nor the
+    samples ever hit): such a record produces no suggestion. Email, phone, id
+    card and birthday hits classify the field as ``PII`` and suggest
+    ``partial`` masking; password and token hits classify it as ``CREDENTIAL``
+    and suggest ``redact``. When both groups hit, PII wins and the masking is
+    ``partial``. Credential suggestions always carry an empty role list: the
+    suggested masking applies to every role.
+    """
+    evidence = json.loads(row["evidence"])
+    hits_pii = any(kind in _PII_EVIDENCE_KINDS for kind in evidence)
+    if hits_pii:
+        classification, masking = "PII", "partial"
+    elif any(kind in _CREDENTIAL_EVIDENCE_KINDS for kind in evidence):
+        classification, masking = "CREDENTIAL", "redact"
+    else:
+        return None
+    return {
+        "field": row["field"],
+        "classification": classification,
+        "masking": masking,
+        "allowed_roles": [],
+    }
+
+
+def list_masking_suggestions(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Advisory masking suggestions for one version, ordered by record id.
+
+    Suggestions are recomputed on every read from the current identification
+    records; the endpoint writes nothing and never registers a privacy policy.
+    Only records with at least one name or sample hit yield a suggestion, so a
+    version without identifications (or with only unhit records) returns an
+    empty list. The path dataset/version resolves first (404 precedence); any
+    body bytes or query parameters are a 422 checked afterwards, mirroring the
+    identifications list endpoint.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The masking suggestions endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The masking suggestions endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM sensitive_identifications WHERE version_id = ? ORDER BY id ASC",
+        (version_row["id"],),
+    ).fetchall()
+    suggestions: list[dict] = []
+    for row in rows:
+        suggestion = _identification_suggestion(row)
+        if suggestion is not None:
+            suggestions.append(suggestion)
+    return suggestions
+
+
 # --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #

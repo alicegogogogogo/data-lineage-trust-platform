@@ -357,6 +357,23 @@ class SensitiveIdentification(BaseModel):
     created_at: str
 
 
+# Advisory masking-strategy suggestions derived from the identification
+# records. They never create or modify a privacy policy; the privacy view
+# keeps masking according to registered policies only.
+MaskingSuggestionClassification = Literal["PII", "CREDENTIAL"]
+
+
+class MaskingSuggestion(BaseModel):
+    field: str
+    classification: MaskingSuggestionClassification
+    # Same vocabulary as the privacy view ("partial"/"redact"); a suggestion
+    # introduces no new masking format.
+    masking: PrivacyMasking
+    # Always empty: a candidate grants no role an unmasked view, so an empty
+    # list means the suggested masking applies to every role.
+    allowed_roles: list[str]
+
+
 # --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #
