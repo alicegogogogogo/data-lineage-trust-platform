@@ -28,6 +28,8 @@ from app.models import (
     PrivacyViewResponse,
     ProcessingRunCancel,
     ProcessingRunFinish,
+    ProcessingRunBatchCompleteRequest,
+    ProcessingRunBatchCompleteResponse,
     ProcessingTask,
     ProcessingTaskCreate,
     ProcessingTaskDependenciesUpdate,
@@ -742,6 +744,31 @@ def dispatch_processing_tasks(
     return ProcessingTaskDispatchResponse(
         **repository.dispatch_processing_tasks(
             conn, dataset_name, version, payload.limit
+        )
+    )
+
+
+# The literal "batch-complete" segment must not be parsed as a task id (mirrors
+# the "dispatch" and "schedule" routes). The body is required and contains only
+# the non-empty "runs" array.
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/batch-complete",
+    response_model=ProcessingRunBatchCompleteResponse,
+)
+def batch_complete_processing_task_runs(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    payload: ProcessingRunBatchCompleteRequest,
+    conn=Depends(get_db),
+) -> ProcessingRunBatchCompleteResponse:
+    return ProcessingRunBatchCompleteResponse(
+        **repository.batch_complete_task_runs(
+            conn,
+            dataset_name,
+            version,
+            [item.model_dump() for item in payload.runs],
+            query_keys=tuple(request.query_params.keys()),
         )
     )
 

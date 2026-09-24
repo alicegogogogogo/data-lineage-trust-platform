@@ -403,6 +403,33 @@ class ProcessingTaskDispatchResponse(BaseModel):
     runs: list[ProcessingTaskRun]
 
 
+class ProcessingRunBatchCompleteItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: StrictInt
+    run_id: StrictInt
+    status: Literal["succeeded", "failed"]
+    # Mirrors ProcessingRunFinish: null/omitted for success, a non-empty
+    # message for failure (emptiness is checked in the repository after the
+    # path resolves so 404 precedence is preserved).
+    error: StrictStr | None = None
+
+
+class ProcessingRunBatchCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    runs: list[ProcessingRunBatchCompleteItem] = Field(
+        min_length=1,
+        description="Non-empty batch of task/run completions for the path version",
+    )
+
+
+class ProcessingRunBatchCompleteResponse(BaseModel):
+    dataset: str
+    version: int
+    runs: list[ProcessingTaskRun]
+
+
 class ProcessingTaskDependenciesUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

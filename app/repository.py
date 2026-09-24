@@ -2266,6 +2266,182 @@ def cancel_task_run(
             raise
 
 
+def batch_complete_task_runs(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    items: list[dict[str, Any]],
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Finish a non-empty batch of currently running runs in one transaction.
+
+    Every item names a task of the path version together with one of its runs
+    and declares ``succeeded`` (no error) or ``failed`` (an error that is
+    non-empty after trimming). The whole batch is validated before any write:
+    the path dataset/version must exist (404); query parameters are rejected
+    (422); per-item status/error rules are checked (422); every named task must
+    exist in the version (404) and must not appear twice (409); every run must
+    exist (404), belong to the named task when it is in the same version (422)
+    and still be ``running`` with its task currently completable (409). A run
+    owned by a task in another dataset/version is treated as not existing in
+    this version (404).
+
+    On success every run gets a ``finished_at`` timestamp and its terminal
+    status, and the owning task moves to the same status atomically; the result
+    runs are returned ordered by task id ascending. A ``failed`` task keeps its
+    ``attempt_count`` and follows the existing retry rules. The process lock
+    and ``BEGIN IMMEDIATE`` serialize against single finish/cancel/start and
+    dispatch; the conditional ``UPDATE ... WHERE status = 'running'`` is the
+    hard single-winner guard, so any racing request gets a 409 with the whole
+    batch rolled back and no half-written row.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+
+            if query_keys:
+                raise RequestInvalidError(
+                    "The batch-complete endpoint does not accept query parameters"
+                )
+
+            # Phase 1: resolve every named task within the path version. All
+            # existence checks precede every other per-item check so an unknown
+            # task stays a 404 regardless of the batch order or any other
+            # invalid item.
+            task_rows: dict[int, sqlite3.Row] = {}
+            for item in items:
+                task_id = item["task_id"]
+                task_row = conn.execute(
+                    "SELECT * FROM processing_tasks WHERE version_id = ? AND id = ?",
+                    (version_row["id"], task_id),
+                ).fetchone()
+                if task_row is None:
+                    raise NotFoundError(
+                        f"Processing task {task_id} does not exist in version "
+                        f"{version_number} of dataset '{dataset_name}'"
+                    )
+                task_rows[task_id] = task_row
+
+            # Phase 2: per-item payload semantics, mirroring the single finish
+            # endpoint (which resolves the path task before these same checks):
+            # a success carries no error and a failure needs a non-blank one.
+            for item in items:
+                status = item["status"]
+                error = item["error"]
+                if status == "succeeded":
+                    if error is not None:
+                        raise RequestInvalidError(
+                            "A successful run must not carry an error message"
+                        )
+                elif error is None or not error.strip():
+                    raise RequestInvalidError(
+                        "A failed run requires a non-empty error message"
+                    )
+
+            # Phase 3: resolve every run. Existence across the whole batch is
+            # checked before ownership: a run in another dataset/version is out
+            # of scope and reported as not found (404), never as an ownership
+            # mismatch.
+            run_rows: dict[int, sqlite3.Row] = {}
+            for item in items:
+                run_id = item["run_id"]
+                run_row = conn.execute(
+                    "SELECT r.*, t.version_id AS owner_version_id "
+                    "FROM processing_task_runs r "
+                    "JOIN processing_tasks t ON t.id = r.task_id "
+                    "WHERE r.id = ?",
+                    (run_id,),
+                ).fetchone()
+                if run_row is None or run_row["owner_version_id"] != version_row["id"]:
+                    raise NotFoundError(
+                        f"Processing task run {run_id} does not exist in version "
+                        f"{version_number} of dataset '{dataset_name}'"
+                    )
+                run_rows[run_id] = run_row
+
+            # Phase 4: ownership within the version. A run of another task in
+            # the same (dataset, version) is a 422.
+            for item in items:
+                run_row = run_rows[item["run_id"]]
+                if run_row["task_id"] != item["task_id"]:
+                    raise RequestInvalidError(
+                        f"Processing task run {item['run_id']} does not belong to "
+                        f"task {item['task_id']} in version {version_number} of "
+                        f"dataset '{dataset_name}'"
+                    )
+
+            # Phase 5: conflicts, evaluated only once every reference resolves
+            # and every payload is valid (404/422 take precedence, as on the
+            # single finish endpoint). The same task may appear at most once;
+            # only the task's current running run can be completed and the task
+            # must still be running.
+            seen_task_ids: set[int] = set()
+            for item in items:
+                task_id = item["task_id"]
+                if task_id in seen_task_ids:
+                    raise ConflictError(
+                        f"Processing task {task_id} appears more than once in the "
+                        "batch; each task may be completed at most once"
+                    )
+                seen_task_ids.add(task_id)
+
+                task_row = task_rows[task_id]
+                run_row = run_rows[item["run_id"]]
+                if run_row["status"] != "running":
+                    raise ConflictError(
+                        f"Processing task run {run_row['id']} is already "
+                        f"'{run_row['status']}' and cannot be finished again"
+                    )
+                if task_row["status"] != "running":
+                    raise ConflictError(
+                        f"Processing task {task_row['id']} is "
+                        f"'{task_row['status']}' and cannot be completed currently"
+                    )
+
+            # All checks passed: write the batch. Each conditional update is
+            # the hard guard against a concurrent terminal transition; a lost
+            # race rolls back the entire batch.
+            finished_at = utc_now_iso()
+            for item in items:
+                run_row = run_rows[item["run_id"]]
+                error = item["error"] if item["status"] == "failed" else None
+                cursor = conn.execute(
+                    "UPDATE processing_task_runs SET status = ?, finished_at = ?, "
+                    "error = ? WHERE id = ? AND status = 'running'",
+                    (item["status"], finished_at, error, run_row["id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError(
+                        f"Processing task run {run_row['id']} was finished "
+                        "concurrently"
+                    )
+                conn.execute(
+                    "UPDATE processing_tasks SET status = ? WHERE id = ?",
+                    (item["status"], item["task_id"]),
+                )
+
+            completed: list[dict] = []
+            for item in items:
+                updated = conn.execute(
+                    "SELECT * FROM processing_task_runs WHERE id = ?",
+                    (item["run_id"],),
+                ).fetchone()
+                completed.append(_run_row_to_dict(updated))
+        except BaseException:
+            conn.rollback()
+            raise
+
+    completed.sort(key=lambda run: run["task_id"])
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "runs": completed,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Dependency graph editing and the scheduling view
 # --------------------------------------------------------------------------- #

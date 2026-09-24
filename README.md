@@ -284,6 +284,38 @@ run records one attempt. Tasks and runs are persisted across restarts.
   does not belong to the task/version in the path → `422`; unknown
   dataset/version/task/run → `404`; other invalid input → `422` and nothing
   is written.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/batch-complete` —
+  finish several currently running runs in one transaction. Body contains only
+  a non-empty `runs` array; each item names a task of the path version and one
+  of its runs: `{"task_id": <int>, "run_id": <int>, "status": "succeeded"}` or
+  the same with `"status": "failed"` and an `error` that is non-empty after
+  trimming whitespace (`succeeded` items carry no `error`). The same task must
+  not appear twice. The whole batch is validated before any write and either
+  every item completes or none do; on success the response is
+  `{"dataset", "version", "runs"}` with the completed runs sorted by task id
+  ascending, each carrying the same fields as the single-run finish response.
+  Every run gets a `finished_at` timestamp and its task moves atomically to
+  the same status; `failed` tasks keep their consumed attempts and stay
+  retryable while attempts remain. Tasks whose dependencies succeed in the
+  same batch are not started or skipped within that batch (the dependencies
+  are `running` at selection time, as with dispatch) and become startable
+  immediately afterwards, each at its next continuous attempt. Empty/missing
+  `runs`, extra fields, non-integer (including boolean) ids, an unknown status
+  or a missing/blank/non-string `error` → `422`; an empty body or malformed
+  JSON → `422`; any query parameter → `422`. Unknown dataset/version → `404`;
+  a batch task that does not exist or belongs to another dataset/version →
+  `404`; an unknown run → `404` (a run belonging to another dataset/version is
+  treated as out of scope); a run that belongs to another task of the same
+  version → `422`. An already finished run, a duplicate task in the batch or a
+  task that is not currently `running` (not currently completable) → `409`,
+  and the entire batch is rolled back: statuses, timestamps and counters are
+  unchanged. Concurrent batch completion is single-winner against the
+  single-run finish/cancel endpoints, run starts and batch dispatch: exactly
+  one racing operation commits and the others receive `409`, never leaving a
+  `running` run with a half-written `finished_at` or rolling `attempt_count`
+  back. Audit records appended afterwards record the run's terminal status,
+  and the schedule, audit report and post-restart reads present the batch
+  results through the existing fields and ordering.
 - `POST /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}/cancel` —
   cancel the currently running run. The body contains only a non-empty
   `reason` string; leading and trailing whitespace is trimmed and the result
