@@ -2016,52 +2016,155 @@ def finish_task_run(
     status: str,
     error: str | None,
 ) -> dict:
-    dataset = require_dataset(conn, dataset_name)
-    version_row = _require_schema_version(conn, dataset, version_number)
-    task_row = _require_task(
-        conn, version_row, dataset_name, version_number, task_id
-    )
-
-    if status == "succeeded":
-        if error is not None:
-            raise RequestInvalidError(
-                "A successful run must not carry an error message"
-            )
-    else:
-        if error is None or not error.strip():
-            raise RequestInvalidError(
-                "A failed run requires a non-empty error message"
+    # Serialize against run starts, dispatch and cancellations in this process
+    # (see _processing_write_section) and take the database write lock up
+    # front, so a finish racing a cancellation reads the committed terminal
+    # state instead of upgrading a shared lock mid-request.
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            task_row = _require_task(
+                conn, version_row, dataset_name, version_number, task_id
             )
 
-    run_row = conn.execute(
-        "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
-    ).fetchone()
-    if run_row is None:
-        raise NotFoundError(f"Processing task run {run_id} does not exist")
-    if run_row["task_id"] != task_row["id"]:
-        raise RequestInvalidError(
-            f"Processing task run {run_id} does not belong to task {task_id} "
-            f"in version {version_number} of dataset '{dataset_name}'"
-        )
-    if run_row["status"] != "running":
-        raise ConflictError(
-            f"Processing task run {run_id} is already '{run_row['status']}' "
-            "and cannot be finished again"
-        )
+            if status == "succeeded":
+                if error is not None:
+                    raise RequestInvalidError(
+                        "A successful run must not carry an error message"
+                    )
+            else:
+                if error is None or not error.strip():
+                    raise RequestInvalidError(
+                        "A failed run requires a non-empty error message"
+                    )
 
-    conn.execute(
-        "UPDATE processing_task_runs SET status = ?, finished_at = ?, error = ? "
-        "WHERE id = ?",
-        (status, utc_now_iso(), error, run_row["id"]),
-    )
-    conn.execute(
-        "UPDATE processing_tasks SET status = ? WHERE id = ?",
-        (status, task_row["id"]),
-    )
-    updated = conn.execute(
-        "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
-    ).fetchone()
-    return _run_row_to_dict(updated)
+            run_row = conn.execute(
+                "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise NotFoundError(f"Processing task run {run_id} does not exist")
+            if run_row["task_id"] != task_row["id"]:
+                raise RequestInvalidError(
+                    f"Processing task run {run_id} does not belong to task {task_id} "
+                    f"in version {version_number} of dataset '{dataset_name}'"
+                )
+            if run_row["status"] != "running":
+                raise ConflictError(
+                    f"Processing task run {run_id} is already '{run_row['status']}' "
+                    "and cannot be finished again"
+                )
+
+            # The conditional write is the hard guard against a concurrent
+            # cancellation: it matches only while the run is still 'running',
+            # so exactly one of finish/cancel commits the terminal transition.
+            cursor = conn.execute(
+                "UPDATE processing_task_runs SET status = ?, finished_at = ?, "
+                "error = ? WHERE id = ? AND status = 'running'",
+                (status, utc_now_iso(), error, run_row["id"]),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    f"Processing task run {run_id} was finished concurrently"
+                )
+            conn.execute(
+                "UPDATE processing_tasks SET status = ? WHERE id = ?",
+                (status, task_row["id"]),
+            )
+            updated = conn.execute(
+                "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
+            ).fetchone()
+            return _run_row_to_dict(updated)
+        except BaseException:
+            conn.rollback()
+            raise
+
+
+def cancel_task_run(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    reason: str,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Cancel a still-``running`` run, storing the trimmed reason as its error.
+
+    The run is ended atomically (``finished_at`` plus status ``failed``)
+    together with the task's transition to ``failed``; ``attempt_count`` is
+    deliberately not rolled back, so the existing start rules hand out the
+    next continuous attempt while attempts remain. Racing a finish, a
+    single-task start or a batch dispatch is single-winner: the conditional
+    ``UPDATE ... WHERE status = 'running'`` only matches for the transaction
+    that performs the transition, every other request gets a 409 and no field
+    is left half-written.
+
+    The request path must resolve first (unknown dataset/version/task/run is a
+    404 and a run owned by another task/version is a 422); the blank-reason
+    and query-parameter checks are 422s evaluated after the path resolves,
+    mirroring finish/audit-record precedence. Nothing is written when any
+    check fails.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            task_row = _require_task(
+                conn, version_row, dataset_name, version_number, task_id
+            )
+
+            clean_reason = reason.strip()
+            if not clean_reason:
+                raise RequestInvalidError("Cancellation reason must not be empty")
+            if query_keys:
+                raise RequestInvalidError(
+                    "The run cancel endpoint does not accept query parameters"
+                )
+
+            run_row = conn.execute(
+                "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise NotFoundError(f"Processing task run {run_id} does not exist")
+            if run_row["task_id"] != task_row["id"]:
+                raise RequestInvalidError(
+                    f"Processing task run {run_id} does not belong to task {task_id} "
+                    f"in version {version_number} of dataset '{dataset_name}'"
+                )
+            if run_row["status"] != "running":
+                raise ConflictError(
+                    f"Processing task run {run_id} is already '{run_row['status']}' "
+                    "and cannot be cancelled"
+                )
+
+            # The conditional write is the hard guard against a concurrent
+            # finish or cancellation: it matches only while the run is still
+            # 'running', so exactly one racing transaction commits the
+            # terminal transition and every other one gets a 409.
+            cursor = conn.execute(
+                "UPDATE processing_task_runs SET status = 'failed', "
+                "finished_at = ?, error = ? WHERE id = ? AND status = 'running'",
+                (utc_now_iso(), clean_reason, run_row["id"]),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    f"Processing task run {run_id} was finished concurrently"
+                )
+            conn.execute(
+                "UPDATE processing_tasks SET status = 'failed' WHERE id = ?",
+                (task_row["id"],),
+            )
+            updated = conn.execute(
+                "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
+            ).fetchone()
+            return _run_row_to_dict(updated)
+        except BaseException:
+            conn.rollback()
+            raise
 
 
 # --------------------------------------------------------------------------- #

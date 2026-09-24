@@ -284,6 +284,24 @@ run records one attempt. Tasks and runs are persisted across restarts.
   does not belong to the task/version in the path → `422`; unknown
   dataset/version/task/run → `404`; other invalid input → `422` and nothing
   is written.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}/cancel` —
+  cancel the currently running run. The body contains only a non-empty
+  `reason` string; leading and trailing whitespace is trimmed and the result
+  is stored as the run's `error`. Returns the updated run with `finished_at`
+  written and `status` `failed`; the task is atomically moved to `failed` in
+  the same transaction while `attempt_count` is not rolled back, so a
+  cancelled task follows the existing start rules: it can run again when its
+  dependencies have succeeded and attempts remain, and the next run keeps the
+  continuous attempt sequence. Only a `running` run can be cancelled;
+  cancelling an already `succeeded`/`failed` run returns `409` and changes no
+  field. A run that does not belong to the task/version in the path → `422`;
+  unknown dataset/version/task/run → `404`; a missing reason, an extra body
+  field, a non-string reason or one that is blank after trimming, an empty
+  body, malformed JSON or any query parameter → `422` and nothing is
+  written. Cancellation is single-winner against finishing, single-task
+  starts and batch dispatch: exactly one racing operation performs the state
+  transition and the others receive `409`, so no run is left `running` with a
+  half-written `finished_at`.
 - `PUT /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/dependencies` —
   atomically replace the task's dependency list. Body contains only
   `{"depends_on": [<task id>, ...]}` (the array may be empty); the ids must
