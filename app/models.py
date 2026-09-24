@@ -45,6 +45,31 @@ class SchemaVersion(BaseModel):
     fields: list[FieldInfo]
 
 
+# --------------------------------------------------------------------------- #
+# Read-only schema version diff
+# --------------------------------------------------------------------------- #
+
+
+class FieldChangeDefinition(BaseModel):
+    type: str
+    nullable: bool
+
+
+class VersionFieldChange(BaseModel):
+    field: str
+    kind: Literal["added", "removed", "changed"]
+    # Null on the side where the field does not exist; never omitted.
+    before: FieldChangeDefinition | None
+    after: FieldChangeDefinition | None
+
+
+class VersionDiffResponse(BaseModel):
+    from_version: int
+    to_version: int
+    compatible: bool
+    changes: list[VersionFieldChange]
+
+
 class LineageCreate(BaseModel):
     target_dataset: str
     target_version: int
