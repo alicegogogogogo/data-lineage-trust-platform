@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, StrictStr
 
 
 class DatasetCreate(BaseModel):
@@ -304,6 +304,56 @@ class PrivacyViewResponse(BaseModel):
     dataset: str
     version: int
     rows: list[dict[str, Any]]
+
+
+# --------------------------------------------------------------------------- #
+# Sensitive field identification (candidate annotations only)
+# --------------------------------------------------------------------------- #
+
+
+# A sample value must be a JSON scalar: string, number, boolean or null.
+# Objects and arrays are rejected by the request model before any write.
+SensitiveSample = StrictStr | StrictBool | StrictInt | StrictFloat | None
+
+
+class SensitiveIdentificationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: StrictStr = Field(description="Existing field of the schema version")
+    samples: list[SensitiveSample] = Field(
+        description="Scalar sample values of the field; may be empty"
+    )
+
+
+# A single piece of evidence supporting (or not) an identification. Name hits
+# always precede sample hits in the ordered list.
+class SensitiveEvidence(BaseModel):
+    # How the hit was obtained: a sensitive word in the field name, or a
+    # pattern observed in a sample value.
+    kind: Literal["name", "sample"]
+    # Sensitive category that was matched, e.g. "email" or "phone".
+    category: str
+    # The sample value that produced a sample hit; null for a name hit.
+    value: str | None = None
+
+
+# High when both name and sample hits exist, medium for samples only, low for
+# a name hit only and none when neither side matched.
+SensitiveConfidence = Literal["high", "medium", "low", "none"]
+
+
+class SensitiveIdentification(BaseModel):
+    # Per-version number in first-submission order; stable across refreshes.
+    sequence: int
+    dataset: str
+    version: int
+    field: str
+    # Name hits first, then sample hits.
+    evidence: list[SensitiveEvidence]
+    confidence: SensitiveConfidence
+    # The schema field the identification is about.
+    source: LineageSourceRef
+    created_at: str
 
 
 # --------------------------------------------------------------------------- #

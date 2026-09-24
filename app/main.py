@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -55,6 +55,8 @@ from app.models import (
     RetentionExceptionCreate,
     SchemaVersion,
     SchemaVersionCreate,
+    SensitiveIdentification,
+    SensitiveIdentificationCreate,
     SnapshotCreate,
     SnapshotDeletionRequest,
     ConfirmedSnapshotDeletionRequest,
@@ -583,6 +585,67 @@ def view_privacy_rows(
             conn, dataset_name, version, payload.role, payload.rows
         )
     )
+
+
+# --------------------------------------------------------------------------- #
+# Sensitive field identification (candidate annotations only)
+# --------------------------------------------------------------------------- #
+
+
+SENSITIVE_IDENTIFICATIONS_PATH = (
+    "/datasets/{dataset_name}/versions/{version}/sensitive-identifications"
+)
+
+
+@app.post(SENSITIVE_IDENTIFICATIONS_PATH, response_model=SensitiveIdentification)
+def identify_sensitive_field(
+    request: Request,
+    response: Response,
+    dataset_name: str,
+    version: int,
+    payload: SensitiveIdentificationCreate,
+    conn=Depends(get_db),
+) -> SensitiveIdentification:
+    # The first identification of a field is 201; re-running the same field
+    # refreshes its record in place (sequence unchanged) and is 200. Query
+    # parameters are a 422 checked in the repository after the path resolves,
+    # preserving 404 precedence.
+    record, created = repository.upsert_sensitive_identification(
+        conn,
+        dataset_name,
+        version,
+        payload.field,
+        list(payload.samples),
+        query_keys=tuple(request.query_params.keys()),
+    )
+    response.status_code = 201 if created else 200
+    return SensitiveIdentification(**record)
+
+
+@app.get(
+    SENSITIVE_IDENTIFICATIONS_PATH,
+    response_model=list[SensitiveIdentification],
+)
+def list_sensitive_identifications(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[SensitiveIdentification]:
+    # Parameterless read; any body bytes or query parameters are a 422 checked
+    # in the repository once the path dataset/version is known, preserving 404
+    # precedence (mirrors the evaluation-history endpoint).
+    return [
+        SensitiveIdentification(**record)
+        for record in repository.list_sensitive_identifications(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
 
 
 # --------------------------------------------------------------------------- #
