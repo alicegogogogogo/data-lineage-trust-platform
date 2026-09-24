@@ -87,6 +87,47 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (version_id, sequence)
     )
     """,
+    # At most one anomaly detection config per schema version; the three
+    # thresholds are constrained here as well so a stored config can never be
+    # out of range.
+    """
+    CREATE TABLE IF NOT EXISTS quality_anomaly_detection_configs (
+        id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id                  INTEGER NOT NULL UNIQUE
+                                    REFERENCES schema_versions(id) ON DELETE CASCADE,
+        consecutive_worsening_steps INTEGER NOT NULL
+                                    CHECK (consecutive_worsening_steps >= 2),
+        violation_row_limit         INTEGER NOT NULL
+                                    CHECK (violation_row_limit >= 0),
+        rule_violation_limit        INTEGER NOT NULL
+                                    CHECK (rule_violation_limit >= 0),
+        created_at                  TEXT NOT NULL
+    )
+    """,
+    # Append-only anomaly records produced by scans of the evaluation history.
+    # ``rule_id`` is set only for 'rule_limit' records; ``sequence`` is the
+    # history sequence of the evaluation the record points to.
+    """
+    CREATE TABLE IF NOT EXISTS quality_anomaly_records (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id      INTEGER NOT NULL
+                        REFERENCES schema_versions(id) ON DELETE CASCADE,
+        kind            TEXT NOT NULL
+                        CHECK (kind IN ('row_limit', 'rule_limit', 'trend')),
+        sequence        INTEGER NOT NULL CHECK (sequence >= 1),
+        rule_id         INTEGER,
+        violation_count INTEGER NOT NULL CHECK (violation_count >= 0),
+        created_at      TEXT NOT NULL
+    )
+    """,
+    # One record per (kind, history sequence, rule) within a version; the null
+    # rule ids of row-limit and trend records dedupe through the IFNULL
+    # expression (plain UNIQUE would treat NULLs as distinct).
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_quality_anomaly_records_unique
+    ON quality_anomaly_records (version_id, kind, sequence, IFNULL(rule_id, 0))
+    """,
     """
     CREATE TABLE IF NOT EXISTS privacy_policies (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,

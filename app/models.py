@@ -212,6 +212,53 @@ class ErrorResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Quality anomaly detection over the evaluation history
+# --------------------------------------------------------------------------- #
+
+
+class QualityAnomalyDetectionConfigCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    consecutive_worsening_steps: StrictInt = Field(
+        ge=2,
+        description="Consecutive strictly increasing steps that judge a "
+        "worsening trend",
+    )
+    violation_row_limit: StrictInt = Field(
+        ge=0,
+        description="Maximum tolerated distinct violating rows of one evaluation",
+    )
+    rule_violation_limit: StrictInt = Field(
+        ge=0,
+        description="Maximum tolerated violating rows of a single rule",
+    )
+
+
+class QualityAnomalyDetectionConfig(BaseModel):
+    id: int
+    dataset: str
+    version: int
+    consecutive_worsening_steps: int
+    violation_row_limit: int
+    rule_violation_limit: int
+    created_at: str
+
+
+QualityAnomalyKind = Literal["row_limit", "rule_limit", "trend"]
+
+
+class QualityAnomalyRecord(BaseModel):
+    id: int
+    kind: QualityAnomalyKind
+    # History sequence of the evaluation the record points to.
+    sequence: int
+    # Null except for 'rule_limit' records.
+    rule_id: int | None
+    violation_count: int
+    created_at: str
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 

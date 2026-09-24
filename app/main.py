@@ -39,6 +39,9 @@ from app.models import (
     ProcessingTaskWithRuns,
     ProcessingScheduleResponse,
     ProcessingAuditReportResponse,
+    QualityAnomalyDetectionConfig,
+    QualityAnomalyDetectionConfigCreate,
+    QualityAnomalyRecord,
     QualityRule,
     QualityRuleCreate,
     QualityRuleEnabledUpdate,
@@ -403,10 +406,114 @@ def list_quality_rule_evaluations(
 
 
 # --------------------------------------------------------------------------- #
-# Privacy policies
+# Quality anomaly detection over the evaluation history
 # --------------------------------------------------------------------------- #
 
 
+ANOMALY_DETECTION_PATH = (
+    "/datasets/{dataset_name}/versions/{version}"
+    "/quality-rules/anomaly-detection"
+)
+
+
+@app.post(
+    ANOMALY_DETECTION_PATH,
+    response_model=QualityAnomalyDetectionConfig,
+    status_code=201,
+)
+def register_anomaly_detection_config(
+    dataset_name: str,
+    version: int,
+    payload: QualityAnomalyDetectionConfigCreate,
+    conn=Depends(get_db),
+) -> QualityAnomalyDetectionConfig:
+    return QualityAnomalyDetectionConfig(
+        **repository.register_anomaly_detection_config(
+            conn,
+            dataset_name,
+            version,
+            consecutive_worsening_steps=payload.consecutive_worsening_steps,
+            violation_row_limit=payload.violation_row_limit,
+            rule_violation_limit=payload.rule_violation_limit,
+        )
+    )
+
+
+@app.get(ANOMALY_DETECTION_PATH, response_model=QualityAnomalyDetectionConfig)
+def get_anomaly_detection_config(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> QualityAnomalyDetectionConfig:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/version is known,
+    # preserving 404 precedence (mirrors the evaluation history endpoint).
+    return QualityAnomalyDetectionConfig(
+        **repository.get_anomaly_detection_config(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.post(
+    f"{ANOMALY_DETECTION_PATH}/scan",
+    response_model=list[QualityAnomalyRecord],
+)
+def scan_quality_anomalies(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[QualityAnomalyRecord]:
+    # The scan takes no input beyond the path; any body bytes or query
+    # parameters are a 422 validated in the repository after the path
+    # resolves, preserving 404 precedence.
+    return [
+        QualityAnomalyRecord(**record)
+        for record in repository.scan_quality_anomalies(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
+@app.get(
+    f"{ANOMALY_DETECTION_PATH}/anomalies",
+    response_model=list[QualityAnomalyRecord],
+)
+def list_quality_anomalies(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[QualityAnomalyRecord]:
+    # Same parameterless read rules as the scan and config endpoints.
+    return [
+        QualityAnomalyRecord(**record)
+        for record in repository.list_quality_anomalies(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Privacy policies
+# --------------------------------------------------------------------------- #
 @app.post(
     "/datasets/{dataset_name}/versions/{version}/privacy-policies",
     response_model=PrivacyPolicy,
