@@ -1974,6 +1974,179 @@ def list_masking_suggestions(
     return suggestions
 
 
+# Serializes batch registrations of one (dataset, version) within this process,
+# so two concurrent registrations validate and insert as whole transactions.
+# The UNIQUE(version_id, field) constraint on privacy_policies remains the hard
+# guard against writers in other processes (and against single-policy
+# creation), mirroring the processing write section.
+_privacy_register_locks: dict[tuple[str, int], threading.Lock] = {}
+_privacy_register_locks_guard = threading.Lock()
+
+
+def _privacy_register_lock(key: tuple[str, int]) -> threading.Lock:
+    with _privacy_register_locks_guard:
+        lock = _privacy_register_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _privacy_register_locks[key] = lock
+        return lock
+
+
+def register_privacy_policies_from_suggestions(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    fields: list[str],
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Register one privacy policy per named field from its current candidate.
+
+    The whole batch is validated before any policy or timestamp is written.
+    The path dataset/version must resolve first (404); query parameters are
+    rejected (422); every name must be a non-blank, non-duplicated string
+    (422) naming an existing field of the version (404). A field without an
+    available masking suggestion candidate — never identified, or identified
+    with neither kind of hit — conflicts (409), as does a field that already
+    has a policy (409). Each new policy copies the candidate's
+    classification, masking and (empty) allowed roles verbatim, is enabled and
+    receives a service-generated id and created_at.
+
+    ``BEGIN IMMEDIATE`` plus the per-(dataset, version) process lock serialize
+    concurrent registrations: a racing batch (or a single-policy creation) that
+    wins the unique constraint turns the loser's whole batch into a 409
+    rollback, so exactly one registration commits per field and no partial
+    batch survives. The created policies are returned in request field order.
+    Registration only reads the identification records and field definitions;
+    it never writes an identification record.
+    """
+    with _privacy_register_lock((dataset_name, version_number)):
+        # The path resolves inside the pinned transaction (a prior SELECT would
+        # already have opened an implicit deferred transaction, making the
+        # explicit BEGIN fail), mirroring the processing batch-complete flow.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+
+            if query_keys:
+                raise RequestInvalidError(
+                    "The policy registration endpoint does not accept query "
+                    "parameters"
+                )
+
+            # Phase 1: request shape. Names are trimmed exactly as on the
+            # single policy-create endpoint; a duplicate after trimming (e.g.
+            # "x" / " x ") is the same field listed twice.
+            clean_fields: list[str] = []
+            seen_fields: set[str] = set()
+            for name in fields:
+                clean_name = name.strip()
+                if not clean_name:
+                    raise RequestInvalidError("Field name must not be empty")
+                if clean_name in seen_fields:
+                    raise RequestInvalidError(
+                        f"Field '{clean_name}' is listed more than once in "
+                        "'fields'"
+                    )
+                seen_fields.add(clean_name)
+                clean_fields.append(clean_name)
+
+            version_id = version_row["id"]
+
+            # Phase 2: every name must point at a field of this version (404).
+            field_names = _version_field_names(conn, version_id)
+            for clean_name in clean_fields:
+                if clean_name not in field_names:
+                    raise NotFoundError(
+                        f"Field '{clean_name}' does not exist in version "
+                        f"{version_number} of dataset '{dataset_name}'"
+                    )
+
+            # Phase 3: conflicts, checked only after the request is well-formed
+            # and every reference resolves (422/404 take precedence). The
+            # candidates are recomputed from the current identification records
+            # exactly like the read-only suggestions endpoint, and the read of
+            # existing policies happens inside the pinned transaction so a
+            # concurrent commit cannot sneak in between the check and insert.
+            suggestions_by_field: dict[str, dict] = {}
+            identification_rows = conn.execute(
+                "SELECT * FROM sensitive_identifications "
+                "WHERE version_id = ? ORDER BY id ASC",
+                (version_id,),
+            ).fetchall()
+            for identification_row in identification_rows:
+                suggestion = _identification_suggestion(identification_row)
+                if suggestion is not None:
+                    suggestions_by_field[identification_row["field"]] = suggestion
+
+            existing_policy_fields = {
+                row["field"]
+                for row in conn.execute(
+                    "SELECT field FROM privacy_policies WHERE version_id = ?",
+                    (version_id,),
+                ).fetchall()
+            }
+
+            for clean_name in clean_fields:
+                if clean_name not in suggestions_by_field:
+                    raise ConflictError(
+                        f"No masking suggestion candidate is available for "
+                        f"field '{clean_name}' in version {version_number} of "
+                        f"dataset '{dataset_name}'"
+                    )
+                if clean_name in existing_policy_fields:
+                    raise ConflictError(
+                        f"A privacy policy for field '{clean_name}' already "
+                        f"exists for version {version_number} of dataset "
+                        f"'{dataset_name}'"
+                    )
+
+            # All checks passed: write the batch in request order. The unique
+            # (version_id, field) constraint is the hard guard against a
+            # concurrent writer; losing the race rolls back the entire batch.
+            created_at = utc_now_iso()
+            created_ids: list[int] = []
+            for clean_name in clean_fields:
+                suggestion = suggestions_by_field[clean_name]
+                try:
+                    cursor = conn.execute(
+                        "INSERT INTO privacy_policies ("
+                        "version_id, field, classification, masking, "
+                        "allowed_roles, enabled, created_at"
+                        ") VALUES (?, ?, ?, ?, ?, 1, ?)",
+                        (
+                            version_id,
+                            clean_name,
+                            suggestion["classification"],
+                            suggestion["masking"],
+                            json.dumps(suggestion["allowed_roles"]),
+                            created_at,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ConflictError(
+                        f"A privacy policy for field '{clean_name}' already "
+                        f"exists for version {version_number} of dataset "
+                        f"'{dataset_name}'"
+                    ) from exc
+                created_ids.append(cursor.lastrowid)
+
+            created_policies: list[dict] = []
+            for policy_id in created_ids:
+                policy_row = conn.execute(
+                    "SELECT id, field, classification, masking, allowed_roles, "
+                    "enabled, created_at FROM privacy_policies WHERE id = ?",
+                    (policy_id,),
+                ).fetchone()
+                created_policies.append(_policy_row_to_dict(policy_row))
+        except BaseException:
+            conn.rollback()
+            raise
+
+    return created_policies
+
+
 # --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #

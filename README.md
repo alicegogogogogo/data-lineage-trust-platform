@@ -305,6 +305,31 @@ stable ids) persist across restarts.
   - `allowed_roles` is always an empty list: the suggested masking applies to
     every role, granting none an unmasked view.
 
+- `POST /datasets/{dataset}/versions/{version}/sensitive-identifications/masking-suggestions/register`
+  — explicitly register the candidates as privacy policies. The body contains
+  exactly one field: `{"fields": ["contact_email", "mobile_phone"]}`, a
+  non-empty array of distinct, non-empty field names of the version. Each named
+  field must currently have a masking suggestion candidate (see the read-only
+  suggestions endpoint); its candidate's `classification`, `masking` and
+  `allowed_roles` are copied verbatim into a new enabled privacy policy (a
+  candidate carries an empty role list, so every role sees the masked value).
+  Returns `201` with the created policy records (the same fields as the
+  privacy-policy creation response, including service-generated `id` and
+  `created_at`) ordered by the request's field names; the policies take effect
+  on the next privacy view and survive restarts. The whole batch is validated
+  before any write, so any rejected request writes no policy and no timestamp:
+  unknown dataset/version or a name that is not a field of the version → `404`;
+  a field without an available candidate (never identified, or identified with
+  neither kind of hit) or a field that already has a policy → `409`; a missing
+  or extra body field, an empty array, a duplicate name, a non-string name or
+  one that is blank after trimming, an empty body, a whitespace-only body,
+  malformed JSON or any query parameter → `422`. Two concurrent registrations
+  of the same field are single-winner: exactly one commits and the other
+  receives `409` with nothing written. This endpoint only reads identification
+  records and field definitions; it never writes an identification record, and
+  the read-only suggestions endpoint is unchanged (still no writes and no
+  automatic registration).
+
 ### Row snapshots
 
 A row snapshot persistently records the rows of a schema version at one point in

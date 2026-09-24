@@ -374,6 +374,21 @@ class MaskingSuggestion(BaseModel):
     allowed_roles: list[str]
 
 
+class PrivacyPolicyRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Non-empty list of distinct, non-empty (after trimming) field names of the
+    # version that currently have a masking suggestion. Blank/duplicate names
+    # and an empty list are rejected (422); the repository performs the
+    # trim-and-blank check since pydantic-level StrictStr only guarantees a
+    # string.
+    fields: list[StrictStr] = Field(
+        min_length=1,
+        description="Field names whose candidates are registered as policies; "
+        "returned in request order",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #

@@ -25,6 +25,7 @@ from app.models import (
     PrivacyPolicy,
     PrivacyPolicyCreate,
     PrivacyPolicyEnabledUpdate,
+    PrivacyPolicyRegistrationRequest,
     PrivacyViewRequest,
     PrivacyViewResponse,
     ProcessingRunCancel,
@@ -677,6 +678,36 @@ def list_masking_suggestions(
             dataset_name,
             version,
             body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
+@app.post(
+    f"{SENSITIVE_IDENTIFICATIONS_PATH}/masking-suggestions/register",
+    response_model=list[PrivacyPolicy],
+    status_code=201,
+)
+def register_privacy_policies_from_suggestions(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    payload: PrivacyPolicyRegistrationRequest,
+    conn=Depends(get_db),
+) -> list[PrivacyPolicy]:
+    # Explicitly turn the read-only candidates into registered policies: each
+    # named field's current candidate becomes an enabled policy carrying the
+    # candidate's classification, masking and allowed roles verbatim. The batch
+    # is validated before any write; any query parameter is a 422 checked in
+    # the repository after the path dataset/version resolves, preserving 404
+    # precedence (mirrors the identifications POST).
+    return [
+        PrivacyPolicy(**policy)
+        for policy in repository.register_privacy_policies_from_suggestions(
+            conn,
+            dataset_name,
+            version,
+            list(payload.fields),
             query_keys=tuple(request.query_params.keys()),
         )
     ]
