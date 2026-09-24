@@ -182,6 +182,92 @@ def list_schema_versions(conn: sqlite3.Connection, dataset_name: str) -> list[di
     ]
 
 
+def _version_fields_by_name(
+    conn: sqlite3.Connection, version_id: int
+) -> dict[str, dict]:
+    """Persisted field definitions of one version keyed by field name."""
+    rows = conn.execute(
+        "SELECT name, type, nullable FROM schema_fields "
+        "WHERE version_id = ? ORDER BY name",
+        (version_id,),
+    ).fetchall()
+    return {
+        row["name"]: {"type": row["type"], "nullable": bool(row["nullable"])}
+        for row in rows
+    }
+
+
+def diff_schema_versions(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    from_version: int,
+    to_version: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only diff of the persisted field definitions of two versions.
+
+    The endpoint takes no parameters: a non-empty request body or any query
+    parameter is rejected (422) only after the path dataset and both versions
+    have been resolved, so an unknown dataset/version stays a 404. Only the
+    stored field definitions are compared — field position, quality rules,
+    privacy policies, snapshots and task state never enter the result.
+
+    ``changes`` is sorted by field name ascending; a field whose definition
+    (``type``/``nullable``) is identical on both sides is not a change, so
+    reordering fields between versions yields an empty diff. ``compatible``
+    reports whether the target can take over the base's fields: a removal, a
+    type change or a nullability tightening (nullable -> not nullable) makes
+    it false; additions and nullability loosening keep it true.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    from_row = _require_schema_version(conn, dataset, from_version)
+    to_row = _require_schema_version(conn, dataset, to_version)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The schema version diff endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The schema version diff endpoint does not accept query parameters"
+        )
+
+    from_fields = _version_fields_by_name(conn, from_row["id"])
+    to_fields = _version_fields_by_name(conn, to_row["id"])
+
+    changes: list[dict] = []
+    compatible = True
+    for name in sorted(set(from_fields) | set(to_fields)):
+        before = from_fields.get(name)
+        after = to_fields.get(name)
+        if before is None:
+            changes.append(
+                {"field": name, "kind": "added", "before": None, "after": after}
+            )
+        elif after is None:
+            changes.append(
+                {"field": name, "kind": "removed", "before": before, "after": None}
+            )
+            compatible = False
+        elif before != after:
+            changes.append(
+                {"field": name, "kind": "changed", "before": before, "after": after}
+            )
+            if before["type"] != after["type"] or (
+                before["nullable"] and not after["nullable"]
+            ):
+                compatible = False
+
+    return {
+        "from_version": from_row["version"],
+        "to_version": to_row["version"],
+        "compatible": compatible,
+        "changes": changes,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Lineage
 # --------------------------------------------------------------------------- #

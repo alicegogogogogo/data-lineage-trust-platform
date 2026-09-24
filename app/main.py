@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -48,6 +48,7 @@ from app.models import (
     RetentionExceptionCreate,
     SchemaVersion,
     SchemaVersionCreate,
+    SchemaVersionDiffResponse,
     SnapshotCreate,
     SnapshotDeletionRequest,
     ConfirmedSnapshotDeletionRequest,
@@ -118,6 +119,10 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+async def _read_request_body(request: Request) -> bytes:
+    return await request.body()
+
+
 # --------------------------------------------------------------------------- #
 # Datasets
 # --------------------------------------------------------------------------- #
@@ -171,6 +176,33 @@ def get_schema_version(
 ) -> SchemaVersion:
     return SchemaVersion(
         **repository.get_schema_version(conn, dataset_name, version)
+    )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{from_version}/diff/{to_version}",
+    response_model=SchemaVersionDiffResponse,
+)
+def diff_schema_versions(
+    request: Request,
+    dataset_name: str,
+    from_version: int = Path(ge=1),
+    to_version: int = Path(ge=1),
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> SchemaVersionDiffResponse:
+    # The endpoint is parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/versions are known,
+    # preserving 404 precedence (mirrors the audit-report endpoint).
+    return SchemaVersionDiffResponse(
+        **repository.diff_schema_versions(
+            conn,
+            dataset_name,
+            from_version,
+            to_version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
     )
 
 
@@ -669,10 +701,6 @@ def get_processing_schedule(
 
 # The report is a parameterless read of the whole task collection, so the
 # literal "audit-report" segment must likewise be declared before "/{task_id}".
-async def _read_request_body(request: Request) -> bytes:
-    return await request.body()
-
-
 @app.get(
     f"{PROCESSING_TASKS_PATH}/audit-report",
     response_model=ProcessingAuditReportResponse,

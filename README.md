@@ -52,6 +52,24 @@ traces.
   their fields.
 - `GET /datasets/{dataset}/versions/{version}` — read one version with its
   fields. Unknown dataset/version → `404`.
+- `GET /datasets/{dataset}/versions/{from}/diff/{to}` — read-only comparison of
+  the persisted field definitions of two versions. The endpoint takes no
+  request body and no query parameters (both are rejected with `422`; a
+  non-positive or non-integer version number is also `422`; unknown
+  dataset/version → `404`). Returns
+  `{"from_version", "to_version", "compatible", "changes"}`. `changes` is
+  sorted by field name ascending; each entry is
+  `{"field", "kind", "before", "after"}` with `kind` one of `added`, `removed`
+  or `changed`. `before`/`after` hold the field's `{"type", "nullable"}`
+  definition on each side; the missing side is `null` for `added`/`removed`
+  (the keys are always present). A field whose type and nullability are
+  identical on both sides is not a change, so reordering fields yields an
+  empty diff. `compatible` is `false` when any field was removed, changed type
+  or had its nullability tightened (nullable → not nullable), and `true`
+  otherwise (additions and nullability loosening included). Identical versions
+  return `200` with empty `changes` and `compatible: true`. The result is
+  computed from the stored field definitions only, is deterministic across
+  restarts and never modifies any data.
 
 ### Field-level lineage
 
