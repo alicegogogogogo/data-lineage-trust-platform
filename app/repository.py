@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import threading
 from collections import Counter
@@ -1637,6 +1638,253 @@ def view_privacy_rows(
         "version": version_row["version"],
         "rows": masked_rows,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Sensitive-field identification (candidate annotation only)
+# --------------------------------------------------------------------------- #
+
+
+# Sensitive words matched case-insensitively as substrings of the field name,
+# in evidence-emission order.
+SENSITIVE_WORDS: tuple[str, ...] = (
+    "email",
+    "phone",
+    "id_card",
+    "password",
+    "token",
+    "birth",
+)
+
+# Phone numbers are matched against ASCII 0-9 only (str.isdigit() also accepts
+# e.g. superscript or full-width Unicode digits).
+_ASCII_DIGITS = re.compile(r"[0-9]+\Z")
+
+
+def _sensitive_name_evidence(field_name: str) -> list[str]:
+    """Name-hit kinds for one field name, in sensitive-word order."""
+    lowered = field_name.lower()
+    return [f"name:{word}" for word in SENSITIVE_WORDS if word in lowered]
+
+
+def _text_sample_hits(text: str) -> set[str]:
+    """Sample-hit kinds for one string value.
+
+    Email: exactly one ``@`` with non-empty text on both sides and a dot in the
+    domain. Phone: an 11-digit ASCII decimal string starting with ``1``. The
+    two formats are disjoint (an email must contain ``@``).
+    """
+    hits: set[str] = set()
+    if text.count("@") == 1:
+        local, _, domain = text.partition("@")
+        if local and domain and "." in domain:
+            hits.add("sample:email")
+    if len(text) == 11 and text[0] == "1" and _ASCII_DIGITS.match(text):
+        hits.add("sample:phone")
+    return hits
+
+
+def _sensitive_sample_evidence(samples: list[Any]) -> list[str]:
+    """Sample-hit kinds across all samples; only string values participate."""
+    hits: set[str] = set()
+    for sample in samples:
+        if isinstance(sample, str):
+            hits |= _text_sample_hits(sample)
+    return [
+        kind for kind in ("sample:email", "sample:phone") if kind in hits
+    ]
+
+
+def _identify_sensitive(
+    field_name: str, field_type: str, samples: list[Any]
+) -> tuple[list[str], str]:
+    """Combine name and sample evidence for one field.
+
+    Name evidence is independent of the declared type. Sample evidence is only
+    computed for fields declared ``string``: every other declared type is
+    matched by name only even when a sample looks like an email. Evidence is
+    name hits followed by sample hits (each group de-duplicated). Confidence is
+    ``high`` when both sides hit, ``medium`` for samples only, ``low`` for the
+    name only and ``none`` when neither hits (the record is still generated).
+    """
+    name_evidence = _sensitive_name_evidence(field_name)
+    sample_evidence = (
+        _sensitive_sample_evidence(samples) if field_type == "string" else []
+    )
+    evidence = name_evidence + sample_evidence
+    if name_evidence and sample_evidence:
+        confidence = "high"
+    elif sample_evidence:
+        confidence = "medium"
+    elif name_evidence:
+        confidence = "low"
+    else:
+        confidence = "none"
+    return evidence, confidence
+
+
+def _identification_row_to_dict(
+    row: sqlite3.Row, dataset_name: str, version_number: int
+) -> dict:
+    return {
+        "id": row["id"],
+        "field": row["field"],
+        "field_type": row["field_type"],
+        "evidence": json.loads(row["evidence"]),
+        "confidence": row["confidence"],
+        "source": {
+            "dataset": dataset_name,
+            "version": version_number,
+            "field": row["field"],
+        },
+        "created_at": row["created_at"],
+    }
+
+
+def create_sensitive_identification(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    field: str,
+    samples: list[Any],
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> tuple[dict, bool]:
+    """Identify one field or refresh its existing identification in place.
+
+    Returns ``(record, created)`` with ``created`` true for the first
+    submission (201) and false for an in-place refresh that keeps the same id
+    (200). The path dataset/version must resolve first (404); a blank field
+    name or any query parameter is a 422 checked afterwards, and a field that
+    does not exist in the version is a 404 — mirroring the privacy-policy
+    precedence. Identification only reads the declared name and type and the
+    submitted scalars; the samples are never stored. A concurrent first
+    submission in another process turns the losing insert into a refresh, so
+    exactly one record per (version, field) ever exists.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    clean_field = field.strip()
+    if not clean_field:
+        raise RequestInvalidError("Field name must not be empty")
+    if query_keys:
+        raise RequestInvalidError(
+            "The sensitive identification endpoint does not accept query parameters"
+        )
+
+    field_row = conn.execute(
+        "SELECT name, type FROM schema_fields WHERE version_id = ? AND name = ?",
+        (version_row["id"], clean_field),
+    ).fetchone()
+    if field_row is None:
+        raise NotFoundError(
+            f"Field '{clean_field}' does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    evidence, confidence = _identify_sensitive(
+        field_row["name"], field_row["type"], samples
+    )
+
+    existing = conn.execute(
+        "SELECT id FROM sensitive_identifications "
+        "WHERE version_id = ? AND field = ?",
+        (version_row["id"], field_row["name"]),
+    ).fetchone()
+
+    if existing is None:
+        try:
+            cursor = conn.execute(
+                "INSERT INTO sensitive_identifications ("
+                "version_id, field, field_type, evidence, confidence, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    version_row["id"],
+                    field_row["name"],
+                    field_row["type"],
+                    json.dumps(evidence),
+                    confidence,
+                    utc_now_iso(),
+                ),
+            )
+            identification_id = cursor.lastrowid
+            created = True
+        except sqlite3.IntegrityError:
+            # Another process inserted the same (version, field) first: end the
+            # current transaction so the competing commit is visible, then treat
+            # the request as an in-place refresh rather than a conflict.
+            conn.rollback()
+            existing = conn.execute(
+                "SELECT id FROM sensitive_identifications "
+                "WHERE version_id = ? AND field = ?",
+                (version_row["id"], field_row["name"]),
+            ).fetchone()
+            identification_id = existing["id"]
+            conn.execute(
+                "UPDATE sensitive_identifications "
+                "SET field_type = ?, evidence = ?, confidence = ? WHERE id = ?",
+                (
+                    field_row["type"],
+                    json.dumps(evidence),
+                    confidence,
+                    identification_id,
+                ),
+            )
+            created = False
+    else:
+        conn.execute(
+            "UPDATE sensitive_identifications "
+            "SET field_type = ?, evidence = ?, confidence = ? WHERE id = ?",
+            (
+                field_row["type"],
+                json.dumps(evidence),
+                confidence,
+                existing["id"],
+            ),
+        )
+        identification_id = existing["id"]
+        created = False
+
+    row = conn.execute(
+        "SELECT * FROM sensitive_identifications WHERE id = ?",
+        (identification_id,),
+    ).fetchone()
+    return (
+        _identification_row_to_dict(row, dataset["name"], version_row["version"]),
+        created,
+    )
+
+
+def list_sensitive_identifications(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Every sensitive identification of one version, ordered by id ascending."""
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The sensitive identifications endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The sensitive identifications endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM sensitive_identifications WHERE version_id = ? ORDER BY id ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return [
+        _identification_row_to_dict(row, dataset["name"], version_row["version"])
+        for row in rows
+    ]
 
 
 # --------------------------------------------------------------------------- #

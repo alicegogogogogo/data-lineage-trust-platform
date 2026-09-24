@@ -231,6 +231,54 @@ data. Policies (including their enabled state) are persisted across restarts.
   - `null` values and fields without a policy are returned unchanged; rows
     missing a covered field are left without it.
 
+### Sensitive-field identification
+
+Sensitive-field identification produces candidate annotations for the fields of
+a schema version. It complements the manual privacy policies but never creates
+or modifies one: an identification is advisory only. Records (including their
+stable ids) persist across restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/sensitive-identifications` —
+  identify one field. The body contains exactly `field` and `samples`:
+  `{"field": "contact_email", "samples": ["alice@example.com"]}`. `field` must
+  name an existing field of the version; its name and type are taken from the
+  version definition. `samples` is an array of JSON scalars (strings, numbers,
+  booleans or `null`) and may be empty; objects or arrays reject the whole
+  request. The samples are never stored or echoed back. Returns the record;
+  the first submission for a field returns `201`, re-running the same field
+  refreshes the record in place (the id is unchanged) and returns `200`.
+- `GET /datasets/{dataset}/versions/{version}/sensitive-identifications` —
+  return every identification record of the version sorted by id ascending
+  (empty when there are none). The endpoint takes no request body and no query
+  parameters (`422`); unknown dataset/version → `404`.
+
+  Each record has `id`, `field`, `field_type`, `evidence`, `confidence`,
+  `source` and `created_at`. `source` references the identified field as
+  `{"dataset", "version", "field"}`. `evidence` is the ordered, de-duplicated
+  list of hit kinds, name hits before sample hits:
+
+  - **Name hits** — the field name contains a sensitive word case-insensitively
+    as a substring. The words are `email`, `phone`, `id_card`, `password`,
+    `token` and `birth`, emitting `name:<word>` in that order.
+  - **Sample hits** — only string sample values are inspected (numbers,
+    booleans and `null` never hit), and only when the field's declared type is
+    `string`; a field declared with any other type is matched by name alone,
+    even when a sample looks like an email. `sample:email` requires exactly
+    one `@` with non-empty text on both sides and a dot in the domain;
+    `sample:phone` requires an 11-digit string starting with `1`. Either format
+    matching is sufficient.
+
+  `confidence` is `high` when both the name and the samples hit, `medium` for
+  samples only, `low` for the name only and `none` when neither side hits
+  (`evidence` is then an empty list but the record is still generated).
+
+  One record is kept per field: a re-run overwrites the evidence and confidence
+  in place with a stable id. Unknown dataset/version → `404`; a field that does
+  not exist in the version → `404`; missing or extra body fields, a
+  non-string or blank field name, a `samples` value that is not an array of
+  scalars (objects and arrays included), an empty body, malformed JSON or any
+  query parameter → `422` and nothing is written.
+
 ### Row snapshots
 
 A row snapshot persistently records the rows of a schema version at one point in

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, StrictStr
 
 
 class DatasetCreate(BaseModel):
@@ -304,6 +304,57 @@ class PrivacyViewResponse(BaseModel):
     dataset: str
     version: int
     rows: list[dict[str, Any]]
+
+
+# --------------------------------------------------------------------------- #
+# Sensitive-field identification (candidate annotation only)
+# --------------------------------------------------------------------------- #
+
+
+# A sample may only be a JSON scalar (string, number, boolean or null); objects
+# and arrays reject the whole request. Strict members never coerce, so ``true``
+# is not mistaken for the number 1.
+SensitiveSample = StrictStr | StrictInt | StrictFloat | StrictBool | None
+
+
+class SensitiveIdentificationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: StrictStr = Field(description="Existing field of the schema version")
+    samples: list[SensitiveSample] = Field(
+        description="Scalar sample values; may be empty. Objects and arrays are "
+        "rejected; the submitted samples are never stored or echoed back",
+    )
+
+
+# Hit kinds are emitted in fixed order: name hits before sample hits, each
+# group following the sensitive-word order (email, phone, id_card, password,
+# token, birth). Sample hits exist only for email and phone.
+SensitiveEvidenceKind = Literal[
+    "name:email",
+    "name:phone",
+    "name:id_card",
+    "name:password",
+    "name:token",
+    "name:birth",
+    "sample:email",
+    "sample:phone",
+]
+
+
+class SensitiveIdentification(BaseModel):
+    id: int
+    field: str
+    # Declared type of the field, taken from the schema version; sample
+    # matching runs only when this is "string".
+    field_type: str
+    # Ordered, de-duplicated hit kinds; empty when neither name nor samples hit
+    # (the record is still generated, with confidence "none").
+    evidence: list[SensitiveEvidenceKind]
+    confidence: Literal["high", "medium", "low", "none"]
+    # Reference to the identified field: its dataset, version and field name.
+    source: LineageSourceRef
+    created_at: str
 
 
 # --------------------------------------------------------------------------- #

@@ -141,6 +141,23 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (version_id, field)
     )
     """,
+    # Candidate sensitive-field identification results, one per (version,
+    # field): a re-run refreshes evidence/confidence/field_type in place while
+    # the id and created_at stay fixed. The submitted samples are deliberately
+    # not stored, so a row never carries raw values.
+    """
+    CREATE TABLE IF NOT EXISTS sensitive_identifications (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id  INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        field       TEXT NOT NULL,
+        field_type  TEXT NOT NULL,
+        evidence    TEXT NOT NULL,
+        confidence  TEXT NOT NULL
+                    CHECK (confidence IN ('high', 'medium', 'low', 'none')),
+        created_at  TEXT NOT NULL,
+        UNIQUE (version_id, field)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS snapshots (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
