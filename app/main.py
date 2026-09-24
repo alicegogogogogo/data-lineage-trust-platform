@@ -27,6 +27,7 @@ from app.models import (
     PrivacyViewRequest,
     PrivacyViewResponse,
     ProcessingRunFinish,
+    ProcessingRunCancel,
     ProcessingTask,
     ProcessingTaskCreate,
     ProcessingTaskDependenciesUpdate,
@@ -786,6 +787,35 @@ def finish_task_run(
             run_id,
             payload.status,
             payload.error,
+        )
+    )
+
+
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/{{task_id}}/runs/{{run_id}}/cancel",
+    response_model=ProcessingTaskRun,
+)
+def cancel_task_run(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    run_id: int,
+    payload: ProcessingRunCancel,
+    conn=Depends(get_db),
+) -> ProcessingTaskRun:
+    # The body carries exactly one non-empty reason (enforced by the model);
+    # query parameters are rejected in the repository once the path
+    # dataset/version is resolved, preserving 404 precedence.
+    return ProcessingTaskRun(
+        **repository.cancel_task_run(
+            conn,
+            dataset_name,
+            version,
+            task_id,
+            run_id,
+            payload.reason,
+            query_keys=tuple(request.query_params.keys()),
         )
     )
 

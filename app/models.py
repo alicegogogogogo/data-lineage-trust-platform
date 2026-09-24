@@ -352,6 +352,14 @@ class ProcessingRunFinish(BaseModel):
     error: StrictStr | None = None
 
 
+class ProcessingRunCancel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: StrictStr = Field(
+        description="Non-empty reason (after trimming) recorded as the run error"
+    )
+
+
 class ProcessingTaskDispatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
