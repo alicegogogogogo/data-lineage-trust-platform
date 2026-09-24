@@ -403,16 +403,24 @@ class ProcessingTaskDispatchResponse(BaseModel):
     runs: list[ProcessingTaskRun]
 
 
+# Sentinel default for ProcessingRunBatchCompleteItem.error: unlike the
+# single-run finish payload, the batch item must distinguish an omitted error
+# field from an explicitly supplied one, because a success item may only omit
+# the field — writing it at all (even as null) is a 422.
+ERROR_FIELD_UNSET: Any = object()
+
+
 class ProcessingRunBatchCompleteItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_id: StrictInt
     run_id: StrictInt
     status: Literal["succeeded", "failed"]
-    # Mirrors ProcessingRunFinish: null/omitted for success, a non-empty
-    # message for failure (emptiness is checked in the repository after the
-    # path resolves so 404 precedence is preserved).
-    error: StrictStr | None = None
+    # Omitted for success, a non-empty message for failure. An explicitly
+    # supplied value (null included) stays distinguishable from omission via
+    # the sentinel default; the success/failure rules are enforced in the
+    # repository after the path resolves so 404 precedence is preserved.
+    error: StrictStr | None = ERROR_FIELD_UNSET
 
 
 class ProcessingRunBatchCompleteRequest(BaseModel):

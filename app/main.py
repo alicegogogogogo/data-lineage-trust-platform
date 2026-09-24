@@ -750,7 +750,9 @@ def dispatch_processing_tasks(
 
 # The literal "batch-complete" segment must not be parsed as a task id (mirrors
 # the "dispatch" and "schedule" routes). The body is required and contains only
-# the non-empty "runs" array.
+# the non-empty "runs" array. Items are dumped with exclude_unset so the
+# repository can tell an omitted "error" field apart from an explicitly
+# supplied one (a success item must omit it entirely).
 @app.post(
     f"{PROCESSING_TASKS_PATH}/batch-complete",
     response_model=ProcessingRunBatchCompleteResponse,
@@ -767,7 +769,7 @@ def batch_complete_processing_task_runs(
             conn,
             dataset_name,
             version,
-            [item.model_dump() for item in payload.runs],
+            [item.model_dump(exclude_unset=True) for item in payload.runs],
             query_keys=tuple(request.query_params.keys()),
         )
     )
