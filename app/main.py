@@ -33,6 +33,8 @@ from app.models import (
     ProcessingTaskDependenciesUpdate,
     ProcessingTaskDispatchRequest,
     ProcessingTaskDispatchResponse,
+    ProcessingBatchCompleteRequest,
+    ProcessingBatchCompleteResponse,
     ProcessingTaskRun,
     ProcessingTaskWithRuns,
     ProcessingScheduleResponse,
@@ -742,6 +744,32 @@ def dispatch_processing_tasks(
     return ProcessingTaskDispatchResponse(
         **repository.dispatch_processing_tasks(
             conn, dataset_name, version, payload.limit
+        )
+    )
+
+
+# Declared before the "/{task_id}" routes so the literal "batch-complete"
+# segment is not parsed as a task id (mirrors "schedule", "audit-report" and
+# "dispatch"). It is an independent entry point that does not alter the
+# single-run finish route.
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/batch-complete",
+    response_model=ProcessingBatchCompleteResponse,
+)
+def batch_complete_processing_task_runs(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    payload: ProcessingBatchCompleteRequest,
+    conn=Depends(get_db),
+) -> ProcessingBatchCompleteResponse:
+    return ProcessingBatchCompleteResponse(
+        **repository.batch_complete_task_runs(
+            conn,
+            dataset_name,
+            version,
+            [item.model_dump() for item in payload.runs],
+            query_keys=tuple(request.query_params.keys()),
         )
     )
 

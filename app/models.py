@@ -403,6 +403,34 @@ class ProcessingTaskDispatchResponse(BaseModel):
     runs: list[ProcessingTaskRun]
 
 
+class ProcessingBatchCompleteItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: StrictInt = Field(
+        description="Task of the path version whose current run is being completed"
+    )
+    run_id: StrictInt = Field(description="The task's currently running run")
+    status: Literal["succeeded", "failed"]
+    # Failed items require a non-empty (post-trim) message; succeeded items must
+    # omit it entirely. Cross-field presence is checked in the repository inside
+    # the batch transaction so every rejection rolls the whole batch back.
+    error: StrictStr | None = None
+
+
+class ProcessingBatchCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    runs: list[ProcessingBatchCompleteItem] = Field(
+        description="Non-empty list of runs to complete together in one transaction"
+    )
+
+
+class ProcessingBatchCompleteResponse(BaseModel):
+    dataset: str
+    version: int
+    runs: list[ProcessingTaskRun]
+
+
 class ProcessingTaskDependenciesUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

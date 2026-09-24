@@ -276,6 +276,32 @@ run records one attempt. Tasks and runs are persisted across restarts.
   the same task, and a single response never exceeds `limit`. Unknown
   dataset/version → `404`; extra body fields, a non-integer (including
   boolean) or non-positive `limit` → `422` and nothing is written.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/batch-complete` —
+  finish many current runs of one version together, independently of the
+  single-run finish route. The body contains only a non-empty `runs` array;
+  each item is `{"task_id", "run_id", "status"}` with `status` `succeeded`
+  (no `error`) or `failed` (with an `error` that is non-empty after trimming;
+  the message is stored verbatim as on the single-run finish route), and a
+  task may appear at most once. The whole batch is validated
+  in a single transaction before any run is written, so any failure commits
+  nothing. On success every run gets `finished_at` and its task moves
+  atomically to the same status; a `failed` task with attempts left stays
+  retryable with continuous attempt numbering, and tasks whose dependencies
+  succeed in the same batch are immediately `ready` to the schedule and
+  dispatch (no extra run or skipped attempt). Returns `200` with
+  `{"dataset", "version", "runs"}`, the completed runs sorted by task id
+  ascending using the existing run fields. Unknown path dataset/version, an
+  item task outside the version, or an unknown run → `404`; a run that exists
+  in the same dataset/version but belongs to another item's task → `422`; an
+  empty/missing/`null` `runs`, an extra field, a non-integer id, an unknown
+  status, a missing/blank/non-string failed `error`, an `error` on a
+  succeeded item, an empty body, malformed JSON or any query parameter →
+  `422`. An already-ended run, a duplicate task in the batch, or a task that
+  is not currently `running` → `409` with every run and task left untouched.
+  Batch completion is single-winner against a concurrent single-run finish,
+  cancel, start or dispatch: exactly one request transitions each run and
+  the others receive `409`, never leaving a `running` run with a half-written
+  `finished_at` or rolling `attempt_count` back.
 - `PATCH /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}` —
   finish the currently running run. Body: `{"status": "succeeded"}` or
   `{"status": "failed", "error": "<non-empty message>"}`. Writes `finished_at`
