@@ -162,6 +162,55 @@ class QualityRuleEvaluateResponse(BaseModel):
     results: list[QualityRuleResult]
 
 
+class QualityEvaluationSummary(BaseModel):
+    sequence: int
+    dataset: str
+    version: int
+    row_count: int
+    violation_count: int
+    results: list[QualityRuleResult]
+    created_at: str
+
+
+class QualityEvaluationHistoryResponse(BaseModel):
+    dataset: str
+    version: int
+    evaluations: list[QualityEvaluationSummary]
+
+
+class QualityEvaluationRef(BaseModel):
+    sequence: int
+    created_at: str
+    row_count: int
+    violation_count: int
+
+
+class QualityViolationOccurrence(BaseModel):
+    rule_id: int
+    row_index: int
+
+
+class QualityRuleChange(BaseModel):
+    rule_id: int
+    name: str
+    # Null on the side where the rule has no recorded result (e.g. it was
+    # disabled or created between the two evaluations); delta is then null too.
+    previous_violation_count: int | None
+    latest_violation_count: int | None
+    delta: int | None
+
+
+class QualityEvaluationCompareResponse(BaseModel):
+    dataset: str
+    version: int
+    # Null on both sides when fewer than two evaluations are recorded.
+    from_evaluation: QualityEvaluationRef | None
+    to_evaluation: QualityEvaluationRef | None
+    new_violations: list[QualityViolationOccurrence]
+    disappeared_violations: list[QualityViolationOccurrence]
+    rule_changes: list[QualityRuleChange]
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None

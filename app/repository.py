@@ -889,10 +889,258 @@ def evaluate_quality_rules(
             }
         )
 
-    return {
+    evaluation = {
         "dataset": dataset["name"],
         "version": version_row["version"],
         "results": results,
+    }
+    _record_quality_evaluation(conn, version_row, evaluation, rows)
+    return evaluation
+
+
+# Serializes the read-tail -> append sequence of evaluation history within
+# this process (the endpoint runs synchronously in the threadpool). The
+# UNIQUE(version_id, sequence) constraint is the hard cross-process guard; a
+# writer that loses a race against another process retries with the new tail.
+_quality_eval_append_locks: dict[int, threading.Lock] = {}
+_quality_eval_append_locks_guard = threading.Lock()
+_QUALITY_EVAL_APPEND_MAX_ATTEMPTS = 100
+
+
+def _quality_eval_append_lock(version_id: int) -> threading.Lock:
+    with _quality_eval_append_locks_guard:
+        lock = _quality_eval_append_locks.get(version_id)
+        if lock is None:
+            lock = threading.Lock()
+            _quality_eval_append_locks[version_id] = lock
+        return lock
+
+
+def _record_quality_evaluation(
+    conn: sqlite3.Connection,
+    version_row: sqlite3.Row,
+    evaluation: dict,
+    rows: list[dict],
+) -> None:
+    """Append the execution summary of one successful evaluation.
+
+    Every successful evaluation is recorded exactly once, including an empty
+    row set (all violation counts are then zero). A rejected or failed
+    evaluation raises before reaching this function (or the insert fails and
+    the surrounding transaction rolls back), so it never leaves a record.
+    """
+    violating_rows = {
+        index
+        for result in evaluation["results"]
+        for index in result["violations"]
+    }
+    with _quality_eval_append_lock(version_row["id"]):
+        for attempt in range(_QUALITY_EVAL_APPEND_MAX_ATTEMPTS):
+            tail = conn.execute(
+                "SELECT sequence FROM quality_evaluations "
+                "WHERE version_id = ? ORDER BY sequence DESC LIMIT 1",
+                (version_row["id"],),
+            ).fetchone()
+            sequence = 1 if tail is None else tail["sequence"] + 1
+            try:
+                conn.execute(
+                    "INSERT INTO quality_evaluations ("
+                    "version_id, sequence, dataset_name, version_number, "
+                    "row_count, violation_count, results, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        version_row["id"],
+                        sequence,
+                        evaluation["dataset"],
+                        evaluation["version"],
+                        len(rows),
+                        len(violating_rows),
+                        json.dumps(evaluation["results"]),
+                        utc_now_iso(),
+                    ),
+                )
+                return
+            except sqlite3.IntegrityError:
+                # Another process inserted the same sequence first. End the
+                # current transaction so the re-read sees the competing commit,
+                # then retry.
+                if attempt + 1 == _QUALITY_EVAL_APPEND_MAX_ATTEMPTS:
+                    conn.rollback()
+                    raise ConflictError(
+                        "Too many concurrent evaluation writes; retry the request"
+                    )
+                conn.rollback()
+
+
+def _quality_evaluation_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "sequence": row["sequence"],
+        "dataset": row["dataset_name"],
+        "version": row["version_number"],
+        "row_count": row["row_count"],
+        "violation_count": row["violation_count"],
+        "results": json.loads(row["results"]),
+        "created_at": row["created_at"],
+    }
+
+
+def list_quality_evaluations(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """List the version's evaluation summaries, oldest first.
+
+    Read-only and parameterless: a non-empty request body or any query
+    parameter is a 422 raised only after the path dataset/version resolves, so
+    an unknown dataset/version stays a 404.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The evaluation history endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The evaluation history endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT sequence, dataset_name, version_number, row_count, "
+        "violation_count, results, created_at FROM quality_evaluations "
+        "WHERE version_id = ? ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "evaluations": [_quality_evaluation_row_to_dict(row) for row in rows],
+    }
+
+
+def _quality_evaluation_ref(row: sqlite3.Row) -> dict:
+    return {
+        "sequence": row["sequence"],
+        "created_at": row["created_at"],
+        "row_count": row["row_count"],
+        "violation_count": row["violation_count"],
+    }
+
+
+def compare_quality_evaluations(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Compare the latest evaluation with the one immediately before it.
+
+    Each side is compared by the rule results recorded for that evaluation
+    only, so a rule enabled on one side and disabled (or newly created) on the
+    other is simply absent on the missing side and differing row-set sizes do
+    not perturb the per-index comparison. Read-only and parameterless; body
+    bytes or query parameters are a 422 after path resolution (404 takes
+    precedence). With fewer than two records the result is explicitly empty.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The evaluation comparison endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The evaluation comparison endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT sequence, dataset_name, version_number, row_count, "
+        "violation_count, results, created_at FROM quality_evaluations "
+        "WHERE version_id = ? ORDER BY sequence DESC LIMIT 2",
+        (version_row["id"],),
+    ).fetchall()
+
+    empty = {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "from_evaluation": None,
+        "to_evaluation": None,
+        "new_violations": [],
+        "disappeared_violations": [],
+        "rule_changes": [],
+    }
+    if len(rows) < 2:
+        return empty
+
+    previous_row, latest_row = rows[1], rows[0]
+    previous_results = {
+        result["rule_id"]: result for result in json.loads(previous_row["results"])
+    }
+    latest_results = {
+        result["rule_id"]: result for result in json.loads(latest_row["results"])
+    }
+
+    new_violations: list[dict] = []
+    disappeared_violations: list[dict] = []
+    rule_changes: list[dict] = []
+    for rule_id in sorted(set(previous_results) | set(latest_results)):
+        previous_result = previous_results.get(rule_id)
+        latest_result = latest_results.get(rule_id)
+        previous_indices = (
+            set(previous_result["violations"]) if previous_result is not None else set()
+        )
+        latest_indices = (
+            set(latest_result["violations"]) if latest_result is not None else set()
+        )
+        new_violations.extend(
+            {"rule_id": rule_id, "row_index": index}
+            for index in sorted(latest_indices - previous_indices)
+        )
+        disappeared_violations.extend(
+            {"rule_id": rule_id, "row_index": index}
+            for index in sorted(previous_indices - latest_indices)
+        )
+        # The null side marks a rule absent from one evaluation (e.g. it was
+        # disabled in between); delta is then null instead of pretending the
+        # missing side had zero violations.
+        previous_count = (
+            None if previous_result is None else len(previous_result["violations"])
+        )
+        latest_count = (
+            None if latest_result is None else len(latest_result["violations"])
+        )
+        delta = (
+            None
+            if previous_count is None or latest_count is None
+            else latest_count - previous_count
+        )
+        present = latest_result if latest_result is not None else previous_result
+        rule_changes.append(
+            {
+                "rule_id": rule_id,
+                "name": present["name"],
+                "previous_violation_count": previous_count,
+                "latest_violation_count": latest_count,
+                "delta": delta,
+            }
+        )
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "from_evaluation": _quality_evaluation_ref(previous_row),
+        "to_evaluation": _quality_evaluation_ref(latest_row),
+        "new_violations": new_violations,
+        "disappeared_violations": disappeared_violations,
+        "rule_changes": rule_changes,
     }
 
 

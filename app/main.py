@@ -44,6 +44,8 @@ from app.models import (
     QualityRuleEnabledUpdate,
     QualityRuleEvaluateRequest,
     QualityRuleEvaluateResponse,
+    QualityEvaluationCompareResponse,
+    QualityEvaluationHistoryResponse,
     RetentionPolicy,
     RetentionPolicyCreate,
     RetentionException,
@@ -347,6 +349,55 @@ def evaluate_quality_rules(
     return QualityRuleEvaluateResponse(
         **repository.evaluate_quality_rules(
             conn, dataset_name, version, payload.rows
+        )
+    )
+
+
+# Declared after the literal "evaluate" route; "history" and "compare" are
+# literal segments that must not be parsed as rule ids.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/history",
+    response_model=QualityEvaluationHistoryResponse,
+)
+def list_quality_evaluations(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> QualityEvaluationHistoryResponse:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/version is known,
+    # preserving 404 precedence.
+    return QualityEvaluationHistoryResponse(
+        **repository.list_quality_evaluations(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/history/compare",
+    response_model=QualityEvaluationCompareResponse,
+)
+def compare_quality_evaluations(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> QualityEvaluationCompareResponse:
+    return QualityEvaluationCompareResponse(
+        **repository.compare_quality_evaluations(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
         )
     )
 

@@ -130,6 +130,47 @@ and persisted (including their enabled state) across restarts.
     violation.
   - With an empty `rows` list every rule passes.
 
+#### Evaluation history and comparison
+
+Every successful evaluation (including an empty `rows` list) persists an
+append-only execution summary per schema version; a rejected or failed
+evaluation leaves no record. Summaries are numbered continuously from `1` per
+version, survive restarts and can never be updated or deleted through the API
+(the database itself rejects rewrites). Concurrent evaluations never reuse a
+sequence or lose a record.
+
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/history` —
+  list the version's evaluation summaries in occurrence order (`sequence`
+  ascending). Each entry contains `sequence`, `dataset`, `version`,
+  `row_count` (submitted rows), `violation_count` (distinct 0-based row
+  indices with at least one violation) and `results` (the same
+  `rule_id`/`name`/`passed`/`violations` objects returned by evaluate,
+  sorted by `rule_id`). No request body or query parameters are accepted
+  (`422`); unknown dataset/version → `404`.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/history/compare` —
+  read-only comparison of the most recent evaluation (`to_evaluation`)
+  against the one immediately before it (`from_evaluation`). Returns
+  `{"dataset", "version", "from_evaluation", "to_evaluation",
+  "new_violations", "disappeared_violations", "rule_changes"}`:
+  - `new_violations` / `disappeared_violations` list per-rule 0-based row
+    indices that appear only in the latest / only in the previous result,
+    each as `{"rule_id", "row_index"}` — indices from different rule
+    results are not merged.
+  - `rule_changes` is sorted by `rule_id`; each entry has `name`,
+    `previous_violation_count`, `latest_violation_count` and `delta`
+    (`latest - previous`, so increases, decreases and zero are all
+    observable). A rule absent from one evaluation (e.g. disabled between
+    the two, or different row sets) has the missing count and `delta` set
+    to `null`.
+  - Comparisons use only the two persisted summaries: a rule disabled
+    between evaluations contributes its recorded result on the side where
+    it ran and is marked null on the other; differing row-set sizes do not
+    affect the per-index comparison.
+  - When the version has zero or one recorded evaluation the response is
+    `200` with both evaluation refs and every list empty (no error). No
+    request body or query parameters are accepted (`422`, no writes);
+    unknown dataset/version → `404`.
+
 ### Privacy policies
 
 Privacy policies attach a sensitivity classification and masking strategy to a

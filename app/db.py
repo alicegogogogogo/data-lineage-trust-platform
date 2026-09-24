@@ -71,6 +71,27 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (version_id, name)
     )
     """,
+    # One row per successful quality-rule evaluation. The full execution
+    # summary (per-rule results, submitted and violating row counts) is stored
+    # as JSON so the history is self-contained: later reads and the
+    # latest-vs-previous comparison depend only on these persisted summaries,
+    # never on the rules as they stand afterwards. Summaries are append-only
+    # (triggers below reject updates and deletes) and numbered continuously
+    # from 1 per schema version.
+    """
+    CREATE TABLE IF NOT EXISTS quality_evaluations (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id      INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        sequence        INTEGER NOT NULL CHECK (sequence >= 1),
+        dataset_name    TEXT NOT NULL,
+        version_number  INTEGER NOT NULL,
+        row_count       INTEGER NOT NULL CHECK (row_count >= 0),
+        violation_count INTEGER NOT NULL CHECK (violation_count >= 0),
+        results         TEXT NOT NULL,
+        created_at      TEXT NOT NULL,
+        UNIQUE (version_id, sequence)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS privacy_policies (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +251,22 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON processing_task_audit_records
     BEGIN
         SELECT RAISE(ABORT, 'processing task audit records are immutable');
+    END
+    """,
+    # Quality evaluation history is append-only as well: a recorded execution
+    # summary can never be rewritten or removed.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_quality_evaluations_no_update
+    BEFORE UPDATE ON quality_evaluations
+    BEGIN
+        SELECT RAISE(ABORT, 'quality evaluation records are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_quality_evaluations_no_delete
+    BEFORE DELETE ON quality_evaluations
+    BEGIN
+        SELECT RAISE(ABORT, 'quality evaluation records are immutable');
     END
     """,
 )
