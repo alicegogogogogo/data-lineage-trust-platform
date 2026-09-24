@@ -374,6 +374,20 @@ class MaskingSuggestion(BaseModel):
     allowed_roles: list[str]
 
 
+class MaskingSuggestionsRegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Non-empty array of field names; StrictStr rejects non-string items at the
+    # request layer. Blank-after-trimming names and duplicates are semantic
+    # checks in the repository, after the path dataset/version resolves, so an
+    # unknown dataset/version keeps its 404 precedence.
+    fields: list[StrictStr] = Field(
+        min_length=1,
+        description="Distinct, non-empty names of existing version fields that "
+        "each currently have a masking suggestion candidate",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #

@@ -1974,6 +1974,168 @@ def list_masking_suggestions(
     return suggestions
 
 
+# Serializes validate-existing -> insert within this process so two concurrent
+# registrations can never both pass the "no policy yet" check (mirrors the
+# evaluation append lock). The privacy_policies UNIQUE(version_id, field)
+# constraint is the hard cross-process guard; the losing registration turns
+# its insert into a 409 and the whole batch is rolled back.
+_suggestion_register_locks: dict[int, threading.Lock] = {}
+_suggestion_register_locks_guard = threading.Lock()
+
+
+def _suggestion_register_lock(version_id: int) -> threading.Lock:
+    with _suggestion_register_locks_guard:
+        lock = _suggestion_register_locks.get(version_id)
+        if lock is None:
+            lock = threading.Lock()
+            _suggestion_register_locks[version_id] = lock
+        return lock
+
+
+def _current_masking_suggestions(
+    conn: sqlite3.Connection, version_id: int
+) -> dict[str, dict]:
+    """Read-time-recomputed candidates of one version keyed by field name.
+
+    This is the same recomputation as the read-only suggestions endpoint, so
+    registration acts on exactly the candidates a concurrent GET would list:
+    only identification records with at least one name/sample hit contribute.
+    """
+    rows = conn.execute(
+        "SELECT * FROM sensitive_identifications WHERE version_id = ? ORDER BY id ASC",
+        (version_id,),
+    ).fetchall()
+    return {
+        row["field"]: suggestion
+        for row in rows
+        if (suggestion := _identification_suggestion(row)) is not None
+    }
+
+
+def register_masking_suggestions(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    fields: list[str],
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Register one privacy policy per requested field from its candidate.
+
+    The whole batch is validated before any policy or timestamp is written;
+    any rejection rolls back without a partial result. Validation order,
+    mirroring the manual policy creation, is:
+
+    1. The path dataset/version must resolve (404).
+    2. Query parameters (422) and the field-name list shape: every name is
+       non-empty after trimming and no name repeats (422).
+    3. Every requested field must exist in the version (404).
+    4. Each field must currently have a candidate (a hit-bearing
+       identification record) and must not already carry a policy (409).
+
+    Each new policy copies the candidate's classification and masking verbatim
+    with its empty allowed-role list, is enabled by default and gets a
+    service-generated id and timestamp; records are returned in the request's
+    field-name order. Identification records are only read, never written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    version_id = version_row["id"]
+
+    if query_keys:
+        raise RequestInvalidError(
+            "The masking suggestion registration endpoint does not accept "
+            "query parameters"
+        )
+
+    cleaned_fields: list[str] = []
+    seen: set[str] = set()
+    for name in fields:
+        clean_name = name.strip()
+        if not clean_name:
+            raise RequestInvalidError("Field names must not be empty")
+        if clean_name in seen:
+            raise RequestInvalidError(
+                f"Field '{clean_name}' is listed more than once in 'fields'"
+            )
+        seen.add(clean_name)
+        cleaned_fields.append(clean_name)
+
+    version_field_names = _version_field_names(conn, version_id)
+    for clean_name in cleaned_fields:
+        if clean_name not in version_field_names:
+            raise NotFoundError(
+                f"Field '{clean_name}' does not exist in version "
+                f"{version_number} of dataset '{dataset_name}'"
+            )
+
+    with _suggestion_register_lock(version_id):
+        suggestions_by_field = _current_masking_suggestions(conn, version_id)
+        for clean_name in cleaned_fields:
+            if clean_name not in suggestions_by_field:
+                # Covers both "never identified" and an identification record
+                # whose two classes both missed on its latest run.
+                raise ConflictError(
+                    f"No masking suggestion candidate is available for field "
+                    f"'{clean_name}'; identify the field before registering a "
+                    "privacy policy"
+                )
+
+        existing = {
+            row["field"]
+            for row in conn.execute(
+                "SELECT field FROM privacy_policies WHERE version_id = ?",
+                (version_id,),
+            ).fetchall()
+        }
+        for clean_name in cleaned_fields:
+            if clean_name in existing:
+                raise ConflictError(
+                    f"A privacy policy for field '{clean_name}' already exists "
+                    f"for version {version_number} of dataset '{dataset_name}'"
+                )
+
+        # All checks passed: the inserts below are the only writes, and they
+        # share the request's transaction, so a failure still rolls back every
+        # policy and timestamp. The UNIQUE(version_id, field) constraint turns a
+        # competing registration in another process into a 409 here.
+        inserted_ids: list[int] = []
+        try:
+            for clean_name in cleaned_fields:
+                suggestion = suggestions_by_field[clean_name]
+                cursor = conn.execute(
+                    "INSERT INTO privacy_policies ("
+                    "version_id, field, classification, masking, allowed_roles, "
+                    "enabled, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, 1, ?)",
+                    (
+                        version_id,
+                        clean_name,
+                        suggestion["classification"],
+                        suggestion["masking"],
+                        json.dumps(suggestion["allowed_roles"]),
+                        utc_now_iso(),
+                    ),
+                )
+                inserted_ids.append(cursor.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError(
+                "A privacy policy for one of the requested fields was "
+                "registered concurrently; retry the request"
+            ) from exc
+
+        rows_by_field: dict[str, sqlite3.Row] = {}
+        for policy_id in inserted_ids:
+            row = conn.execute(
+                "SELECT id, field, classification, masking, allowed_roles, "
+                "enabled, created_at FROM privacy_policies WHERE id = ?",
+                (policy_id,),
+            ).fetchone()
+            rows_by_field[row["field"]] = row
+
+    return [_policy_row_to_dict(rows_by_field[name]) for name in cleaned_fields]
+
+
 # --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #

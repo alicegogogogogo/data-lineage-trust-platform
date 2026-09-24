@@ -22,6 +22,7 @@ from app.models import (
     LineageImpactResponse,
     LineageResponse,
     MaskingSuggestion,
+    MaskingSuggestionsRegisterRequest,
     PrivacyPolicy,
     PrivacyPolicyCreate,
     PrivacyPolicyEnabledUpdate,
@@ -677,6 +678,39 @@ def list_masking_suggestions(
             dataset_name,
             version,
             body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
+@app.post(
+    f"{SENSITIVE_IDENTIFICATIONS_PATH}/masking-suggestions/register",
+    response_model=list[PrivacyPolicy],
+    status_code=201,
+)
+def register_masking_suggestions(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    payload: MaskingSuggestionsRegisterRequest,
+    conn=Depends(get_db),
+) -> list[PrivacyPolicy]:
+    # Turn the version's current advisory candidates into registered privacy
+    # policies for exactly the named fields. The candidates (classification,
+    # masking and the empty allowed-role list) are read from the identification
+    # records and recomputed the same way the read-only suggestions endpoint
+    # does; the identification records themselves are never written. The batch
+    # is validated as a whole before any policy is inserted, so a rejected
+    # request writes nothing. Query parameters are a 422 checked in the
+    # repository after the path resolves, preserving 404 precedence (mirrors
+    # the batch-complete endpoint).
+    return [
+        PrivacyPolicy(**policy)
+        for policy in repository.register_masking_suggestions(
+            conn,
+            dataset_name,
+            version,
+            list(payload.fields),
             query_keys=tuple(request.query_params.keys()),
         )
     ]

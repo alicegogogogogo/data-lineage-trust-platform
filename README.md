@@ -305,6 +305,31 @@ stable ids) persist across restarts.
   - `allowed_roles` is always an empty list: the suggested masking applies to
     every role, granting none an unmasked view.
 
+- `POST /datasets/{dataset}/versions/{version}/sensitive-identifications/masking-suggestions/register`
+  — turn the current advisory candidates into registered privacy policies. The
+  body contains only `{"fields": ["<field>", ...]}`: a non-empty array of
+  distinct field names, each non-empty after trimming and naming an existing
+  field of the version that currently has a masking suggestion candidate.
+  Returns `201` with one privacy policy record per requested field, in the
+  request's field-name order; each record has the same fields as the manual
+  policy creation response (`id`, `field`, `classification`, `masking`,
+  `allowed_roles`, `enabled`, `created_at`), is enabled by default and gets a
+  service-generated id and timestamp. Each policy copies its candidate's
+  `classification` and `masking` verbatim with the candidate's empty
+  `allowed_roles`, so after registration every role sees those fields masked;
+  the next privacy view read masks according to the new policies. The whole
+  batch is validated before anything is written, so any rejection writes no
+  policy and no timestamp. Unknown dataset/version, or a named field that does
+  not exist in the version → `404`; a field without an available candidate
+  (never identified, or whose identification record currently yields no
+  candidate) or one that already has a privacy policy → `409`; two concurrent
+  registrations of the same field leave exactly one winner. Missing or extra
+  body fields, an empty `fields` array, duplicate, non-string or blank names,
+  an empty body, a whitespace-only body, malformed JSON or any query parameter
+  → `422` and nothing is written. Registration only reads the identification
+  records and field definitions; it never writes or auto-refreshes an
+  identification, and the read-only suggestions endpoint stays unchanged.
+
 ### Row snapshots
 
 A row snapshot persistently records the rows of a schema version at one point in
