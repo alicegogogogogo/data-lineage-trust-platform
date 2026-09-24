@@ -750,7 +750,10 @@ def dispatch_processing_tasks(
 
 # The literal "batch-complete" segment must not be parsed as a task id (mirrors
 # the "dispatch" and "schedule" routes). The body is required and contains only
-# the non-empty "runs" array.
+# the non-empty "runs" array. exclude_unset preserves whether an item explicitly
+# carries an "error" key (even null): a success item may only omit it, so the
+# repository must be able to reject an explicit null/write while accepting an
+# omitted field.
 @app.post(
     f"{PROCESSING_TASKS_PATH}/batch-complete",
     response_model=ProcessingRunBatchCompleteResponse,
@@ -767,7 +770,7 @@ def batch_complete_processing_task_runs(
             conn,
             dataset_name,
             version,
-            [item.model_dump() for item in payload.runs],
+            [item.model_dump(exclude_unset=True) for item in payload.runs],
             query_keys=tuple(request.query_params.keys()),
         )
     )

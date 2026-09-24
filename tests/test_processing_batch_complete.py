@@ -343,6 +343,8 @@ def test_batch_rejects_unknown_status_and_bad_error(client: TestClient) -> None:
         {"runs": [{"task_id": task["id"], "run_id": run["id"],
                    "status": "succeeded", "error": "nope"}]},
         {"runs": [{"task_id": task["id"], "run_id": run["id"],
+                   "status": "succeeded", "error": None}]},
+        {"runs": [{"task_id": task["id"], "run_id": run["id"],
                    "status": "failed", "error": 5}]},
         {"runs": [{"task_id": task["id"], "run_id": run["id"],
                    "status": "failed", "error": True}]},
@@ -426,6 +428,17 @@ def test_batch_unknown_dataset_or_version_is_404(client: TestClient) -> None:
     assert response.status_code == 404
     assert response.json()["error"] == "not_found"
     assert_error_shape(response.json())
+
+    # 404 path resolution takes precedence over the per-item error rule: an
+    # explicit null on a success item is a 422 only once the path resolves.
+    body_null_error = {
+        "runs": [{"task_id": 1, "run_id": 1, "status": "succeeded", "error": None}]
+    }
+    response = client.post(
+        "/datasets/ghost/versions/1/processing-tasks/batch-complete",
+        json=body_null_error,
+    )
+    assert response.status_code == 404
 
     create_dataset_and_version(client)
     response = client.post(

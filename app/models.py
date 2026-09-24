@@ -409,9 +409,12 @@ class ProcessingRunBatchCompleteItem(BaseModel):
     task_id: StrictInt
     run_id: StrictInt
     status: Literal["succeeded", "failed"]
-    # Mirrors ProcessingRunFinish: null/omitted for success, a non-empty
-    # message for failure (emptiness is checked in the repository after the
-    # path resolves so 404 precedence is preserved).
+    # Success items must omit this field entirely (an explicit null or any
+    # value is a 422); failure items carry a non-empty message. The field is
+    # optional at the model layer so emptiness/presence is checked in the
+    # repository after the path resolves, preserving 404 precedence; the route
+    # passes exclude_unset so the repository can tell omission from explicit
+    # null.
     error: StrictStr | None = None
 
 

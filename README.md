@@ -289,7 +289,9 @@ run records one attempt. Tasks and runs are persisted across restarts.
   a non-empty `runs` array; each item names a task of the path version and one
   of its runs: `{"task_id": <int>, "run_id": <int>, "status": "succeeded"}` or
   the same with `"status": "failed"` and an `error` that is non-empty after
-  trimming whitespace (`succeeded` items carry no `error`). The same task must
+  trimming whitespace. A `succeeded` item must omit the `error` field
+  entirely; writing the field explicitly — even as `null` or with any value —
+  is a `422` (unlike omission). The same task must
   not appear twice. The whole batch is validated before any write and either
   every item completes or none do; on success the response is
   `{"dataset", "version", "runs"}` with the completed runs sorted by task id

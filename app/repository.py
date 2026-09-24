@@ -2277,15 +2277,16 @@ def batch_complete_task_runs(
     """Finish a non-empty batch of currently running runs in one transaction.
 
     Every item names a task of the path version together with one of its runs
-    and declares ``succeeded`` (no error) or ``failed`` (an error that is
-    non-empty after trimming). The whole batch is validated before any write:
-    the path dataset/version must exist (404); query parameters are rejected
-    (422); per-item status/error rules are checked (422); every named task must
-    exist in the version (404) and must not appear twice (409); every run must
-    exist (404), belong to the named task when it is in the same version (422)
-    and still be ``running`` with its task currently completable (409). A run
-    owned by a task in another dataset/version is treated as not existing in
-    this version (404).
+    and declares ``succeeded`` (the ``error`` field must be omitted entirely;
+    an explicit null or any other value is a 422) or ``failed`` (an ``error``
+    string that is non-empty after trimming). The whole batch is validated
+    before any write: the path dataset/version must exist (404); query
+    parameters are rejected (422); per-item status/error rules are checked
+    (422); every named task must exist in the version (404) and must not
+    appear twice (409); every run must exist (404), belong to the named task
+    when it is in the same version (422) and still be ``running`` with its
+    task currently completable (409). A run owned by a task in another
+    dataset/version is treated as not existing in this version (404).
 
     On success every run gets a ``finished_at`` timestamp and its terminal
     status, and the owning task moves to the same status atomically; the result
@@ -2326,17 +2327,21 @@ def batch_complete_task_runs(
                 task_rows[task_id] = task_row
 
             # Phase 2: per-item payload semantics, mirroring the single finish
-            # endpoint (which resolves the path task before these same checks):
-            # a success carries no error and a failure needs a non-blank one.
+            # endpoint (which resolves the path task before these same checks).
+            # Items arrive via model_dump(exclude_unset=True), so "error" is
+            # present in the dict only when the request carried the key: a
+            # success may only omit it (an explicit null/value is a 422) and a
+            # failure must carry a non-blank string.
             for item in items:
                 status = item["status"]
-                error = item["error"]
+                error_present = "error" in item
+                error = item.get("error")
                 if status == "succeeded":
-                    if error is not None:
+                    if error_present:
                         raise RequestInvalidError(
                             "A successful run must not carry an error message"
                         )
-                elif error is None or not error.strip():
+                elif not error_present or error is None or not error.strip():
                     raise RequestInvalidError(
                         "A failed run requires a non-empty error message"
                     )
