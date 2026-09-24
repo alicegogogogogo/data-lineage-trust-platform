@@ -264,6 +264,56 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         SELECT RAISE(ABORT, 'quality rule evaluation records are immutable');
     END
     """,
+    # One anomaly detection configuration per schema version: the consecutive
+    # worsening-step threshold and the two violation-count limits a scan
+    # applies to the persisted evaluation history.
+    """
+    CREATE TABLE IF NOT EXISTS quality_anomaly_detection_configs (
+        id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id                  INTEGER NOT NULL
+                                    REFERENCES schema_versions(id) ON DELETE CASCADE,
+        consecutive_worsening_steps INTEGER NOT NULL
+                                    CHECK (consecutive_worsening_steps >= 2),
+        violation_row_limit         INTEGER NOT NULL
+                                    CHECK (violation_row_limit >= 0),
+        rule_violation_limit        INTEGER NOT NULL
+                                    CHECK (rule_violation_limit >= 0),
+        created_at                  TEXT NOT NULL,
+        UNIQUE (version_id)
+    )
+    """,
+    # Anomaly records produced by detection scans. ``sequence`` numbers the
+    # records of one version contiguously; ``evaluation_sequence`` points at
+    # the evaluation history entry the record was derived from and ``rule_id``
+    # is null for every kind except 'rule_limit_exceeded'.
+    """
+    CREATE TABLE IF NOT EXISTS quality_anomaly_records (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id          INTEGER NOT NULL
+                            REFERENCES schema_versions(id) ON DELETE CASCADE,
+        sequence            INTEGER NOT NULL CHECK (sequence >= 1),
+        kind                TEXT NOT NULL
+                            CHECK (kind IN (
+                                'row_limit_exceeded',
+                                'rule_limit_exceeded',
+                                'trend'
+                            )),
+        evaluation_sequence INTEGER NOT NULL,
+        rule_id             INTEGER,
+        violation_count     INTEGER NOT NULL CHECK (violation_count >= 0),
+        created_at          TEXT NOT NULL,
+        UNIQUE (version_id, sequence)
+    )
+    """,
+    # The same anomaly (kind, evaluation, rule) is persisted at most once per
+    # version no matter how many scans detect it; IFNULL maps the null rule id
+    # of row-limit and trend records so the dedup key treats them as equal.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_quality_anomaly_records_unique_anomaly
+    ON quality_anomaly_records (
+        version_id, kind, evaluation_sequence, IFNULL(rule_id, -1)
+    )
+    """,
 )
 
 

@@ -152,6 +152,50 @@ and persisted (including their enabled state) across restarts.
   empty lists), not an error. Same `404`/`422` rules as the history
   endpoint; nothing is written.
 
+#### Quality anomaly detection
+
+Anomaly detection runs over the persisted evaluation history of a schema
+version, driven by one registered detection configuration per version.
+
+- `POST /datasets/{dataset}/versions/{version}/quality-rules/anomaly-detection`
+  — register the version's detection config. Body:
+  `{"consecutive_worsening_steps": 2, "violation_row_limit": 10, "rule_violation_limit": 5}`
+  (exactly these three integers; the steps must be at least 2 and the limits
+  must not be negative). Returns `201` with `id`, `dataset`, `version`, the
+  three configured values and `created_at`. Only one config may exist per
+  version: a second registration returns `409`. Unknown dataset/version →
+  `404`; missing/extra fields, non-integer values, steps below 2 or negative
+  limits → `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/anomaly-detection`
+  — read-only fetch of the registered config (`404` when none is registered).
+  The endpoint takes no request body and no query parameters (`422`).
+- `POST /datasets/{dataset}/versions/{version}/quality-rules/anomaly-detection/scan`
+  — run one detection pass over the persisted evaluation history and return
+  the anomaly records this scan newly created (in `sequence` order); they are
+  persisted. Scanning without a registered config returns `409`; with an
+  empty history the scan succeeds and writes nothing. Detection rules:
+  - an evaluation whose distinct violating row count exceeds
+    `violation_row_limit` yields a `row_limit_exceeded` record pointing at
+    its history sequence;
+  - a single rule whose violating row count exceeds `rule_violation_limit`
+    yields a `rule_limit_exceeded` record carrying that `rule_id`;
+  - a trailing run of adjacent evaluations whose violation row counts
+    strictly increase step by step yields a `trend` record at the last
+    evaluation of the run once the run's step count reaches
+    `consecutive_worsening_steps`; runs that never reach the steps or are
+    broken by a decline or plateau produce nothing.
+  Each record carries `sequence` (contiguous per version), `dataset`,
+  `version`, `kind`, `evaluation_sequence`, `rule_id` (null except for
+  `rule_limit_exceeded`), `violation_count` and `created_at`. The same
+  (kind, evaluation sequence, rule id) is recorded at most once: repeated or
+  concurrent scans only append anomalies that appeared since, with
+  contiguous, conflict-free sequences. The endpoint takes no request body
+  and no query parameters (`422`); unknown dataset/version → `404`.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/anomaly-detection/records`
+  — list every persisted anomaly record of the version by `sequence`
+  ascending (empty when nothing was detected, never an error). Same
+  `404`/`422` rules as the scan endpoint.
+
 ### Privacy policies
 
 Privacy policies attach a sensitivity classification and masking strategy to a

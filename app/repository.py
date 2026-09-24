@@ -1015,9 +1015,10 @@ def _require_evaluation_path(
 ) -> tuple[dict, sqlite3.Row]:
     """Resolve the path (404) before rejecting body bytes/query params (422).
 
-    Both history endpoints are parameterless; the shape checks run only once
-    the dataset and version are known, so an unknown dataset/version stays a
-    404 (mirroring the parameterless audit-report endpoint).
+    The history and anomaly-detection scan/query endpoints are parameterless;
+    the shape checks run only once the dataset and version are known, so an
+    unknown dataset/version stays a 404 (mirroring the parameterless
+    audit-report endpoint).
     """
     dataset = require_dataset(conn, dataset_name)
     version_row = _require_schema_version(conn, dataset, version_number)
@@ -1157,6 +1158,344 @@ def diff_quality_rule_evaluations(
         "removed_violation_rows": sorted(before_rows - after_rows),
         "rules": rule_diffs,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Quality anomaly detection (config + scans over the evaluation history)
+# --------------------------------------------------------------------------- #
+
+
+ANOMALY_KIND_ROW_LIMIT = "row_limit_exceeded"
+ANOMALY_KIND_RULE_LIMIT = "rule_limit_exceeded"
+ANOMALY_KIND_TREND = "trend"
+
+
+def _anomaly_config_row_to_dict(
+    row: sqlite3.Row, dataset_name: str, version_number: int
+) -> dict:
+    return {
+        "id": row["id"],
+        "dataset": dataset_name,
+        "version": version_number,
+        "consecutive_worsening_steps": row["consecutive_worsening_steps"],
+        "violation_row_limit": row["violation_row_limit"],
+        "rule_violation_limit": row["rule_violation_limit"],
+        "created_at": row["created_at"],
+    }
+
+
+def create_anomaly_detection_config(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    consecutive_worsening_steps: int,
+    violation_row_limit: int,
+    rule_violation_limit: int,
+) -> dict:
+    """Register the single anomaly detection config of one schema version."""
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO quality_anomaly_detection_configs ("
+            "version_id, consecutive_worsening_steps, violation_row_limit, "
+            "rule_violation_limit, created_at"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                version_row["id"],
+                consecutive_worsening_steps,
+                violation_row_limit,
+                rule_violation_limit,
+                utc_now_iso(),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ConflictError(
+            f"An anomaly detection config already exists for version "
+            f"{version_number} of dataset '{dataset_name}'"
+        ) from exc
+
+    row = conn.execute(
+        "SELECT * FROM quality_anomaly_detection_configs WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _anomaly_config_row_to_dict(row, dataset["name"], version_row["version"])
+
+
+def get_anomaly_detection_config(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only fetch of the version's registered detection config."""
+    dataset, version_row = _require_evaluation_path(
+        conn, dataset_name, version_number, body=body, query_keys=query_keys,
+        endpoint="anomaly detection config",
+    )
+    row = conn.execute(
+        "SELECT * FROM quality_anomaly_detection_configs WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"No anomaly detection config exists for version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    return _anomaly_config_row_to_dict(row, dataset["name"], version_row["version"])
+
+
+def _anomaly_record_row_to_dict(
+    row: sqlite3.Row, dataset_name: str, version_number: int
+) -> dict:
+    return {
+        "sequence": row["sequence"],
+        "dataset": dataset_name,
+        "version": version_number,
+        "kind": row["kind"],
+        "evaluation_sequence": row["evaluation_sequence"],
+        "rule_id": row["rule_id"],
+        "violation_count": row["violation_count"],
+        "created_at": row["created_at"],
+    }
+
+
+def _detect_quality_anomalies(
+    history_rows: list[sqlite3.Row],
+    *,
+    consecutive_worsening_steps: int,
+    violation_row_limit: int,
+    rule_violation_limit: int,
+) -> list[tuple[str, int, int | None, int]]:
+    """Detect anomalies over the persisted evaluation history of one version.
+
+    Returns ``(kind, evaluation_sequence, rule_id, violation_count)`` tuples in
+    a deterministic order: evaluations in occurrence (sequence) order, each
+    contributing its row-limit record, then one rule-limit record per exceeded
+    rule in recorded result order, then its trend record.
+
+    A row-limit record flags every evaluation whose distinct violating row
+    count exceeds ``violation_row_limit``; a rule-limit record flags every
+    single rule whose violating row count exceeds ``rule_violation_limit``. A
+    trend record flags an evaluation whose own trailing run of strictly
+    increasing violation row counts (each step one adjacent increase) reaches
+    ``consecutive_worsening_steps``; a decline or plateau resets the run, so
+    runs that never reach the configured steps produce nothing.
+    """
+    detected: list[tuple[str, int, int | None, int]] = []
+    trailing_worsening_steps = 0
+    previous_violation_rows: int | None = None
+    for row in history_rows:
+        sequence = row["sequence"]
+        violation_rows = row["violation_row_count"]
+
+        if violation_rows > violation_row_limit:
+            detected.append(
+                (ANOMALY_KIND_ROW_LIMIT, sequence, None, violation_rows)
+            )
+
+        for result in json.loads(row["results"]):
+            rule_violations = len(result["violations"])
+            if rule_violations > rule_violation_limit:
+                detected.append(
+                    (
+                        ANOMALY_KIND_RULE_LIMIT,
+                        sequence,
+                        result["rule_id"],
+                        rule_violations,
+                    )
+                )
+
+        if (
+            previous_violation_rows is not None
+            and violation_rows > previous_violation_rows
+        ):
+            trailing_worsening_steps += 1
+        else:
+            trailing_worsening_steps = 0
+        if trailing_worsening_steps >= consecutive_worsening_steps:
+            detected.append((ANOMALY_KIND_TREND, sequence, None, violation_rows))
+
+        previous_violation_rows = violation_rows
+    return detected
+
+
+# Serializes read-existing -> append within this process so concurrent scans
+# never compute the same record sequence. SQLite's UNIQUE(version_id,
+# sequence) constraint and the dedup index on (version_id, kind,
+# evaluation_sequence, rule_id) are the hard guards against writers in other
+# processes; such a collision is resolved with a bounded re-read-and-retry
+# (mirrors the evaluation history append).
+_anomaly_scan_locks: dict[int, threading.Lock] = {}
+_anomaly_scan_locks_guard = threading.Lock()
+
+# Bound on re-read-and-retry attempts when a writer in another process wins
+# the race for the same (version_id, sequence).
+_ANOMALY_SCAN_MAX_ATTEMPTS = 100
+
+
+def _anomaly_scan_lock(version_id: int) -> threading.Lock:
+    with _anomaly_scan_locks_guard:
+        lock = _anomaly_scan_locks.get(version_id)
+        if lock is None:
+            lock = threading.Lock()
+            _anomaly_scan_locks[version_id] = lock
+        return lock
+
+
+def scan_quality_anomalies(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Run one anomaly detection pass over the persisted evaluation history.
+
+    Every detected anomaly that is not yet recorded (same kind, same
+    evaluation sequence, same rule id) is appended with the next contiguous
+    per-version sequence and the records created by this scan are returned in
+    that order; a repeated scan only fills in anomalies that appeared since
+    the previous one. The endpoint is parameterless (body bytes or query
+    parameters are a 422 once the path resolves), requires the registered
+    detection config (409 when missing) and succeeds without writing anything
+    when the history is empty. Only the persisted evaluation history and the
+    registered config are read; rule definitions and other metadata are never
+    consulted or written.
+    """
+    dataset, version_row = _require_evaluation_path(
+        conn, dataset_name, version_number, body=body, query_keys=query_keys,
+        endpoint="anomaly scan",
+    )
+
+    config_row = conn.execute(
+        "SELECT * FROM quality_anomaly_detection_configs WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchone()
+    if config_row is None:
+        raise ConflictError(
+            f"No anomaly detection config is registered for version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    history_rows = conn.execute(
+        "SELECT sequence, violation_row_count, results "
+        "FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    detected = _detect_quality_anomalies(
+        history_rows,
+        consecutive_worsening_steps=config_row["consecutive_worsening_steps"],
+        violation_row_limit=config_row["violation_row_limit"],
+        rule_violation_limit=config_row["rule_violation_limit"],
+    )
+    if not detected:
+        return []
+
+    # The per-version lock makes read-existing -> append atomic within this
+    # process (FastAPI runs this synchronous endpoint in one process's
+    # threadpool). The UNIQUE constraints are the hard cross-process guards; a
+    # writer that loses a race against another process retries with the newly
+    # committed records instead of failing the request.
+    with _anomaly_scan_lock(version_row["id"]):
+        for attempt in range(_ANOMALY_SCAN_MAX_ATTEMPTS):
+            existing_rows = conn.execute(
+                "SELECT kind, evaluation_sequence, rule_id "
+                "FROM quality_anomaly_records WHERE version_id = ?",
+                (version_row["id"],),
+            ).fetchall()
+            existing_keys = {
+                (row["kind"], row["evaluation_sequence"], row["rule_id"])
+                for row in existing_rows
+            }
+            pending = [
+                record
+                for record in detected
+                if (record[0], record[1], record[2]) not in existing_keys
+            ]
+            if not pending:
+                return []
+
+            tail = conn.execute(
+                "SELECT MAX(sequence) AS max_sequence "
+                "FROM quality_anomaly_records WHERE version_id = ?",
+                (version_row["id"],),
+            ).fetchone()
+            sequence = (tail["max_sequence"] or 0) + 1
+
+            inserted_ids: list[int] = []
+            try:
+                for kind, evaluation_sequence, rule_id, violation_count in pending:
+                    cursor = conn.execute(
+                        "INSERT INTO quality_anomaly_records ("
+                        "version_id, sequence, kind, evaluation_sequence, "
+                        "rule_id, violation_count, created_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            version_row["id"],
+                            sequence,
+                            kind,
+                            evaluation_sequence,
+                            rule_id,
+                            violation_count,
+                            utc_now_iso(),
+                        ),
+                    )
+                    inserted_ids.append(cursor.lastrowid)
+                    sequence += 1
+            except sqlite3.IntegrityError:
+                # Another process inserted conflicting records first. End the
+                # current (pinned) transaction so the re-read establishes a
+                # new snapshot that includes the competing commit, then retry.
+                if attempt + 1 == _ANOMALY_SCAN_MAX_ATTEMPTS:
+                    conn.rollback()
+                    raise ConflictError(
+                        "Too many concurrent anomaly scans; retry the request"
+                    )
+                conn.rollback()
+                continue
+
+            return [
+                _anomaly_record_row_to_dict(
+                    conn.execute(
+                        "SELECT * FROM quality_anomaly_records WHERE id = ?",
+                        (record_id,),
+                    ).fetchone(),
+                    dataset["name"],
+                    version_row["version"],
+                )
+                for record_id in inserted_ids
+            ]
+    return []  # pragma: no cover - the loop always returns or raises
+
+
+def list_quality_anomaly_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Every persisted anomaly record of one version, by sequence ascending."""
+    dataset, version_row = _require_evaluation_path(
+        conn, dataset_name, version_number, body=body, query_keys=query_keys,
+        endpoint="anomaly records",
+    )
+    rows = conn.execute(
+        "SELECT * FROM quality_anomaly_records WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return [
+        _anomaly_record_row_to_dict(row, dataset["name"], version_row["version"])
+        for row in rows
+    ]
 
 
 # --------------------------------------------------------------------------- #
