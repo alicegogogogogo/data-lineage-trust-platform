@@ -44,6 +44,8 @@ from app.models import (
     QualityRuleEnabledUpdate,
     QualityRuleEvaluateRequest,
     QualityRuleEvaluateResponse,
+    QualityRuleEvaluationDiffResponse,
+    QualityRuleEvaluationRecord,
     RetentionPolicy,
     RetentionPolicyCreate,
     RetentionException,
@@ -349,6 +351,55 @@ def evaluate_quality_rules(
             conn, dataset_name, version, payload.rows
         )
     )
+
+
+# Declared before the "/evaluations" collection route for symmetry with the
+# other literal-segment routes; both are read-only and parameterless, so any
+# body bytes or query parameters are a 422 validated in the repository once
+# the path dataset/version is known, preserving 404 precedence.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/evaluations/diff",
+    response_model=QualityRuleEvaluationDiffResponse,
+)
+def diff_quality_rule_evaluations(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> QualityRuleEvaluationDiffResponse:
+    return QualityRuleEvaluationDiffResponse(
+        **repository.diff_quality_rule_evaluations(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/evaluations",
+    response_model=list[QualityRuleEvaluationRecord],
+)
+def list_quality_rule_evaluations(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[QualityRuleEvaluationRecord]:
+    return [
+        QualityRuleEvaluationRecord(**record)
+        for record in repository.list_quality_rule_evaluations(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
 
 
 # --------------------------------------------------------------------------- #

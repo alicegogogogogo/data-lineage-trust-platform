@@ -129,6 +129,28 @@ and persisted (including their enabled state) across restarts.
     counts as `null`, and every row taking part in a duplicate group is a
     violation.
   - With an empty `rows` list every rule passes.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/evaluations` —
+  list the persisted evaluation history of the version, ordered by `sequence`
+  (occurrence order). Every successful evaluation appends one immutable
+  summary (`sequence`, `dataset`, `version`, `row_count`,
+  `violation_row_count` — the number of distinct submitted rows violating at
+  least one rule — `results` and `created_at`); rejected or failed
+  evaluations leave no record, and an empty `rows` submission is recorded
+  with zero violations. The endpoint takes no request body and no query
+  parameters (`422`); unknown dataset/version → `404`.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/evaluations/diff`
+  — read-only diff between the two most recent recorded evaluations
+  (`from_sequence` → `to_sequence`). `added_violation_rows` /
+  `removed_violation_rows` are the 0-based row indices that started or
+  stopped violating any rule, and each entry of `rules` carries the rule's
+  `before`/`after` side (`violation_count` and `violations`), the per-rule
+  `added_violations` / `removed_violations` and the numeric
+  `violation_count_delta` (negative, zero or positive). A rule missing from
+  one side (disabled or created between the two evaluations) has a `null`
+  side and `null` row-level diff fields. With fewer than two recorded
+  evaluations the response is an explicit empty result (null sequences,
+  empty lists), not an error. Same `404`/`422` rules as the history
+  endpoint; nothing is written.
 
 ### Privacy policies
 

@@ -889,10 +889,273 @@ def evaluate_quality_rules(
             }
         )
 
+    # Every successful evaluation appends an immutable summary to the history
+    # (an empty submission is recorded too, with zero violations). A rejected
+    # or failed evaluation raises above and leaves no record.
+    _record_quality_rule_evaluation(
+        conn,
+        version_row["id"],
+        row_count=len(rows),
+        violation_row_count=len(
+            {index for result in results for index in result["violations"]}
+        ),
+        results=results,
+    )
+
     return {
         "dataset": dataset["name"],
         "version": version_row["version"],
         "results": results,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Quality rule evaluation history (append-only) and read-only diff
+# --------------------------------------------------------------------------- #
+
+
+# Serializes read-tail -> append within this process so concurrent evaluations
+# never compute the same sequence. SQLite's UNIQUE(version_id, sequence)
+# constraint is the hard guard against writers in other processes; such a
+# collision is resolved with a bounded re-read-and-retry (mirrors the audit
+# record append).
+_evaluation_append_locks: dict[int, threading.Lock] = {}
+_evaluation_append_locks_guard = threading.Lock()
+
+# Bound on re-read-and-retry attempts when a writer in another process wins the
+# race for the same (version_id, sequence).
+_EVALUATION_APPEND_MAX_ATTEMPTS = 100
+
+
+def _evaluation_append_lock(version_id: int) -> threading.Lock:
+    with _evaluation_append_locks_guard:
+        lock = _evaluation_append_locks.get(version_id)
+        if lock is None:
+            lock = threading.Lock()
+            _evaluation_append_locks[version_id] = lock
+        return lock
+
+
+def _record_quality_rule_evaluation(
+    conn: sqlite3.Connection,
+    version_id: int,
+    *,
+    row_count: int,
+    violation_row_count: int,
+    results: list[dict],
+) -> None:
+    """Append one evaluation summary as the next sequence of the version.
+
+    The per-version lock makes read-tail -> append atomic within this process
+    (FastAPI runs this synchronous endpoint in one process's threadpool). The
+    UNIQUE(version_id, sequence) constraint is the hard cross-process guard; a
+    writer that loses a race against another process retries with the new tail
+    instead of failing the request.
+    """
+    stored_results = json.dumps(results)
+    with _evaluation_append_lock(version_id):
+        for attempt in range(_EVALUATION_APPEND_MAX_ATTEMPTS):
+            tail = conn.execute(
+                "SELECT MAX(sequence) AS max_sequence "
+                "FROM quality_rule_evaluations WHERE version_id = ?",
+                (version_id,),
+            ).fetchone()
+            sequence = (tail["max_sequence"] or 0) + 1
+            try:
+                conn.execute(
+                    "INSERT INTO quality_rule_evaluations ("
+                    "version_id, sequence, row_count, violation_row_count, "
+                    "results, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        version_id,
+                        sequence,
+                        row_count,
+                        violation_row_count,
+                        stored_results,
+                        utc_now_iso(),
+                    ),
+                )
+                return
+            except sqlite3.IntegrityError:
+                # Another process inserted the same sequence first. End the
+                # current (pinned) transaction so the re-read establishes a new
+                # snapshot that includes the competing commit, then retry.
+                if attempt + 1 == _EVALUATION_APPEND_MAX_ATTEMPTS:
+                    conn.rollback()
+                    raise ConflictError(
+                        "Too many concurrent evaluation writes; retry the request"
+                    )
+                conn.rollback()
+                continue
+
+
+def _evaluation_row_to_dict(
+    row: sqlite3.Row, dataset_name: str, version_number: int
+) -> dict:
+    return {
+        "sequence": row["sequence"],
+        "dataset": dataset_name,
+        "version": version_number,
+        "row_count": row["row_count"],
+        "violation_row_count": row["violation_row_count"],
+        "results": json.loads(row["results"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _require_evaluation_path(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes,
+    query_keys: tuple[str, ...],
+    endpoint: str,
+) -> tuple[dict, sqlite3.Row]:
+    """Resolve the path (404) before rejecting body bytes/query params (422).
+
+    Both history endpoints are parameterless; the shape checks run only once
+    the dataset and version are known, so an unknown dataset/version stays a
+    404 (mirroring the parameterless audit-report endpoint).
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body.strip():
+        raise RequestInvalidError(
+            f"The {endpoint} endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            f"The {endpoint} endpoint does not accept query parameters"
+        )
+    return dataset, version_row
+
+
+def list_quality_rule_evaluations(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Every recorded evaluation summary of one version, in occurrence order."""
+    dataset, version_row = _require_evaluation_path(
+        conn, dataset_name, version_number, body=body, query_keys=query_keys,
+        endpoint="evaluation history",
+    )
+    rows = conn.execute(
+        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return [
+        _evaluation_row_to_dict(row, dataset["name"], version_row["version"])
+        for row in rows
+    ]
+
+
+def diff_quality_rule_evaluations(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only diff between the two most recent evaluations of one version.
+
+    The latest recorded evaluation (``to``) is compared against its immediate
+    predecessor (``from``) using exactly the results each of them recorded;
+    the persisted rule definitions and submitted rows of the two evaluations
+    are all that is consulted. Row positions are the 0-based indices each
+    evaluation reported. A rule missing from one side (disabled or not yet
+    created between the two evaluations) keeps a null side, and its row-level
+    diff fields are null as well, so a missing side stays distinguishable from
+    a present side with zero violations. With fewer than two recorded
+    evaluations the result is explicitly empty (null sequences, empty lists),
+    never an error. Nothing is written.
+    """
+    dataset, version_row = _require_evaluation_path(
+        conn, dataset_name, version_number, body=body, query_keys=query_keys,
+        endpoint="evaluation diff",
+    )
+    rows = conn.execute(
+        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence DESC LIMIT 2",
+        (version_row["id"],),
+    ).fetchall()
+
+    empty = {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "from_sequence": None,
+        "to_sequence": None,
+        "added_violation_rows": [],
+        "removed_violation_rows": [],
+        "rules": [],
+    }
+    if len(rows) < 2:
+        return empty
+
+    to_row, from_row = rows[0], rows[1]
+    before_results = {r["rule_id"]: r for r in json.loads(from_row["results"])}
+    after_results = {r["rule_id"]: r for r in json.loads(to_row["results"])}
+
+    rule_diffs: list[dict] = []
+    for rule_id in sorted(set(before_results) | set(after_results)):
+        before = before_results.get(rule_id)
+        after = after_results.get(rule_id)
+        if before is not None and after is not None:
+            before_set = set(before["violations"])
+            after_set = set(after["violations"])
+            added: list[int] | None = sorted(after_set - before_set)
+            removed: list[int] | None = sorted(before_set - after_set)
+            delta: int | None = len(after["violations"]) - len(before["violations"])
+        else:
+            added = removed = delta = None
+        rule_diffs.append(
+            {
+                "rule_id": rule_id,
+                "name": (after if after is not None else before)["name"],
+                "before": (
+                    None
+                    if before is None
+                    else {
+                        "violation_count": len(before["violations"]),
+                        "violations": before["violations"],
+                    }
+                ),
+                "after": (
+                    None
+                    if after is None
+                    else {
+                        "violation_count": len(after["violations"]),
+                        "violations": after["violations"],
+                    }
+                ),
+                "added_violations": added,
+                "removed_violations": removed,
+                "violation_count_delta": delta,
+            }
+        )
+
+    before_rows = {
+        index for result in before_results.values() for index in result["violations"]
+    }
+    after_rows = {
+        index for result in after_results.values() for index in result["violations"]
+    }
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "from_sequence": from_row["sequence"],
+        "to_sequence": to_row["sequence"],
+        "added_violation_rows": sorted(after_rows - before_rows),
+        "removed_violation_rows": sorted(before_rows - after_rows),
+        "rules": rule_diffs,
     }
 
 

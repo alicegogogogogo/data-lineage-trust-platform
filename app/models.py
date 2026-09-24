@@ -162,6 +162,50 @@ class QualityRuleEvaluateResponse(BaseModel):
     results: list[QualityRuleResult]
 
 
+# --------------------------------------------------------------------------- #
+# Quality rule evaluation history and diff
+# --------------------------------------------------------------------------- #
+
+
+class QualityRuleEvaluationRecord(BaseModel):
+    sequence: int
+    dataset: str
+    version: int
+    row_count: int
+    violation_row_count: int
+    results: list[QualityRuleResult]
+    created_at: str
+
+
+class QualityRuleEvaluationSide(BaseModel):
+    violation_count: int
+    violations: list[int]
+
+
+class QualityRuleEvaluationRuleDiff(BaseModel):
+    rule_id: int
+    name: str
+    # Null on the side whose evaluation has no result for this rule (e.g. the
+    # rule was disabled or did not exist yet); never omitted.
+    before: QualityRuleEvaluationSide | None
+    after: QualityRuleEvaluationSide | None
+    # Null exactly when a side is missing: a row-level diff needs both sides.
+    added_violations: list[int] | None
+    removed_violations: list[int] | None
+    violation_count_delta: int | None
+
+
+class QualityRuleEvaluationDiffResponse(BaseModel):
+    dataset: str
+    version: int
+    # Null (with empty lists) when fewer than two evaluations are recorded.
+    from_sequence: int | None
+    to_sequence: int | None
+    added_violation_rows: list[int]
+    removed_violation_rows: list[int]
+    rules: list[QualityRuleEvaluationRuleDiff]
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None

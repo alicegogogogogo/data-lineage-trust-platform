@@ -71,6 +71,22 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (version_id, name)
     )
     """,
+    # Append-only history of quality-rule evaluation summaries. ``results``
+    # holds the exact per-rule outcome list of the evaluation as JSON;
+    # ``sequence`` numbers the evaluations of one version in occurrence order.
+    """
+    CREATE TABLE IF NOT EXISTS quality_rule_evaluations (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id          INTEGER NOT NULL
+                            REFERENCES schema_versions(id) ON DELETE CASCADE,
+        sequence            INTEGER NOT NULL CHECK (sequence >= 1),
+        row_count           INTEGER NOT NULL CHECK (row_count >= 0),
+        violation_row_count INTEGER NOT NULL CHECK (violation_row_count >= 0),
+        results             TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        UNIQUE (version_id, sequence)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS privacy_policies (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +246,22 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON processing_task_audit_records
     BEGIN
         SELECT RAISE(ABORT, 'processing task audit records are immutable');
+    END
+    """,
+    # Evaluation history is append-only as well: the database itself refuses
+    # updates and deletes so a recorded summary can never be rewritten.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_quality_rule_evaluations_no_update
+    BEFORE UPDATE ON quality_rule_evaluations
+    BEGIN
+        SELECT RAISE(ABORT, 'quality rule evaluation records are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_quality_rule_evaluations_no_delete
+    BEFORE DELETE ON quality_rule_evaluations
+    BEGIN
+        SELECT RAISE(ABORT, 'quality rule evaluation records are immutable');
     END
     """,
 )
