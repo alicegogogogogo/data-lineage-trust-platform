@@ -231,10 +231,16 @@ data. Policies (including their enabled state) are persisted across restarts.
   - `null` values and fields without a policy are returned unchanged; rows
     missing a covered field are left without it.
 
-  Every successful view also appends one audit record per field it actually
-  masked (a role in `allowed_roles`, a `null` value, an uncovered field or a
-  disabled policy never hits); the records are persisted per version and are
-  append-only.
+  Every successful view also appends one audit record per value it actually
+  masks: each masked value in each row gets its own record, so the same field
+  masked across several rows writes several records (records are never merged
+  by field or request); a role in `allowed_roles`, a `null` value, an
+  uncovered field, a field missing from a row or a disabled policy never hits.
+  All records written by one view share a single write time; the records are
+  persisted per version, are append-only and are numbered with unique,
+  contiguous sequences even when views run concurrently across processes. A
+  view never fails because of the audit append (write collisions are retried
+  until the whole batch lands) and never leaves a partial record.
 - `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records`
   — list every masking-hit record of the version, ordered by `sequence`
   ascending (empty when there are none, never an error). Each record has

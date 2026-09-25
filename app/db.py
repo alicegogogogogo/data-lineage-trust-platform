@@ -141,11 +141,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (version_id, field)
     )
     """,
-    # Append-only audit of privacy-view masking hits: one record per field
-    # actually masked by a view request. ``sequence`` numbers the records of
-    # one version in write order; ``policy_id`` keeps the id of the policy
-    # that masked the field (policies are never deleted, only enabled or
-    # disabled, so the plain integer reference always resolves).
+    # Append-only audit of privacy-view masking hits: one record per value
+    # actually masked by a view request (the same field masked in several rows
+    # writes several records). ``sequence`` numbers the records of one version
+    # in write order; ``policy_id`` keeps the id of the policy that masked the
+    # value (policies are never deleted, only enabled or disabled, so the plain
+    # integer reference always resolves).
     """
     CREATE TABLE IF NOT EXISTS privacy_view_audit_records (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,

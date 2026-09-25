@@ -149,7 +149,7 @@ def test_summary_groups_by_field_policy_role_and_masking(client: TestClient) -> 
     )
 
 
-def test_hit_count_counts_records_not_rows_or_fields(client: TestClient) -> None:
+def test_hit_count_counts_records_one_per_masked_value(client: TestClient) -> None:
     make_dataset_with_version(client)
     create_policy(
         client,
@@ -157,16 +157,18 @@ def test_hit_count_counts_records_not_rows_or_fields(client: TestClient) -> None
          "allowed_roles": []},
     )
 
-    # Three masked rows in one view still write a single record.
+    # Three masked values in one view write three records.
     assert post_view(
         client, "guest", [{"email": "a@b.c"}, {"email": "d@e.f"}, {"email": "g@h.i"}]
     ).status_code == 200
-    # Each later view adds exactly one more record for the same group.
+    # The later view adds one more record per masked value (one here).
     assert post_view(client, "guest", [{"email": "x@y.z"}]).status_code == 200
+    # A null value adds none.
+    assert post_view(client, "guest", [{"email": None}]).status_code == 200
 
     groups = get_summary(client)["groups"]
     assert len(groups) == 1
-    assert groups[0]["hit_count"] == 2
+    assert groups[0]["hit_count"] == 4
     assert groups[0]["field"] == "email"
 
 

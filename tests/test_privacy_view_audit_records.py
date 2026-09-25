@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.db import db_session
+from app import db as app_db
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -103,7 +104,9 @@ def test_masked_view_writes_one_record_per_masked_field(client: TestClient) -> N
     assert [record["sequence"] for record in records] == [1, 2]
 
 
-def test_same_field_masked_in_several_rows_is_one_record(client: TestClient) -> None:
+def test_same_field_masked_in_several_rows_writes_one_record_per_value(
+    client: TestClient,
+) -> None:
     make_dataset_with_version(client)
     create_policy(
         client,
@@ -116,10 +119,77 @@ def test_same_field_masked_in_several_rows_is_one_record(client: TestClient) -> 
     )
     assert response.status_code == 200
 
+    # Two masked values -> two records (the null is not a hit); records are
+    # never merged by field.
     records = client.get(audit_path()).json()
-    assert len(records) == 1
-    assert records[0]["field"] == "email"
-    assert records[0]["sequence"] == 1
+    assert len(records) == 2
+    assert [record["field"] for record in records] == ["email", "email"]
+    assert [record["sequence"] for record in records] == [1, 2]
+    assert all(record["role"] == "guest" for record in records)
+
+
+def test_each_masked_value_in_each_row_gets_its_own_record_in_order(
+    client: TestClient,
+) -> None:
+    make_dataset_with_version(client)
+    email_policy = create_policy(
+        client,
+        {"field": "email", "classification": "PII", "masking": "partial",
+         "allowed_roles": []},
+    )
+    ssn_policy = create_policy(
+        client,
+        {"field": "ssn", "classification": "secret", "masking": "redact",
+         "allowed_roles": []},
+    )
+
+    rows = [
+        {"email": "a@x.io", "ssn": "1", "id": 1},   # email + ssn hit
+        {"email": None, "ssn": "2", "id": 2},       # only ssn hits (null)
+        {"email": "b@x.io", "id": 3},               # only email hits (field missing)
+        {"id": 4},                                  # no covered field
+    ]
+    response = post_view(client, "guest", rows)
+    assert response.status_code == 200, response.text
+
+    records = client.get(audit_path()).json()
+    # Hits follow row order; within a row policies sort by id (email first).
+    assert [(r["field"], r["policy_id"]) for r in records] == [
+        ("email", email_policy["id"]),
+        ("ssn", ssn_policy["id"]),
+        ("ssn", ssn_policy["id"]),
+        ("email", email_policy["id"]),
+    ]
+    assert [record["sequence"] for record in records] == [1, 2, 3, 4]
+    # All records of one view share a single write time.
+    assert len({record["created_at"] for record in records}) == 1
+
+
+def test_records_of_later_views_continue_the_sequence_and_get_new_timestamps(
+    client: TestClient,
+) -> None:
+    make_dataset_with_version(client)
+    create_policy(
+        client,
+        {"field": "email", "classification": "PII", "masking": "redact",
+         "allowed_roles": []},
+    )
+
+    assert post_view(
+        client, "guest", [{"email": "a@b.c"}, {"email": "d@e.f"}]
+    ).status_code == 200
+    assert post_view(
+        client, "guest", [{"email": "g@h.i"}, {"email": "j@k.l"}, {"email": "m@n.o"}]
+    ).status_code == 200
+
+    records = client.get(audit_path()).json()
+    assert len(records) == 5
+    assert [record["sequence"] for record in records] == [1, 2, 3, 4, 5]
+    assert [record["field"] for record in records] == ["email"] * 5
+    # Each view keeps its own shared write time, monotonic with the sequences.
+    assert records[0]["created_at"] == records[1]["created_at"]
+    assert records[2]["created_at"] == records[3]["created_at"] == records[4]["created_at"]
+    assert records[1]["created_at"] <= records[2]["created_at"]
 
 
 def test_records_accumulate_across_views_with_contiguous_sequences(
@@ -344,6 +414,7 @@ def test_concurrent_views_have_unique_contiguous_sequences(
     )
 
     count = 12
+    rows_per_view = 3
     failures: list[object] = []
     barrier = threading.Barrier(count)
 
@@ -353,7 +424,11 @@ def test_concurrent_views_have_unique_contiguous_sequences(
         try:
             response = local.post(
                 policies_path() + "/view",
-                json={"role": f"role-{index}", "rows": [{"email": "a@b.c"}]},
+                json={
+                    "role": f"role-{index}",
+                    "rows": [{"email": f"u{index}-{row}@b.c"}
+                             for row in range(rows_per_view)],
+                },
             )
             assert response.status_code == 200, response.text
         except BaseException as exc:  # pragma: no cover - failure reporting
@@ -367,10 +442,131 @@ def test_concurrent_views_have_unique_contiguous_sequences(
 
     assert not failures
     records = client.get(audit_path()).json()
-    assert [record["sequence"] for record in records] == list(range(1, count + 1))
-    assert sorted(record["role"] for record in records) == sorted(
-        f"role-{index}" for index in range(count)
+    # One record per masked value: no gaps, no duplicate sequences.
+    assert len(records) == count * rows_per_view
+    assert [record["sequence"] for record in records] == list(
+        range(1, count * rows_per_view + 1)
     )
+    # Every view landed as a complete batch of its own rows.
+    for index in range(count):
+        role_records = [r for r in records if r["role"] == f"role-{index}"]
+        assert len(role_records) == rows_per_view
+        assert len({r["created_at"] for r in role_records}) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Cross-process concurrency
+# --------------------------------------------------------------------------- #
+
+
+_WORKER_VIEW_SCRIPT = """
+import sys
+from fastapi.testclient import TestClient
+from app.main import app
+
+role = sys.argv[1]
+count = int(sys.argv[2])
+client = TestClient(app)
+response = client.post(
+    "/datasets/orders/versions/1/privacy-policies/view",
+    json={
+        "role": role,
+        "rows": [{"email": f"{role}-{i}@b.c"} for i in range(count)],
+    },
+)
+assert response.status_code == 200, response.text
+assert len(response.json()["rows"]) == count
+"""
+
+
+def test_concurrent_views_across_processes_land_every_record_once(
+    client: TestClient, tmp_path: Path
+) -> None:
+    # The fixture isolates the in-process client to its own database; the
+    # workers must use a shared file set up here once.
+    db_path = tmp_path / "privacy-view-concurrent.db"
+    os.environ["DATA_LINEAGE_DB"] = str(db_path)
+    make_dataset_with_version(client)
+    create_policy(
+        client,
+        {"field": "email", "classification": "PII", "masking": "redact",
+         "allowed_roles": []},
+    )
+
+    worker_count = 6
+    rows_per_view = 4
+    env = os.environ.copy()
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", _WORKER_VIEW_SCRIPT, f"role-{i}",
+             str(rows_per_view)],
+            cwd=PROJECT_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for i in range(worker_count)
+    ]
+    for process in processes:
+        stdout, stderr = process.communicate()
+        assert process.returncode == 0, stderr
+        assert stdout == ""
+
+    records = client.get(audit_path()).json()
+    total = worker_count * rows_per_view
+    assert len(records) == total
+    # Sequences are unique and contiguous across the processes.
+    assert sorted(record["sequence"] for record in records) == list(
+        range(1, total + 1)
+    )
+    # Each process's batch is complete: three... N records per role, one time.
+    for index in range(worker_count):
+        role_records = [r for r in records if r["role"] == f"role-{index}"]
+        assert len(role_records) == rows_per_view
+        assert {r["field"] for r in role_records} == {"email"}
+        assert len({r["created_at"] for r in role_records}) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Audit persistence never breaks the view
+# --------------------------------------------------------------------------- #
+
+
+def test_view_succeeds_without_half_records_when_audit_write_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_dataset_with_version(client)
+    create_policy(
+        client,
+        {"field": "email", "classification": "PII", "masking": "redact",
+         "allowed_roles": []},
+    )
+
+    real_connect = sqlite3.connect
+
+    class FailingAuditConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if "INSERT INTO privacy_view_audit_records" in sql:
+                # A non-contention persistence failure that retries could not fix.
+                raise sqlite3.OperationalError("disk I/O error")
+            return super().execute(sql, *args, **kwargs)
+
+    def failing_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs["factory"] = FailingAuditConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(app_db.sqlite3, "connect", failing_connect)
+
+    response = post_view(
+        client, "guest", [{"email": "a@b.c"}, {"email": "d@e.f"}]
+    )
+    # The view still returns the masked result normally.
+    assert response.status_code == 200, response.text
+    assert response.json()["rows"] == [{"email": "***"}, {"email": "***"}]
+
+    # The failed batch was rolled back: no half records, no broken sequence.
+    assert client.get(audit_path()).json() == []
 
 
 # --------------------------------------------------------------------------- #

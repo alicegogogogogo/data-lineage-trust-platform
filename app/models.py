@@ -307,8 +307,9 @@ class PrivacyViewResponse(BaseModel):
 
 
 # Append-only audit of privacy-view masking hits. One record is written per
-# field actually masked by a view request; ``sequence`` numbers the records of
-# one version in write order.
+# value actually masked by a view request (a field masked in several rows
+# produces several records); ``sequence`` numbers the records of one version
+# in write order.
 class PrivacyViewAuditRecord(BaseModel):
     sequence: int
     field: str

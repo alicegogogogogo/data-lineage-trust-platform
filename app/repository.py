@@ -8,6 +8,7 @@ import math
 import re
 import sqlite3
 import threading
+import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1626,24 +1627,31 @@ def view_privacy_rows(
     }
 
     masked_rows: list[dict[str, Any]] = []
-    # One audit hit per distinct field actually masked by this request, in
-    # first-occurrence order; a null value, an allowed role, an uncovered
-    # field or a disabled policy never hits.
+    # One audit hit per value actually masked by this request: every covered,
+    # non-null value in every row gets its own record in row order (policies
+    # iterate by id within a row); the same field masked in several rows
+    # produces several records and hits are never merged by field or request.
+    # A null value, an allowed role, an uncovered field, a missing field or a
+    # disabled policy never hits.
     hits: list[tuple[str, int, str]] = []
-    hit_fields: set[str] = set()
     for row in rows:
         masked_row = dict(row)
         for field, (policy_id, masking, allowed_roles) in policies.items():
             if field in masked_row and clean_role not in allowed_roles:
                 value = masked_row[field]
                 masked_row[field] = _mask_value(value, masking)
-                if value is not None and field not in hit_fields:
-                    hit_fields.add(field)
+                if value is not None:
                     hits.append((field, policy_id, masking))
         masked_rows.append(masked_row)
 
     # The audit append shares the request transaction: a rejected view writes
-    # nothing, and a committed view never loses its hit records.
+    # nothing. A committed view never loses its hit records: the append keeps
+    # re-reading the sequence tail and retrying after a cross-process collision
+    # until the whole batch lands. If persistence is unavailable for good
+    # (disk/IO failure), the view still returns its masked rows; the append is
+    # rolled back (the view performs no other writes, so nothing is lost) and
+    # swallowed, which guarantees the request never fails and never strands a
+    # half batch; the missing records resurface with the hits of a later view.
     if hits:
         _record_privacy_view_audit(conn, version_row["id"], clean_role, hits)
 
@@ -1662,14 +1670,15 @@ def view_privacy_rows(
 # Serializes read-tail -> append within this process so concurrent views never
 # compute the same sequence (mirrors the evaluation append lock). The
 # UNIQUE(version_id, sequence) constraint is the hard guard against writers in
-# other processes; such a collision is resolved with a bounded
-# re-read-and-retry.
+# other processes; such a collision is resolved by re-reading the tail and
+# retrying for as long as contention persists.
 _privacy_view_audit_locks: dict[int, threading.Lock] = {}
 _privacy_view_audit_locks_guard = threading.Lock()
 
-# Bound on re-read-and-retry attempts when a writer in another process wins the
-# race for the same (version_id, sequence).
-_PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS = 100
+# Backoff between cross-process collision/lock retries: starts small and caps
+# so heavily contended writers do not spin a core while waiting their turn.
+_PRIVACY_VIEW_AUDIT_BACKOFF_START = 0.001
+_PRIVACY_VIEW_AUDIT_BACKOFF_CAP = 0.05
 
 
 def _privacy_view_audit_lock(version_id: int) -> threading.Lock:
@@ -1691,22 +1700,30 @@ def _record_privacy_view_audit(
 
     The per-version lock makes read-tail -> append atomic within this process
     (FastAPI runs this synchronous endpoint in one process's threadpool). The
-    UNIQUE(version_id, sequence) constraint is the hard cross-process guard; a
-    writer that loses a race against another process rolls the partial batch
-    back and retries with the new tail, so a lost race never leaves half a
-    batch behind.
+    UNIQUE(version_id, sequence) constraint is the hard cross-process guard: a
+    writer that loses the race against another process rolls the partial batch
+    back and retries with the newly committed tail, for as long as contention
+    lasts, so a lost race never leaves half a batch and concurrent views end up
+    with exactly the right number of records on unique, contiguous sequences.
+
+    The view itself must never fail because of this append: contention is
+    retried without limit, and a non-contention persistence failure (e.g. a
+    disk I/O error) rolls the batch back and is swallowed so the masked view
+    still returns normally.
     """
+    # All records of one view request share a single write timestamp, even
+    # across retries.
+    created_at = utc_now_iso()
+    backoff = _PRIVACY_VIEW_AUDIT_BACKOFF_START
     with _privacy_view_audit_lock(version_id):
-        for attempt in range(_PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS):
-            tail = conn.execute(
-                "SELECT MAX(sequence) AS max_sequence "
-                "FROM privacy_view_audit_records WHERE version_id = ?",
-                (version_id,),
-            ).fetchone()
-            sequence = (tail["max_sequence"] or 0) + 1
-            # All records of one view request share a single write timestamp.
-            created_at = utc_now_iso()
+        while True:
             try:
+                tail = conn.execute(
+                    "SELECT MAX(sequence) AS max_sequence "
+                    "FROM privacy_view_audit_records WHERE version_id = ?",
+                    (version_id,),
+                ).fetchone()
+                sequence = (tail["max_sequence"] or 0) + 1
                 for field, policy_id, masking in hits:
                     conn.execute(
                         "INSERT INTO privacy_view_audit_records ("
@@ -1729,15 +1746,22 @@ def _record_privacy_view_audit(
                 # Another process inserted the same sequence first. End the
                 # current (pinned) transaction so the re-read establishes a
                 # new snapshot that includes the competing commit, then retry
-                # (mirrors the evaluation append retry).
-                if attempt + 1 == _PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS:
-                    conn.rollback()
-                    raise ConflictError(
-                        "Too many concurrent privacy view audit writes; "
-                        "retry the request"
-                    )
+                # with the new tail (mirrors the evaluation append retry).
                 conn.rollback()
-                continue
+            except sqlite3.OperationalError as exc:
+                # A competing writer still holds the database lock; wait and
+                # retry rather than surface the failure to the view.
+                conn.rollback()
+                if "locked" not in str(exc).lower():
+                    # A non-contention failure (e.g. disk I/O): the view still
+                    # succeeds; the rolled-back batch leaves no partial record.
+                    return
+            except sqlite3.Error:
+                # Any other persistence problem must not fail the view.
+                conn.rollback()
+                return
+            time.sleep(backoff)
+            backoff = min(backoff * 2, _PRIVACY_VIEW_AUDIT_BACKOFF_CAP)
 
 
 def _privacy_view_audit_row_to_dict(row: sqlite3.Row) -> dict:
