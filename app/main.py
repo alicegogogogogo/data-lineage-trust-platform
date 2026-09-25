@@ -23,6 +23,7 @@ from app.models import (
     LineageImpactResponse,
     LineageResponse,
     PrivacyComplianceExportResponse,
+    PrivacyPolicyCoverageResponse,
     MaskingSuggestion,
     MaskingSuggestionsRegisterRequest,
     PrivacyPolicy,
@@ -935,6 +936,52 @@ def export_dataset_privacy_compliance(
     )
     payload = json.dumps(
         export.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version privacy policy coverage check
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that returns the privacy policy coverage of every
+# schema version at once, together with the advisory candidates for fields
+# that still have no policy. The path carries only the dataset name; there is
+# no request body or query parameter.
+PRIVACY_POLICY_COVERAGE_PATH = (
+    "/datasets/{dataset_name}/privacy-policy-coverage"
+)
+
+
+@app.get(
+    PRIVACY_POLICY_COVERAGE_PATH,
+    response_model=PrivacyPolicyCoverageResponse,
+)
+def get_dataset_privacy_policy_coverage(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset is known,
+    # preserving the same 404 precedence as the compliance export. The body is
+    # serialized directly (rather than through the default JSON response) so
+    # the key order is fixed, the whitespace is compact and the document ends
+    # with exactly one newline.
+    coverage = PrivacyPolicyCoverageResponse(
+        **repository.get_privacy_policy_coverage(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        coverage.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

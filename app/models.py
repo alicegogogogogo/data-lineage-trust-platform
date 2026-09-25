@@ -615,6 +615,60 @@ class MaskingSuggestionsRegisterRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version privacy policy coverage check
+# --------------------------------------------------------------------------- #
+
+
+# The three coverage states of one field: a policy exists and is enabled, a
+# policy exists but is disabled, or no policy is registered at all.
+PrivacyPolicyCoverageStatus = Literal["enabled", "disabled", "unregistered"]
+
+
+# One field's coverage as it appears in the check, sorted by field name
+# ascending. The classification, masking and enabled state are the registered
+# policy's current values; all three are null when the field has no policy.
+class PrivacyPolicyCoverageField(BaseModel):
+    field: str
+    status: PrivacyPolicyCoverageStatus
+    classification: str | None
+    masking: PrivacyMasking | None
+    enabled: bool | None
+
+
+# One advisory candidate: an identified field with at least one name/sample
+# hit that still has no privacy policy. Carries only the field name and the
+# suggested classification and masking; candidates never register a policy.
+class PrivacyPolicyCoverageCandidate(BaseModel):
+    field: str
+    classification: MaskingSuggestionClassification
+    masking: PrivacyMasking
+
+
+# One schema version's coverage summary. Exactly these keys, in this order.
+class PrivacyPolicyCoverageVersion(BaseModel):
+    version: int
+    fields: list[PrivacyPolicyCoverageField]
+    candidates: list[PrivacyPolicyCoverageCandidate]
+
+
+class PrivacyPolicyCoverageTotals(BaseModel):
+    version_count: int
+    field_count: int
+    enabled_count: int
+    disabled_count: int
+    unregistered_count: int
+    candidate_count: int
+
+
+# Deterministic whole-dataset coverage check: exactly these keys, in this
+# order.
+class PrivacyPolicyCoverageResponse(BaseModel):
+    dataset: str
+    versions: list[PrivacyPolicyCoverageVersion]
+    totals: PrivacyPolicyCoverageTotals
+
+
+# --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #
 

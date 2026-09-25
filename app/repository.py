@@ -3397,6 +3397,159 @@ def register_masking_suggestions(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version privacy policy coverage check
+# --------------------------------------------------------------------------- #
+
+
+def get_privacy_policy_coverage(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset privacy policy coverage check.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry lists every field of the version (ordered by field
+    name ascending) with its coverage status — ``enabled`` when a registered
+    policy is enabled, ``disabled`` when a registered policy is disabled and
+    ``unregistered`` when no policy exists — plus the version's advisory
+    candidates: identified fields with at least one name/sample hit that still
+    have no privacy policy, ordered by identification record id ascending. A
+    hit-less identification record yields no candidate. ``totals`` counts the
+    versions, the fields, the fields in each of the three coverage states and
+    the candidates, each the sum of the per-version values; a dataset without
+    versions yields an empty version list and all-zero totals, never an error.
+
+    The check is recomputed on every read: it caches nothing and never writes,
+    modifies or deletes a policy or an identification record, and the
+    candidates never register a policy. Like the compliance export, the
+    dataset resolves first (404); a non-empty request body or any query
+    parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy policy coverage endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy policy coverage endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        field_rows = conn.execute(
+            "SELECT name FROM schema_fields WHERE version_id = ? "
+            "ORDER BY name ASC",
+            (version_id,),
+        ).fetchall()
+        policies_by_field = {
+            row["field"]: row
+            for row in conn.execute(
+                "SELECT field, classification, masking, enabled "
+                "FROM privacy_policies WHERE version_id = ?",
+                (version_id,),
+            ).fetchall()
+        }
+
+        fields: list[dict] = []
+        for field_row in field_rows:
+            policy = policies_by_field.get(field_row["name"])
+            if policy is None:
+                fields.append(
+                    {
+                        "field": field_row["name"],
+                        "status": "unregistered",
+                        "classification": None,
+                        "masking": None,
+                        "enabled": None,
+                    }
+                )
+            else:
+                enabled = bool(policy["enabled"])
+                fields.append(
+                    {
+                        "field": field_row["name"],
+                        "status": "enabled" if enabled else "disabled",
+                        "classification": policy["classification"],
+                        "masking": policy["masking"],
+                        "enabled": enabled,
+                    }
+                )
+
+        # Advisory candidates: hit-bearing identification records whose field
+        # has no policy yet, in identification record id order — the same
+        # recomputation as the read-only suggestions endpoint, minus the
+        # already-registered fields.
+        identification_rows = conn.execute(
+            "SELECT * FROM sensitive_identifications WHERE version_id = ? "
+            "ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+        candidates: list[dict] = []
+        for identification_row in identification_rows:
+            if identification_row["field"] in policies_by_field:
+                continue
+            suggestion = _identification_suggestion(identification_row)
+            if suggestion is not None:
+                candidates.append(
+                    {
+                        "field": suggestion["field"],
+                        "classification": suggestion["classification"],
+                        "masking": suggestion["masking"],
+                    }
+                )
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "fields": fields,
+                "candidates": candidates,
+            }
+        )
+
+    totals = {
+        "version_count": len(versions),
+        "field_count": sum(len(version["fields"]) for version in versions),
+        "enabled_count": sum(
+            1
+            for version in versions
+            for field in version["fields"]
+            if field["status"] == "enabled"
+        ),
+        "disabled_count": sum(
+            1
+            for version in versions
+            for field in version["fields"]
+            if field["status"] == "disabled"
+        ),
+        "unregistered_count": sum(
+            1
+            for version in versions
+            for field in version["fields"]
+            if field["status"] == "unregistered"
+        ),
+        "candidate_count": sum(
+            len(version["candidates"]) for version in versions
+        ),
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #
 

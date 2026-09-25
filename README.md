@@ -382,6 +382,40 @@ data. Policies (including their enabled state) are persisted across restarts.
   cleanup. `totals` has exactly `policy_count`, `hit_count`, `masked_count`,
   `view_count` and `cleanup_request_count`, each the sum of the per-version
   values over the whole dataset.
+- `GET /datasets/{dataset}/privacy-policy-coverage` — read-only cross-version
+  check of the dataset's privacy policy coverage, computed fresh on every
+  read (no caching; nothing is written, modified or deleted, and no policy
+  or identification record is touched). The path carries only the dataset
+  name; the request takes no body and no query parameters (`422`); an
+  unknown dataset → `404`, with the same 404-before-422 precedence as the
+  compliance export. A dataset without schema versions returns `200` with an
+  empty `versions` array and all-zero totals, never an error. The JSON
+  document is deterministic (fixed key order, compact whitespace, exactly
+  one trailing newline):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"fields":[{"field":"email","status":"enabled","classification":"PII","masking":"partial","enabled":true}],"candidates":[{"field":"ssn","classification":"PII","masking":"partial"}]}],"totals":{...}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions`, `totals` in that
+  order. `versions` is ordered by version number ascending and each entry
+  has exactly `version`, `fields`, `candidates` in that order. `fields`
+  lists every field of the version ordered by field name ascending; each
+  field has exactly `field`, `status`, `classification`, `masking` and
+  `enabled`. `status` is one of three values: `enabled` (a registered
+  policy is enabled), `disabled` (a registered policy is disabled) and
+  `unregistered` (no policy exists). `classification`, `masking` and
+  `enabled` are the registered policy's current values; all three are
+  `null` for an unregistered field. `candidates` lists the advisory
+  candidates of the version — identified fields with at least one name or
+  sample hit that still have no privacy policy — ordered by identification
+  record id ascending; each candidate has exactly `field`, `classification`
+  and `masking`, computed the same way as the masking-suggestions endpoint.
+  An identified field whose name and samples both miss produces no
+  candidate, and candidates never register a policy. `totals` has exactly
+  `version_count`, `field_count`, `enabled_count`, `disabled_count`,
+  `unregistered_count` and `candidate_count`, each the sum of the
+  per-version values over the whole dataset.
 
 ### Sensitive-field identification
 
