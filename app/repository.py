@@ -2777,6 +2777,132 @@ def confirm_privacy_view_audit_cleanup_request(
 
 
 # --------------------------------------------------------------------------- #
+# Privacy compliance export (dataset-level cross-version read-only summary)
+# --------------------------------------------------------------------------- #
+
+
+def export_privacy_compliance(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Cross-version privacy compliance summary of one dataset.
+
+    Every schema version of the dataset contributes one entry (versions sort
+    by version number ascending): its registered privacy policies (by policy
+    id ascending), its surviving masking-hit record count, the summed masked
+    value count and the record count of its access trail, and its cleanup
+    requests (pending and confirmed, by request id ascending). ``totals``
+    sums the same counters over the whole dataset. A dataset without versions
+    yields an empty ``versions`` list and zero totals, never an error.
+
+    The export is recomputed from the persisted records on every read: it
+    caches nothing and never writes, modifies or deletes a hit record, an
+    access record or a cleanup request. Read-only and parameterless: the path
+    dataset resolves first (404); a non-empty request body or any query
+    parameter is a 422 checked afterwards, with the same 404-before-422
+    precedence as the masking-hit record list.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy compliance export endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy compliance export endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions WHERE dataset_id = ? "
+        "ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    totals = {
+        "policy_count": 0,
+        "hit_count": 0,
+        "masked_count": 0,
+        "view_count": 0,
+        "cleanup_request_count": 0,
+    }
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        policy_rows = conn.execute(
+            "SELECT field, classification, masking, allowed_roles, enabled "
+            "FROM privacy_policies WHERE version_id = ? ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+        policies = [
+            {
+                "field": row["field"],
+                "classification": row["classification"],
+                "masking": row["masking"],
+                "allowed_roles": json.loads(row["allowed_roles"]),
+                "enabled": bool(row["enabled"]),
+            }
+            for row in policy_rows
+        ]
+
+        # Only surviving records count: confirmed cleanup requests delete hit
+        # records, so the count reflects the post-cleanup remainder. Access
+        # records are never cleaned up, so the view count and the summed
+        # masked-value count cover the version's whole trail.
+        hit_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM privacy_view_audit_records "
+            "WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()["count"]
+        access_totals = conn.execute(
+            "SELECT COUNT(*) AS view_count, "
+            "COALESCE(SUM(masked_count), 0) AS masked_count "
+            "FROM privacy_view_access_records WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+
+        cleanup_rows = conn.execute(
+            "SELECT id, reason, status, created_at "
+            "FROM privacy_view_audit_cleanup_requests "
+            "WHERE version_id = ? ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+        cleanup_requests = [
+            {
+                "id": row["id"],
+                "reason": row["reason"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+            }
+            for row in cleanup_rows
+        ]
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "policies": policies,
+                "hit_count": hit_count,
+                "masked_count": access_totals["masked_count"],
+                "view_count": access_totals["view_count"],
+                "cleanup_requests": cleanup_requests,
+            }
+        )
+        totals["policy_count"] += len(policies)
+        totals["hit_count"] += hit_count
+        totals["masked_count"] += access_totals["masked_count"]
+        totals["view_count"] += access_totals["view_count"]
+        totals["cleanup_request_count"] += len(cleanup_requests)
+
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #
 

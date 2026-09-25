@@ -352,8 +352,29 @@ data. Policies (including their enabled state) are persisted across restarts.
   endpoint → `422`; unknown dataset/version/request → `404` (precedence
   matches the hit-record reads), and confirming a confirmed request →
   `409`.
-
-### Sensitive-field identification
+- `GET /datasets/{dataset}/privacy-compliance-export` — read-only
+  cross-version privacy compliance export for the whole dataset. The response
+  is a deterministic compact JSON document (fixed key order, no insignificant
+  whitespace, one trailing newline) with the top-level keys `dataset`,
+  `versions` and `totals`. `versions` lists every schema version sorted by
+  version number ascending; each entry carries `version`, `policies`,
+  `hit_count`, `masked_count`, `view_count` and `cleanup_requests`.
+  `policies` lists the version's registered policies sorted by policy id
+  ascending, each with `field`, `classification`, `masking`, `allowed_roles`
+  and `enabled`. `cleanup_requests` lists the version's cleanup requests
+  (pending and confirmed) sorted by request id ascending, each with `id`,
+  `reason`, `status` and `created_at`. `hit_count` is the number of surviving
+  masking-hit records of the version, `masked_count` the summed masked-value
+  count of its access records and `view_count` its access record count — all
+  reflecting the post-cleanup remainder. `totals` sums the same counters over
+  the whole dataset (`policy_count`, `hit_count`, `masked_count`,
+  `view_count`, `cleanup_request_count`). A dataset without versions yields
+  an empty `versions` array and zero totals, never an error. The export is
+  recomputed from the persisted records on every read: it caches nothing and
+  never writes, modifies or deletes a hit record, an access record or a
+  cleanup request. The endpoint takes no request body and no query parameters
+  (`422`); unknown dataset → `404`, with the same 404-before-422 precedence
+  as the masking-hit record list.
 
 Sensitive-field identification produces candidate annotations for the fields of
 a schema version. It complements the manual privacy policies but never creates

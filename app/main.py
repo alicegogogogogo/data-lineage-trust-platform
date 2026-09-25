@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from fastapi import Depends, FastAPI, Query, Request, Response
@@ -891,6 +892,39 @@ def confirm_privacy_view_audit_cleanup_request(
             body=body,
             query_keys=tuple(request.query_params.keys()),
         )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Privacy compliance export (dataset-level, cross-version)
+# --------------------------------------------------------------------------- #
+
+
+# Read-only cross-version export hanging directly off the dataset resource:
+# one call returns the privacy compliance summary of every schema version of
+# the dataset. The payload is serialized by hand so the deterministic key
+# order, the compact separators and the trailing newline are part of the
+# contract rather than a serialization accident.
+@app.get("/datasets/{dataset_name}/privacy-compliance-export")
+def export_privacy_compliance(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset is known,
+    # preserving 404 precedence (mirrors the masking-hit record list).
+    payload = repository.export_privacy_compliance(
+        conn,
+        dataset_name,
+        body=body,
+        query_keys=tuple(request.query_params.keys()),
+    )
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n",
+        media_type="application/json",
     )
 
 
