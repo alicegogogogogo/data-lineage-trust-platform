@@ -87,6 +87,32 @@ traces.
   is deterministic (fixed key order, compact whitespace, exactly one trailing
   newline). The read is fully side-effect free: version definitions, lineage
   mappings and the impact cache are never written.
+- `GET /datasets/{dataset}/evolution-summary` — read-only whole-dataset
+  companion of the pairwise compatibility impact check. The path carries only
+  the dataset name; the request takes no body and no query parameters
+  (`422`); an unknown dataset → `404`, with the same 404-before-422
+  precedence as the compatibility check (a whitespace-only body is rejected
+  too). A dataset with fewer than two versions returns `200` with an empty
+  `pairs` array and all-zero totals, never an error. The JSON document is
+  deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline) with top-level keys `dataset`, `pairs` and `totals` in that order.
+  `pairs` lists every pair of adjacent versions, ordered by the base version
+  number ascending (a pair without breaking changes is still listed); each
+  entry has exactly `base_version`, `target_version`, `breaking_count`,
+  `impacted_count` and `impacted_datasets`. `breaking_count` uses the same
+  per-field breaking-entry rules as the compatibility impact response (a
+  removed field, a type change or a nullable tightening is one entry;
+  multiple changes of one field merge into one entry). `impacted_datasets`
+  lists the dataset names hosting the fields impacted downstream of the
+  pair's broken fields, using the same start points as the compatibility
+  impact response, merged across the pair, deduplicated, never including a
+  start field itself (cycles terminate) and sorted ascending;
+  `impacted_count` is its length. `totals` has exactly `pair_count`, `breaking_count` and
+  `impacted_count`, each the sum of the per-pair values over the whole
+  dataset (impacted datasets are de-duplicated per pair before summing). The
+  summary is recomputed fresh on every read (no caching, nothing written; it
+  never changes version definitions, lineage mappings or the impact cache and
+  is unaffected by quality and privacy state).
 
 ### Field-level lineage
 

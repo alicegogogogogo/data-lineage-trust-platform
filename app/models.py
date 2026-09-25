@@ -152,6 +152,36 @@ class VersionCompatibilityImpactResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only per-dataset summary of adjacent-version breakage and impact
+# --------------------------------------------------------------------------- #
+
+
+# One adjacent version pair of the dataset. Breaking entries follow the same
+# rules as the compatibility impact response; ``impacted_datasets`` is the
+# sorted, de-duplicated set of dataset names hosting the impacted fields (the
+# start fields themselves are never impacted, even along a cycle).
+class DatasetEvolutionSummaryPair(BaseModel):
+    base_version: int
+    target_version: int
+    breaking_count: int
+    impacted_count: int
+    impacted_datasets: list[str]
+
+
+class DatasetEvolutionSummaryTotals(BaseModel):
+    pair_count: int
+    breaking_count: int
+    impacted_count: int
+
+
+# Deterministic whole-dataset summary: exactly these keys, in this order.
+class DatasetEvolutionSummaryResponse(BaseModel):
+    dataset: str
+    pairs: list[DatasetEvolutionSummaryPair]
+    totals: DatasetEvolutionSummaryTotals
+
+
+# --------------------------------------------------------------------------- #
 # Quality rules
 # --------------------------------------------------------------------------- #
 

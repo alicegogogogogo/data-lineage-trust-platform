@@ -392,15 +392,21 @@ def _field_id_by_name(
 
 
 def _compute_impacted_multi(
-    conn: sqlite3.Connection, source_field_ids: list[int]
+    conn: sqlite3.Connection,
+    source_field_ids: list[int],
+    *,
+    edges: dict[int, list[tuple[int, dict]]] | None = None,
 ) -> list[dict]:
     """All fields reachable downstream of any of the sources.
 
     Every source id is seeded into the visited set, so cycles terminate and
-    none of the start fields ever appears in the result. Purely read-only:
-    unlike :func:`get_lineage_impact` this never touches the impact cache.
+    none of the start fields ever appears in the result. A caller summarizing
+    several pairs at once can build the lineage adjacency once and pass it as
+    ``edges``. Purely read-only: unlike :func:`get_lineage_impact` this never
+    touches the impact cache.
     """
-    edges = _lineage_forward_edges(conn)
+    if edges is None:
+        edges = _lineage_forward_edges(conn)
     visited = set(source_field_ids)
     impacted: dict[tuple[str, int, str], dict] = {}
     queue = list(source_field_ids)
@@ -511,6 +517,128 @@ def check_schema_version_compatibility_impact(
         "breaking_changes": breaking_changes,
         "breaking_change_count": len(breaking_changes),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Read-only per-dataset summary of adjacent-version breakage and impact
+# --------------------------------------------------------------------------- #
+
+
+def dataset_evolution_summary(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only summary of every adjacent schema-version pair of a dataset.
+
+    The pairs are the dataset's consecutive versions ordered by version number
+    ascending (``(1, 2)``, ``(2, 3)``, ...); every pair is listed, even one
+    without a breaking change. A pair's breaking entries use exactly the same
+    rules as :func:`check_schema_version_compatibility_impact` (``removed``,
+    ``type_changed`` or ``nullable_tightened``; a field with several changes
+    collapses into one entry, a type change winning over a nullable
+    tightening), so ``breaking_count`` equals the per-pair breaking entry
+    count. ``impacted_datasets`` lists the dataset names of the fields directly
+    or indirectly downstream of the pair's broken fields along the lineage
+    mappings, using the same start points (the base version's same-named
+    field and, when it still exists, the target version's field), merged
+    across the pair's breaking entries, deduplicated, never including a
+    start field itself and sorted ascending; ``impacted_count`` is its length.
+    ``totals`` sums the pair count, the per-pair breaking counts and the
+    per-pair de-duplicated impacted-dataset counts over the whole dataset.
+    A dataset with fewer than two versions yields an empty pair list and
+    all-zero totals, never an error.
+
+    Like the dataset-level privacy reads, the dataset resolves first (404);
+    any request body bytes (including whitespace-only bytes) or any query
+    parameter is a 422 checked afterwards. The summary is recomputed on every
+    read: it caches nothing and never writes version definitions, lineage
+    mappings or the impact cache.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    if body:
+        raise RequestInvalidError(
+            "The dataset evolution summary endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The dataset evolution summary endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    # Build the lineage adjacency once; all pair traversals share it and none
+    # touches the persistent impact cache.
+    edges = _lineage_forward_edges(conn)
+
+    pairs: list[dict] = []
+    total_breaking = 0
+    total_impacted = 0
+    for base_row, target_row in zip(version_rows, version_rows[1:], strict=False):
+        base_fields = _version_field_definitions(conn, base_row["id"])
+        target_fields = _version_field_definitions(conn, target_row["id"])
+
+        breaking_count = 0
+        impacted_dataset_names: set[str] = set()
+        for name in sorted(set(base_fields) | set(target_fields)):
+            before = base_fields.get(name)
+            after = target_fields.get(name)
+            if before is None:
+                # Added in the target: never breaking.
+                continue
+            if after is None:
+                is_breaking = True
+            elif before["type"] != after["type"]:
+                is_breaking = True
+            elif before["nullable"] and not after["nullable"]:
+                is_breaking = True
+            else:
+                is_breaking = False
+            if not is_breaking:
+                continue
+
+            breaking_count += 1
+            # Same start points as the per-pair compatibility impact
+            # response: the base version's same-named field always, plus the
+            # target version's field only when the field still exists.
+            start_ids = [_field_id_by_name(conn, base_row["id"], name)]
+            if after is not None:
+                start_ids.append(_field_id_by_name(conn, target_row["id"], name))
+            impacted = _compute_impacted_multi(
+                conn,
+                [field_id for field_id in start_ids if field_id is not None],
+                edges=edges,
+            )
+            impacted_dataset_names.update(ref["dataset"] for ref in impacted)
+
+        impacted_datasets = sorted(impacted_dataset_names)
+        total_breaking += breaking_count
+        total_impacted += len(impacted_datasets)
+        pairs.append(
+            {
+                "base_version": base_row["version"],
+                "target_version": target_row["version"],
+                "breaking_count": breaking_count,
+                "impacted_count": len(impacted_datasets),
+                "impacted_datasets": impacted_datasets,
+            }
+        )
+
+    totals = {
+        "pair_count": len(pairs),
+        "breaking_count": total_breaking,
+        "impacted_count": total_impacted,
+    }
+    return {"dataset": dataset["name"], "pairs": pairs, "totals": totals}
 
 
 # --------------------------------------------------------------------------- #
