@@ -377,6 +377,143 @@ def check_schema_version_compatibility(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only compatibility check joined with downstream lineage impact
+# --------------------------------------------------------------------------- #
+
+
+def _field_id_by_name(
+    conn: sqlite3.Connection, version_id: int, field_name: str
+) -> int | None:
+    row = conn.execute(
+        "SELECT id FROM schema_fields WHERE version_id = ? AND name = ?",
+        (version_id, field_name),
+    ).fetchone()
+    return None if row is None else row["id"]
+
+
+def _compute_impacted_multi(
+    conn: sqlite3.Connection, source_field_ids: list[int]
+) -> list[dict]:
+    """All fields reachable downstream of any of the sources.
+
+    Every source id is seeded into the visited set, so cycles terminate and
+    none of the start fields ever appears in the result. Purely read-only:
+    unlike :func:`get_lineage_impact` this never touches the impact cache.
+    """
+    edges = _lineage_forward_edges(conn)
+    visited = set(source_field_ids)
+    impacted: dict[tuple[str, int, str], dict] = {}
+    queue = list(source_field_ids)
+    while queue:
+        current = queue.pop()
+        for target_field_id, ref in edges.get(current, ()):
+            if target_field_id in visited:
+                continue
+            visited.add(target_field_id)
+            impacted[(ref["dataset"], ref["version"], ref["field"])] = ref
+            queue.append(target_field_id)
+    return [impacted[key] for key in sorted(impacted)]
+
+
+def check_schema_version_compatibility_impact(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    base_version: int,
+    target_version: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only breaking-change check joined with downstream lineage impact.
+
+    The breaking changes are exactly those of
+    :func:`check_schema_version_compatibility` (``removed``, ``type_changed``
+    or ``nullable_tightened``; a field with several changes collapses into one
+    entry, a type change winning over a nullable tightening), and each entry
+    additionally carries ``impacted``: every field directly or indirectly
+    downstream of the broken field along the lineage mappings. The traversal
+    starts from the same-named field of the base version and, when the field
+    still exists in the target version, also from the target version's field;
+    the merged set is deduplicated, never contains a start field itself
+    (cycles terminate) and is sorted by dataset, version and field ascending.
+    A field with no downstream yields an empty list; comparing a version with
+    itself yields an empty entry list and a zero count.
+
+    The endpoint takes no parameters: a non-positive version number is a 422
+    checked before path resolution, while any request body bytes (including
+    whitespace-only bytes) or any query parameter is a 422 raised only after
+    the path dataset and both versions have resolved, so an unknown
+    dataset/version stays a 404 (mirroring the compatibility endpoint).
+    Nothing is written: version definitions, lineage mappings and the impact
+    cache are all left untouched.
+    """
+    if base_version < 1 or target_version < 1:
+        raise RequestInvalidError(
+            "Version numbers in the compatibility path must be positive integers"
+        )
+
+    dataset = require_dataset(conn, dataset_name)
+    base_row = _require_schema_version(conn, dataset, base_version)
+    target_row = _require_schema_version(conn, dataset, target_version)
+
+    if body:
+        raise RequestInvalidError(
+            "The version compatibility impact endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The version compatibility impact endpoint does not accept query "
+            "parameters"
+        )
+
+    base_fields = _version_field_definitions(conn, base_row["id"])
+    target_fields = _version_field_definitions(conn, target_row["id"])
+
+    breaking_changes: list[dict] = []
+    for name in sorted(set(base_fields) | set(target_fields)):
+        before = base_fields.get(name)
+        after = target_fields.get(name)
+        if before is None:
+            # Added in the target: never breaking.
+            continue
+        if after is None:
+            kind = "removed"
+        elif before["type"] != after["type"]:
+            kind = "type_changed"
+        elif before["nullable"] and not after["nullable"]:
+            kind = "nullable_tightened"
+        else:
+            continue
+
+        # The base version always has the broken field; the target version's
+        # same-named field joins the traversal only when it still exists.
+        start_ids = [_field_id_by_name(conn, base_row["id"], name)]
+        if after is not None:
+            start_ids.append(_field_id_by_name(conn, target_row["id"], name))
+        impacted = _compute_impacted_multi(
+            conn, [field_id for field_id in start_ids if field_id is not None]
+        )
+
+        breaking_changes.append(
+            {
+                "field": name,
+                "kind": kind,
+                "before": before,
+                "after": after,
+                "impacted": impacted,
+            }
+        )
+
+    return {
+        "base_version": base_row["version"],
+        "target_version": target_row["version"],
+        "breaking_changes": breaking_changes,
+        "breaking_change_count": len(breaking_changes),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Lineage
 # --------------------------------------------------------------------------- #
 

@@ -70,6 +70,23 @@ traces.
   entries. Comparing a version with itself returns an empty list and a zero
   count. The verdict is advisory for release decisions only: it runs no
   migration or rollback.
+- `GET /datasets/{dataset}/versions/{base_version}/compatibility/{target_version}/impact` —
+  read-only companion of the compatibility check: the same top-level keys
+  (`base_version`, `target_version`, `breaking_changes`,
+  `breaking_change_count`) and the same breaking entries, each entry carrying
+  one extra key `impacted` after `after`. `impacted` lists every field
+  directly or indirectly downstream of the broken field along the lineage
+  mappings, starting from the base version's same-named field and — when the
+  field still exists in the target version — also from the target version's
+  field. Each item is `{"dataset", "version", "field"}`; the set is
+  deduplicated, never contains a start field itself (cycles terminate) and is
+  sorted by dataset, version and field ascending. A field with no downstream
+  yields an empty list. The endpoint takes no request body and no query
+  parameters (`422`); unknown dataset/version → `404` with the same
+  404-before-422 precedence as the compatibility check, and the JSON document
+  is deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline). The read is fully side-effect free: version definitions, lineage
+  mappings and the impact cache are never written.
 
 ### Field-level lineage
 

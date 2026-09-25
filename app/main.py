@@ -78,6 +78,7 @@ from app.models import (
     SnapshotMetadata,
     SnapshotResponse,
     VersionCompatibilityResponse,
+    VersionCompatibilityImpactResponse,
     VersionDiffResponse,
 )
 
@@ -262,6 +263,48 @@ def check_schema_version_compatibility(
     )
     payload = json.dumps(
         compatibility.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only companion of the compatibility check: the same breaking-change
+# entries, each additionally carrying the direct and indirect downstream
+# fields of the broken field along the lineage mappings. The body is
+# serialized directly (rather than through the default JSON response) so the
+# key order is fixed, the whitespace is compact and the document ends with
+# exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{base_version}"
+    "/compatibility/{target_version}/impact",
+    response_model=VersionCompatibilityImpactResponse,
+)
+def check_schema_version_compatibility_impact(
+    request: Request,
+    dataset_name: str,
+    base_version: int,
+    target_version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset and both versions
+    # are known, preserving 404 precedence (mirrors the compatibility
+    # endpoint). Nothing is written: version definitions, lineage mappings
+    # and the impact cache are all left untouched.
+    impact = VersionCompatibilityImpactResponse(
+        **repository.check_schema_version_compatibility_impact(
+            conn,
+            dataset_name,
+            base_version,
+            target_version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        impact.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )
