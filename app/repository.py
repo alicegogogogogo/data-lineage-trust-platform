@@ -1615,29 +1615,174 @@ def view_privacy_rows(
         raise RequestInvalidError("Role must not be empty")
 
     policy_rows = conn.execute(
-        "SELECT field, masking, allowed_roles FROM privacy_policies "
-        "WHERE version_id = ? AND enabled = 1",
+        "SELECT id, field, masking, allowed_roles FROM privacy_policies "
+        "WHERE version_id = ? AND enabled = 1 ORDER BY id",
         (version_row["id"],),
     ).fetchall()
 
-    policies: dict[str, tuple[str, set[str]]] = {
-        row["field"]: (row["masking"], set(json.loads(row["allowed_roles"])))
+    policies: dict[str, tuple[int, str, set[str]]] = {
+        row["field"]: (row["id"], row["masking"], set(json.loads(row["allowed_roles"])))
         for row in policy_rows
     }
 
     masked_rows: list[dict[str, Any]] = []
+    # One audit hit per distinct field actually masked by this request, in
+    # first-occurrence order; a null value, an allowed role, an uncovered
+    # field or a disabled policy never hits.
+    hits: list[tuple[str, int, str]] = []
+    hit_fields: set[str] = set()
     for row in rows:
         masked_row = dict(row)
-        for field, (masking, allowed_roles) in policies.items():
+        for field, (policy_id, masking, allowed_roles) in policies.items():
             if field in masked_row and clean_role not in allowed_roles:
-                masked_row[field] = _mask_value(masked_row[field], masking)
+                value = masked_row[field]
+                masked_row[field] = _mask_value(value, masking)
+                if value is not None and field not in hit_fields:
+                    hit_fields.add(field)
+                    hits.append((field, policy_id, masking))
         masked_rows.append(masked_row)
+
+    # The audit append shares the request transaction: a rejected view writes
+    # nothing, and a committed view never loses its hit records.
+    if hits:
+        _record_privacy_view_audit(conn, version_row["id"], clean_role, hits)
 
     return {
         "dataset": dataset["name"],
         "version": version_row["version"],
         "rows": masked_rows,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Privacy view audit records (append-only masking-hit log)
+# --------------------------------------------------------------------------- #
+
+
+# Serializes read-tail -> append within this process so concurrent views never
+# compute the same sequence (mirrors the evaluation append lock). The
+# UNIQUE(version_id, sequence) constraint is the hard guard against writers in
+# other processes; such a collision is resolved with a bounded
+# re-read-and-retry.
+_privacy_view_audit_locks: dict[int, threading.Lock] = {}
+_privacy_view_audit_locks_guard = threading.Lock()
+
+# Bound on re-read-and-retry attempts when a writer in another process wins the
+# race for the same (version_id, sequence).
+_PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS = 100
+
+
+def _privacy_view_audit_lock(version_id: int) -> threading.Lock:
+    with _privacy_view_audit_locks_guard:
+        lock = _privacy_view_audit_locks.get(version_id)
+        if lock is None:
+            lock = threading.Lock()
+            _privacy_view_audit_locks[version_id] = lock
+        return lock
+
+
+def _record_privacy_view_audit(
+    conn: sqlite3.Connection,
+    version_id: int,
+    role: str,
+    hits: list[tuple[str, int, str]],
+) -> None:
+    """Append one record per hit as the next sequences of the version.
+
+    The per-version lock makes read-tail -> append atomic within this process
+    (FastAPI runs this synchronous endpoint in one process's threadpool). The
+    UNIQUE(version_id, sequence) constraint is the hard cross-process guard; a
+    writer that loses a race against another process rolls the partial batch
+    back and retries with the new tail, so a lost race never leaves half a
+    batch behind.
+    """
+    with _privacy_view_audit_lock(version_id):
+        for attempt in range(_PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS):
+            tail = conn.execute(
+                "SELECT MAX(sequence) AS max_sequence "
+                "FROM privacy_view_audit_records WHERE version_id = ?",
+                (version_id,),
+            ).fetchone()
+            sequence = (tail["max_sequence"] or 0) + 1
+            try:
+                for field, policy_id, masking in hits:
+                    conn.execute(
+                        "INSERT INTO privacy_view_audit_records ("
+                        "version_id, sequence, field, policy_id, role, masking, "
+                        "created_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            version_id,
+                            sequence,
+                            field,
+                            policy_id,
+                            role,
+                            masking,
+                            utc_now_iso(),
+                        ),
+                    )
+                    sequence += 1
+                return
+            except sqlite3.IntegrityError:
+                # Another process inserted the same sequence first. End the
+                # current (pinned) transaction so the re-read establishes a
+                # new snapshot that includes the competing commit, then retry
+                # (mirrors the evaluation append retry).
+                if attempt + 1 == _PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS:
+                    conn.rollback()
+                    raise ConflictError(
+                        "Too many concurrent privacy view audit writes; "
+                        "retry the request"
+                    )
+                conn.rollback()
+                continue
+
+
+def _privacy_view_audit_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "sequence": row["sequence"],
+        "field": row["field"],
+        "policy_id": row["policy_id"],
+        "role": row["role"],
+        "masking": row["masking"],
+        "created_at": row["created_at"],
+    }
+
+
+def list_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Every masking-hit record of one version, in write (sequence) order.
+
+    Read-only and parameterless: the path dataset/version resolves first
+    (404); a non-empty request body or any query parameter is a 422 checked
+    afterwards, mirroring the evaluation history endpoint. Nothing is written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit records endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit records endpoint does not accept query "
+            "parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM privacy_view_audit_records WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return [_privacy_view_audit_row_to_dict(row) for row in rows]
 
 
 # --------------------------------------------------------------------------- #

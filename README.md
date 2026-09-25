@@ -231,6 +231,17 @@ data. Policies (including their enabled state) are persisted across restarts.
   - `null` values and fields without a policy are returned unchanged; rows
     missing a covered field are left without it.
 
+  Every successful view also appends one audit record per field it actually
+  masked (a role in `allowed_roles`, a `null` value, an uncovered field or a
+  disabled policy never hits); the records are persisted per version and are
+  append-only.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records`
+  — list every masking-hit record of the version, ordered by `sequence`
+  ascending (empty when there are none, never an error). Each record has
+  `sequence`, `field`, `policy_id`, `role`, `masking` and `created_at`. The
+  endpoint takes no request body and no query parameters (`422`); unknown
+  dataset/version → `404`. Nothing is written.
+
 ### Sensitive-field identification
 
 Sensitive-field identification produces candidate annotations for the fields of

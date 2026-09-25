@@ -306,6 +306,18 @@ class PrivacyViewResponse(BaseModel):
     rows: list[dict[str, Any]]
 
 
+# Append-only audit of privacy-view masking hits. One record is written per
+# field actually masked by a view request; ``sequence`` numbers the records of
+# one version in write order.
+class PrivacyViewAuditRecord(BaseModel):
+    sequence: int
+    field: str
+    policy_id: int
+    role: str
+    masking: PrivacyMasking
+    created_at: str
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #
