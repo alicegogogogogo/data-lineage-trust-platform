@@ -2302,6 +2302,141 @@ def reconcile_privacy_view_audit_records(
     }
 
 
+def trend_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only per-policy hit trend of one version's masking-hit records.
+
+    Records are aggregated by the privacy policy that produced the hit: hits
+    of the same policy merge into one count no matter which role triggered
+    them, and a policy that has since been disabled still has its historical
+    hits counted. Each policy row carries the policy's registered field name,
+    classification and masking (the current registration values) plus its
+    total hit count and a ``days`` list.
+
+    ``days`` lists only the UTC calendar days on which the policy has at least
+    one hit, sorted ascending; days without a hit are neither zero-filled nor
+    emitted. A write time carrying a non-zero UTC offset is bucketed by its
+    UTC calendar day (the bucketing is done in Python rather than relying on
+    SQLite's ``date()``, which does not normalize offsets). Each day reports
+    its record count (one record counts once — never row- or field-weighted),
+    the difference against the previously listed day (null on the first day)
+    and the ``up``/``down``/``flat``/``none`` direction (``none`` marks the
+    first day). Policies sort by policy id and their days sort by date, never
+    relying on database natural order.
+
+    ``totals`` reports the version-wide total (always the sum of the row
+    totals), the number of policies with at least one hit and the number of
+    distinct hit days over the whole version (the per-policy day union, not
+    the per-row days added together). A version without records yields an
+    empty policy list and zero totals. The trend is recomputed from the
+    persisted records on every call: it caches nothing, writes nothing and
+    never touches the hit records.
+
+    Like the record list, the path dataset/version resolves first (404); a
+    non-empty request body or any query parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit trend endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit trend endpoint does not accept query "
+            "parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT p.id AS policy_id, p.field AS field, "
+        "p.classification AS classification, p.masking AS masking, "
+        "a.created_at AS created_at "
+        "FROM privacy_view_audit_records AS a "
+        "JOIN privacy_policies AS p "
+        "ON p.id = a.policy_id AND p.version_id = a.version_id "
+        "WHERE a.version_id = ? "
+        "ORDER BY p.id ASC, a.sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+
+    # policy_id -> registration fields and {utc_day: hit_count}
+    grouped: dict[int, dict[str, Any]] = {}
+    all_days: set[str] = set()
+    for row in rows:
+        written_at = datetime.fromisoformat(row["created_at"])
+        if written_at.tzinfo is None:
+            written_at = written_at.replace(tzinfo=timezone.utc)
+        day = written_at.astimezone(timezone.utc).date().isoformat()
+        entry = grouped.setdefault(
+            row["policy_id"],
+            {
+                "field": row["field"],
+                "classification": row["classification"],
+                "masking": row["masking"],
+                "day_counts": {},
+            },
+        )
+        entry["day_counts"][day] = entry["day_counts"].get(day, 0) + 1
+        all_days.add(day)
+
+    policies: list[dict] = []
+    for policy_id in sorted(grouped):
+        entry = grouped[policy_id]
+        days: list[dict] = []
+        previous: int | None = None
+        for day in sorted(entry["day_counts"]):
+            hit_count = entry["day_counts"][day]
+            if previous is None:
+                delta: int | None = None
+                trend = "none"
+            else:
+                delta = hit_count - previous
+                if hit_count > previous:
+                    trend = "up"
+                elif hit_count < previous:
+                    trend = "down"
+                else:
+                    trend = "flat"
+            days.append(
+                {
+                    "day": day,
+                    "hit_count": hit_count,
+                    "hit_count_delta": delta,
+                    "trend": trend,
+                }
+            )
+            previous = hit_count
+        policies.append(
+            {
+                "policy_id": policy_id,
+                "field": entry["field"],
+                "classification": entry["classification"],
+                "masking": entry["masking"],
+                "total_hits": sum(entry["day_counts"].values()),
+                "days": days,
+            }
+        )
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "policies": policies,
+        "totals": {
+            "total_hits": sum(policy["total_hits"] for policy in policies),
+            "policy_count": len(policies),
+            "day_count": len(all_days),
+        },
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #

@@ -410,6 +410,41 @@ class PrivacyViewAuditReconcileResponse(BaseModel):
     totals: PrivacyViewAuditReconcileTotals
 
 
+# Read-only hit trend aggregated by privacy policy: hits of one policy merge
+# across roles (a disabled policy's historical hits still count) and are
+# bucketed by the UTC calendar day of their write time. Each listed day reports
+# its record count, the change against the previously listed day (null on the
+# first day) and the up/down/flat/none direction. Recomputed from the
+# persisted records on every read; nothing is cached or written.
+class PrivacyViewAuditTrendDay(BaseModel):
+    day: str
+    hit_count: int
+    hit_count_delta: int | None
+    trend: Literal["up", "down", "flat", "none"]
+
+
+class PrivacyViewAuditTrendPolicy(BaseModel):
+    policy_id: int
+    field: str
+    classification: str
+    masking: PrivacyMasking
+    total_hits: int
+    days: list[PrivacyViewAuditTrendDay]
+
+
+class PrivacyViewAuditTrendTotals(BaseModel):
+    total_hits: int
+    policy_count: int
+    day_count: int
+
+
+class PrivacyViewAuditTrendResponse(BaseModel):
+    dataset: str
+    version: int
+    policies: list[PrivacyViewAuditTrendPolicy]
+    totals: PrivacyViewAuditTrendTotals
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #

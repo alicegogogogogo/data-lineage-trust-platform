@@ -288,6 +288,24 @@ data. Policies (including their enabled state) are persisted across restarts.
   endpoint takes no request body and no query parameters (`422`); unknown
   dataset/version → `404`, with the same 404-before-422 precedence as the
   record list.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records/trend`
+  — read-only hit trend aggregated by privacy policy, computed fresh from the
+  persisted records on every read (no caching, nothing is written or deleted).
+  Hits of the same policy merge across roles (a disabled policy's historical
+  hits still count). Response: `{"dataset", "version", "policies", "totals"}`;
+  `policies` is an empty array when the version has no records. Each policy
+  row carries `policy_id`, `field`, `classification`, `masking`, `total_hits`
+  and `days`; policies sort by `policy_id` ascending. `days` lists only UTC
+  calendar days with hits (a write time with a non-zero offset buckets by its
+  UTC day), sorted ascending with no zero-filled gaps; each entry has `day`
+  (`YYYY-MM-DD`), `hit_count` (one record counts once), `hit_count_delta`
+  (difference from the previous listed day, `null` on the first) and `trend`
+  (`up`/`down`/`flat`, or `none` on the first day). `totals` gives
+  `total_hits` (the sum of the row totals), `policy_count` (policies with
+  hits) and `day_count` (distinct hit days over the whole version, the
+  per-policy day union). The endpoint takes no request body and no query
+  parameters (`422`); unknown dataset/version → `404`, with the same
+  404-before-422 precedence as the record list.
 
 ### Sensitive-field identification
 
