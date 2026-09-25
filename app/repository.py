@@ -1823,6 +1823,123 @@ def list_privacy_view_audit_records(
     return [_privacy_view_audit_row_to_dict(row) for row in rows]
 
 
+def _parse_audit_record_window_time(raw: str, parameter: str) -> datetime:
+    """Parse one bound of the hit-record write-time window.
+
+    The bound must be an ISO-8601 date-time carrying an explicit timezone
+    designator (offset or ``Z``); anything else (unparseable text or a
+    naive, timezone-less date-time) is a 422.
+    """
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise RequestInvalidError(
+            f"Query parameter '{parameter}' must be an ISO-8601 date-time"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RequestInvalidError(
+            f"Query parameter '{parameter}' must include a timezone"
+        )
+    return parsed
+
+
+def filter_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    role: str | None,
+    field: str | None,
+    start_at: str | None,
+    end_at: str | None,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Filter the version's masking-hit records, read-only.
+
+    The optional ``role`` and ``field`` filters match the stored values
+    exactly apart from ASCII case (``GUEST`` matches ``guest``, no other
+    fuzzy matching). ``start_at``/``end_at`` keep records whose write time
+    falls in the closed interval between the two timezone-aware ISO-8601
+    bounds; either bound may be given alone. Each omitted criterion skips
+    that filter. Results reuse the full-read shape and stay ordered by
+    ``sequence`` ascending; a version without matching records yields an
+    empty list. Nothing is written, modified or deleted, and the summary
+    and diff endpoints are untouched.
+
+    Like the full read, the path dataset/version resolves first (404); a
+    non-empty request body, an unrecognized query parameter, an
+    unparseable or timezone-less bound, or a start strictly later than the
+    end is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit records filter endpoint does not accept a "
+            "request body"
+        )
+    allowed_keys = {"role", "field", "start_at", "end_at"}
+    extra_keys = [key for key in query_keys if key not in allowed_keys]
+    if extra_keys:
+        raise RequestInvalidError(
+            "Unknown query parameter(s): " + ", ".join(sorted(set(extra_keys)))
+        )
+
+    if role is not None and not role.strip():
+        raise RequestInvalidError(
+            "Query parameter 'role' must be a non-empty role name when given"
+        )
+    if field is not None and not field.strip():
+        raise RequestInvalidError(
+            "Query parameter 'field' must be a non-empty field name when given"
+        )
+
+    start = (
+        _parse_audit_record_window_time(start_at, "start_at")
+        if start_at is not None
+        else None
+    )
+    end = (
+        _parse_audit_record_window_time(end_at, "end_at")
+        if end_at is not None
+        else None
+    )
+    if start is not None and end is not None and start > end:
+        raise RequestInvalidError(
+            "Query parameter 'start_at' must not be later than 'end_at'"
+        )
+
+    clauses = ["version_id = ?"]
+    parameters: list[Any] = [version_row["id"]]
+    if role is not None:
+        clauses.append("role COLLATE NOCASE = ?")
+        parameters.append(role.strip())
+    if field is not None:
+        clauses.append("field COLLATE NOCASE = ?")
+        parameters.append(field.strip())
+
+    # The stored timestamps are timezone-aware ISO-8601 strings in UTC
+    # (offset +00:00), so lexical comparison of UTC-normalized bounds is an
+    # exact closed-interval instant comparison; bounds with other offsets
+    # are normalized before binding.
+    if start is not None:
+        clauses.append("created_at >= ?")
+        parameters.append(start.astimezone(timezone.utc).isoformat())
+    if end is not None:
+        clauses.append("created_at <= ?")
+        parameters.append(end.astimezone(timezone.utc).isoformat())
+
+    rows = conn.execute(
+        "SELECT * FROM privacy_view_audit_records WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY sequence ASC",
+        tuple(parameters),
+    ).fetchall()
+    return [_privacy_view_audit_row_to_dict(row) for row in rows]
+
+
 def summarize_privacy_view_audit_records(
     conn: sqlite3.Connection,
     dataset_name: str,

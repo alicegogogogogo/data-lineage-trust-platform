@@ -619,6 +619,45 @@ def list_privacy_view_audit_records(
     ]
 
 
+# Read-only filtered view of the same masking-hit records the list endpoint
+# returns. The filters are optional query parameters; the endpoint writes
+# nothing and never affects the summary or diff responses.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/audit-records/filter",
+    response_model=list[PrivacyViewAuditRecord],
+)
+def filter_privacy_view_audit_records(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    role: str | None = Query(default=None),
+    field: str | None = Query(default=None),
+    start_at: str | None = Query(default=None),
+    end_at: str | None = Query(default=None),
+    conn=Depends(get_db),
+) -> list[PrivacyViewAuditRecord]:
+    # Path dataset/version resolves first in the repository (404); a request
+    # body, an unknown query parameter, a blank role/field, an unparseable or
+    # timezone-less time bound, or a start later than the end is a 422
+    # afterwards. Nothing is written.
+    return [
+        PrivacyViewAuditRecord(**record)
+        for record in repository.filter_privacy_view_audit_records(
+            conn,
+            dataset_name,
+            version,
+            role=role,
+            field=field,
+            start_at=start_at,
+            end_at=end_at,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
 # Read-only compliance summary appended after the hit-record query path. The
 # summary is recomputed from the persisted records on every read.
 @app.get(

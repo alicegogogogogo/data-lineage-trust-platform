@@ -242,6 +242,24 @@ data. Policies (including their enabled state) are persisted across restarts.
   `sequence`, `field`, `policy_id`, `role`, `masking` and `created_at`. The
   endpoint takes no request body and no query parameters (`422`); unknown
   dataset/version → `404`. Nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records/filter`
+  — read-only filtered view of the same masking-hit records. The optional
+  query parameters are `role`, `field`, `start_at` and `end_at`; each may be
+  omitted, in which case it imposes no filter, and they combine with AND.
+  `role` and `field` match the values stored on the records exactly apart
+  from case (`GUEST` matches `guest`; there is no substring or other fuzzy
+  matching), and a blank value is a `422`. `start_at`/`end_at` keep records
+  whose write time (`created_at`) lies in the closed interval between the
+  two bounds; either bound may be supplied alone. Both bounds are
+  timezone-aware ISO-8601 date-times (an offset or `Z` is mandatory); an
+  unparseable or timezone-less bound, or a `start_at` strictly later than
+  `end_at`, is a `422`. The response is the same array of records in the
+  same shape and `sequence`-ascending order as the unfiltered list (empty
+  when nothing matches, never an error), and results stay consistent across
+  process restarts. The endpoint takes no request body and rejects any
+  other query parameter (`422`); unknown dataset/version → `404`, with the
+  same 404-before-422 precedence as the record list. Nothing is written,
+  modified or deleted, and the summary and diff responses are unaffected.
 - `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records/summary`
   — read-only compliance summary computed fresh from the persisted records on
   every read (no caching, nothing is written or deleted). Response:
