@@ -375,12 +375,12 @@ def test_audit_records_are_immutable(client: TestClient) -> None:
     )
     assert post_view(client, "guest", [{"email": "a@b.c"}]).status_code == 200
 
+    # Updates stay forbidden at the database level; deletes are possible only
+    # so the confirmed cleanup-request flow can remove its frozen target set
+    # (covered in test_privacy_view_audit_cleanup.py).
     with db_session() as conn:
         with pytest.raises(sqlite3.Error):
             conn.execute("UPDATE privacy_view_audit_records SET role = 'x'")
-        conn.rollback()
-        with pytest.raises(sqlite3.Error):
-            conn.execute("DELETE FROM privacy_view_audit_records")
         conn.rollback()
 
     assert len(client.get(audit_path()).json()) == 1

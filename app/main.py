@@ -27,6 +27,9 @@ from app.models import (
     PrivacyPolicyCreate,
     PrivacyPolicyEnabledUpdate,
     PrivacyViewAccessRecord,
+    ConfirmedPrivacyViewAuditCleanupRequest,
+    PrivacyViewAuditCleanupRequest,
+    PrivacyViewAuditCleanupRequestCreate,
     PrivacyViewAuditRecord,
     PrivacyViewAuditDiffResponse,
     PrivacyViewAuditReconcileResponse,
@@ -798,6 +801,99 @@ def get_privacy_view_audit_trend(
             conn,
             dataset_name,
             version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Two-phase cleanup of the masking-hit records
+# --------------------------------------------------------------------------- #
+
+
+CLEANUP_REQUESTS_PATH = (
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/audit-records/cleanup-requests"
+)
+
+
+# Creating a request is the preview: it freezes the target set (the version's
+# hit records written strictly before "before") and stores the preview, but
+# deletes and modifies nothing. Any query parameter is a 422 checked in the
+# repository after the path resolves, preserving 404 precedence.
+@app.post(
+    CLEANUP_REQUESTS_PATH,
+    response_model=PrivacyViewAuditCleanupRequest,
+    status_code=201,
+)
+def create_privacy_view_audit_cleanup_request(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    payload: PrivacyViewAuditCleanupRequestCreate,
+    conn=Depends(get_db),
+) -> PrivacyViewAuditCleanupRequest:
+    return PrivacyViewAuditCleanupRequest(
+        **repository.create_privacy_view_audit_cleanup_request(
+            conn,
+            dataset_name,
+            version,
+            payload.reason,
+            payload.before,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.get(
+    CLEANUP_REQUESTS_PATH,
+    response_model=list[PrivacyViewAuditCleanupRequest],
+)
+def list_privacy_view_audit_cleanup_requests(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[PrivacyViewAuditCleanupRequest]:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/version is known,
+    # preserving 404 precedence, exactly like the hit-record list.
+    return [
+        PrivacyViewAuditCleanupRequest(**cleanup_request)
+        for cleanup_request in repository.list_privacy_view_audit_cleanup_requests(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
+# Confirming takes no input beyond the path: an empty request body and no
+# query parameters, both validated in the repository after the path
+# dataset/version/request resolves, preserving 404 precedence. The confirm
+# atomically deletes the frozen target set.
+@app.post(
+    f"{CLEANUP_REQUESTS_PATH}/{{request_id}}/confirm",
+    response_model=ConfirmedPrivacyViewAuditCleanupRequest,
+)
+def confirm_privacy_view_audit_cleanup_request(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    request_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> ConfirmedPrivacyViewAuditCleanupRequest:
+    return ConfirmedPrivacyViewAuditCleanupRequest(
+        **repository.confirm_privacy_view_audit_cleanup_request(
+            conn,
+            dataset_name,
+            version,
+            request_id,
             body=body,
             query_keys=tuple(request.query_params.keys()),
         )

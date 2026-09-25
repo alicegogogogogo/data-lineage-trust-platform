@@ -446,6 +446,48 @@ class PrivacyViewAuditTrendResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Two-phase cleanup of privacy view masking-hit records
+# --------------------------------------------------------------------------- #
+
+
+class PrivacyViewAuditCleanupRequestCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: StrictStr = Field(
+        description="Non-empty reason for the requested cleanup; trimmed "
+        "before storing"
+    )
+    before: StrictStr = Field(
+        description="ISO-8601 date-time including a timezone; only hits "
+        "written strictly before it are cleaned"
+    )
+
+
+# The preview frozen at request creation: how many hit records the request
+# will delete, the earliest and latest write times among them (null when the
+# target set is empty) and the ascending set of field names they touch.
+class PrivacyViewAuditCleanupPreview(BaseModel):
+    hit_count: int
+    first_hit_at: str | None
+    last_hit_at: str | None
+    fields: list[str]
+
+
+class PrivacyViewAuditCleanupRequest(BaseModel):
+    id: int
+    reason: str
+    before: str
+    status: Literal["pending", "confirmed"]
+    preview: PrivacyViewAuditCleanupPreview
+    created_at: str
+
+
+class ConfirmedPrivacyViewAuditCleanupRequest(PrivacyViewAuditCleanupRequest):
+    confirmed_at: str
+    deleted_count: int
+
+
+# --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #
 

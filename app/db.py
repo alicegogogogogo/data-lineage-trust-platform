@@ -165,6 +165,50 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     # any). ``sequence`` numbers the records of one version in write order;
     # ``masked_count`` equals the number of masking-hit records written by the
     # same view so the two logs can be cross-checked.
+    # Monotonic per-version sequence source for the masking-hit records. The
+    # hit table itself cannot be consulted for the next sequence after a
+    # confirmed cleanup request deleted the tail records (a MAX(sequence)+1
+    # rule would reissue cleaned numbers), so the next sequence is kept here
+    # and never decreases; remaining records keep their original numbers.
+    """
+    CREATE TABLE IF NOT EXISTS privacy_view_audit_sequence_counters (
+        version_id    INTEGER PRIMARY KEY
+                      REFERENCES schema_versions(id) ON DELETE CASCADE,
+        next_sequence INTEGER NOT NULL CHECK (next_sequence >= 1)
+    )
+    """,
+    # Two-phase cleanup of masking-hit records: creating a request freezes the
+    # target set (records of the version written before ``before``, capped at
+    # ``target_max_sequence`` so hits written after the request never join it)
+    # and stores the preview; confirming atomically deletes exactly that set.
+    # Requests persist across restarts and are listed by id ascending.
+    """
+    CREATE TABLE IF NOT EXISTS privacy_view_audit_cleanup_requests (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id           INTEGER NOT NULL
+                             REFERENCES schema_versions(id) ON DELETE CASCADE,
+        reason               TEXT NOT NULL,
+        before               TEXT NOT NULL,
+        status               TEXT NOT NULL
+                             CHECK (status IN ('pending', 'confirmed')),
+        target_max_sequence  INTEGER NOT NULL CHECK (target_max_sequence >= 0),
+        preview_hit_count    INTEGER NOT NULL CHECK (preview_hit_count >= 0),
+        preview_first_hit_at TEXT,
+        preview_last_hit_at  TEXT,
+        preview_fields       TEXT NOT NULL,
+        created_at           TEXT NOT NULL,
+        confirmed_at         TEXT,
+        deleted_count        INTEGER
+    )
+    """,
+    # At most one pending request per version; confirmed requests never block
+    # a new request (mirrors the snapshot deletion requests).
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_privacy_view_audit_cleanup_one_pending
+    ON privacy_view_audit_cleanup_requests (version_id)
+    WHERE status = 'pending'
+    """,
     """
     CREATE TABLE IF NOT EXISTS privacy_view_access_records (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -358,9 +402,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         SELECT RAISE(ABORT, 'quality rule evaluation records are immutable');
     END
     """,
-    # Privacy view audit records are append-only as well: the database itself
-    # refuses updates and deletes so the masking-hit history cannot be
-    # rewritten.
+    # Privacy view audit records refuse updates: a recorded masking hit can
+    # never be rewritten. Deletes are possible only so that a confirmed
+    # cleanup request can remove its frozen target set (see
+    # privacy_view_audit_cleanup_requests); the legacy no-delete trigger of
+    # databases created before that capability is dropped here.
     """
     CREATE TRIGGER IF NOT EXISTS trg_privacy_view_audit_records_no_update
     BEFORE UPDATE ON privacy_view_audit_records
@@ -369,11 +415,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     END
     """,
     """
-    CREATE TRIGGER IF NOT EXISTS trg_privacy_view_audit_records_no_delete
-    BEFORE DELETE ON privacy_view_audit_records
-    BEGIN
-        SELECT RAISE(ABORT, 'privacy view audit records are immutable');
-    END
+    DROP TRIGGER IF EXISTS trg_privacy_view_audit_records_no_delete
     """,
     # Privacy view access records are append-only as well: the database itself
     # refuses updates and deletes so the access history cannot be rewritten.
