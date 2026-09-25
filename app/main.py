@@ -22,6 +22,7 @@ from app.models import (
     LineageCreate,
     LineageCreatedResponse,
     LineageImpactResponse,
+    LineageImpactPathsResponse,
     LineageResponse,
     PrivacyComplianceExportResponse,
     PrivacyPolicyCoverageResponse,
@@ -454,6 +455,47 @@ def get_lineage_impact(
             conn, dataset_name, version, field.strip()
         )
     )
+
+
+# Read-only shortest-path companion of the lineage impact query, appended one
+# segment after it: each impacted field carries the shortest node sequence and
+# its edge count. The body is serialized directly (rather than through the
+# default JSON response) so the key order is fixed, the whitespace is compact
+# and the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/lineage/impact-paths",
+    response_model=LineageImpactPathsResponse,
+)
+def get_lineage_impact_paths(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    field: str | None = Query(default=None),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only: the paths are recomputed from the committed lineage graph on
+    # every read and the impact cache is never read or written. A missing,
+    # blank or repeated 'field' parameter, any other query parameter or any
+    # request body is a 422 validated in the repository once the path
+    # dataset/version and the field have resolved, preserving 404 precedence.
+    result = LineageImpactPathsResponse(
+        **repository.get_lineage_impact_paths(
+            conn,
+            dataset_name,
+            version,
+            field,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+            field_values=tuple(request.query_params.getlist("field")),
+        )
+    )
+    payload = json.dumps(
+        result.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #

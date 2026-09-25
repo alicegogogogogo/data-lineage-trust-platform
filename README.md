@@ -185,6 +185,29 @@ schema version in a different (source) dataset.
   never contain the source itself (cycles terminate) and are sorted by dataset,
   version and field ascending. Unknown dataset/version/field → `404`; a
   missing, blank or invalid `field` parameter → `422`.
+- `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
+  read-only shortest-path explanation of the same impact, computed fresh on
+  every read (no caching; nothing is written, and version definitions, lineage
+  mappings and the impact cache are never touched). The path and the `field`
+  query parameter together name an existing field. The JSON document is
+  deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline) with top-level keys `source`, `impacts`, `direct_count` and
+  `indirect_count` in that order; `source` is the start field reference
+  (`{"dataset", "version", "field"}`). Each `impacts` entry has exactly the
+  location keys `dataset`, `version`, `field`, then `path` and `path_length`;
+  entries are deduplicated, never contain the source and are sorted by dataset,
+  version and field ascending. `path` is the shortest node sequence from the
+  source to the field, including both ends, and each node has the same
+  `{"dataset", "version", "field"}` shape; `path_length` is the number of
+  edges on the path (`1` for a direct downstream field, increasing for
+  indirect ones). Among several shortest paths, the lexicographically smallest
+  node sequence (compared by dataset, version and field) is chosen; cycles
+  terminate. `direct_count` counts fields at distance 1 and `indirect_count`
+  the fields farther away, and a field with no downstream returns an empty
+  `impacts` array and both counts zero, never an error. The endpoint takes no
+  request body and no query parameter other than `field` (a missing, blank or
+  repeated `field` is likewise a `422`); unknown dataset/version/field →
+  `404`, with `404` taking precedence over every `422`.
 
   Impact results are cached persistently (they survive restarts) and every
   read reflects the currently committed lineage graph: creating a schema
