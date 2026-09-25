@@ -236,6 +236,18 @@ data. Policies (including their enabled state) are persisted across restarts.
   value; a role in `allowed_roles`, a `null` value, an uncovered field or a
   disabled policy never hits); the records are persisted per version and are
   append-only.
+
+  Every successful view additionally appends exactly one access record,
+  whether or not it masked any value (an empty `rows` submission is recorded
+  too). Rejected or failed views leave neither kind of record.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/access-records`
+  — list every access record of the version, ordered by `sequence` ascending
+  (empty when there are none, never an error). Each record has `sequence`,
+  `role`, `row_count` (the number of submitted rows), `masked_count` (the
+  number of masking-hit records the same view wrote, so the two logs
+  cross-check) and `created_at`. The endpoint takes no request body and no
+  query parameters (`422`); unknown dataset/version → `404`. Nothing is
+  written.
 - `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records`
   — list every masking-hit record of the version, ordered by `sequence`
   ascending (empty when there are none, never an error). Each record has

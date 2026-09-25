@@ -1643,12 +1643,21 @@ def view_privacy_rows(
                     hits.append((field, policy_id, masking))
         masked_rows.append(masked_row)
 
-    # The audit append shares the request transaction: a rejected view writes
-    # nothing, and a committed view never loses its hit records. A view never
-    # fails because of the append itself — cross-process contention is retried
-    # and, if the retries are exhausted, resolved by a serialized fallback.
-    if hits:
-        _record_privacy_view_audit(conn, version_row["id"], clean_role, hits)
+    # Every successful view leaves exactly one access record, whether or not
+    # any value was masked (an empty row set or a view that masked nothing is
+    # traced too). The per-value masking-hit records and the single access
+    # record are appended together and share the request transaction: a
+    # rejected or failed view leaves neither kind of trace behind, and a
+    # committed view never loses either. A view never fails because of the
+    # append itself — cross-process contention is retried and, if the retries
+    # are exhausted, resolved by a serialized fallback.
+    _record_privacy_view_trail(
+        conn,
+        version_row["id"],
+        clean_role,
+        len(rows),
+        hits,
+    )
 
     return {
         "dataset": dataset["name"],
@@ -1658,15 +1667,17 @@ def view_privacy_rows(
 
 
 # --------------------------------------------------------------------------- #
-# Privacy view audit records (append-only masking-hit log)
+# Privacy view audit records (per-value masking-hit log) and access records
+# (one-per-view access trail)
 # --------------------------------------------------------------------------- #
 
 
 # Serializes read-tail -> append within this process so concurrent views never
-# compute the same sequence (mirrors the evaluation append lock). The
-# UNIQUE(version_id, sequence) constraint is the hard guard against writers in
-# other processes; such a collision is resolved with a bounded
-# re-read-and-retry.
+# compute the same sequence (mirrors the evaluation append lock). One lock per
+# version serializes the whole view trail — the per-value hit batch and the
+# single access record of the request. The UNIQUE(version_id, sequence)
+# constraints on both tables are the hard guards against writers in other
+# processes; such a collision is resolved with a bounded re-read-and-retry.
 _privacy_view_audit_locks: dict[int, threading.Lock] = {}
 _privacy_view_audit_locks_guard = threading.Lock()
 
@@ -1721,9 +1732,53 @@ def _append_privacy_view_audit_batch(
         sequence += 1
 
 
-def _record_privacy_view_audit_serialized(
+def _append_privacy_view_access_record(
+    conn: sqlite3.Connection,
     version_id: int,
     role: str,
+    row_count: int,
+    masked_count: int,
+) -> None:
+    """Insert the single access record of one view as the next sequence."""
+    tail = conn.execute(
+        "SELECT MAX(sequence) AS max_sequence "
+        "FROM privacy_view_access_records WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()
+    sequence = (tail["max_sequence"] or 0) + 1
+    conn.execute(
+        "INSERT INTO privacy_view_access_records ("
+        "version_id, sequence, role, row_count, masked_count, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?)",
+        (version_id, sequence, role, row_count, masked_count, utc_now_iso()),
+    )
+
+
+def _append_privacy_view_trail(
+    conn: sqlite3.Connection,
+    version_id: int,
+    role: str,
+    row_count: int,
+    hits: list[tuple[str, int, str]],
+) -> None:
+    """Append one view's whole trail: its hit batch plus its access record.
+
+    The access record's ``masked_count`` is the number of hit records the same
+    view writes, so the two logs always cross-check. Both appends ride the
+    same transaction, so a collision rolls both back together and a retry
+    re-appends both — the trail is never half-written.
+    """
+    if hits:
+        _append_privacy_view_audit_batch(conn, version_id, role, hits)
+    _append_privacy_view_access_record(
+        conn, version_id, role, row_count, len(hits)
+    )
+
+
+def _record_privacy_view_trail_serialized(
+    version_id: int,
+    role: str,
+    row_count: int,
     hits: list[tuple[str, int, str]],
 ) -> None:
     """Fallback append on a dedicated connection serialized by BEGIN IMMEDIATE.
@@ -1736,30 +1791,31 @@ def _record_privacy_view_audit_serialized(
     """
     with db_session() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        _append_privacy_view_audit_batch(conn, version_id, role, hits)
+        _append_privacy_view_trail(conn, version_id, role, row_count, hits)
 
 
-def _record_privacy_view_audit(
+def _record_privacy_view_trail(
     conn: sqlite3.Connection,
     version_id: int,
     role: str,
+    row_count: int,
     hits: list[tuple[str, int, str]],
 ) -> None:
-    """Append one record per hit as the next sequences of the version.
+    """Append one view's hit batch and access record as the next sequences.
 
     The per-version lock makes read-tail -> append atomic within this process
     (FastAPI runs this synchronous endpoint in one process's threadpool). The
-    UNIQUE(version_id, sequence) constraint is the hard cross-process guard; a
-    writer that loses a race against another process rolls the partial batch
+    UNIQUE(version_id, sequence) constraints are the hard cross-process guard;
+    a writer that loses a race against another process rolls the partial trail
     back and retries with the new tail, so a lost race never leaves half a
-    batch behind. If the bounded retries are ever exhausted, the append falls
+    trail behind. If the bounded retries are ever exhausted, the append falls
     back to a dedicated connection serialized by BEGIN IMMEDIATE, so the view
-    request still succeeds and no hit record is lost.
+    request still succeeds and no record is lost.
     """
     with _privacy_view_audit_lock(version_id):
         for attempt in range(_PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS):
             try:
-                _append_privacy_view_audit_batch(conn, version_id, role, hits)
+                _append_privacy_view_trail(conn, version_id, role, row_count, hits)
                 return
             except sqlite3.IntegrityError:
                 # Another process inserted the same sequence first. End the
@@ -1773,7 +1829,7 @@ def _record_privacy_view_audit(
         # result and the records must not be dropped, so append them through
         # a dedicated connection serialized by BEGIN IMMEDIATE (still under
         # the in-process lock, so in-process writers stay ordered too).
-        _record_privacy_view_audit_serialized(version_id, role, hits)
+        _record_privacy_view_trail_serialized(version_id, role, row_count, hits)
 
 
 def _privacy_view_audit_row_to_dict(row: sqlite3.Row) -> dict:
@@ -1821,6 +1877,62 @@ def list_privacy_view_audit_records(
         (version_row["id"],),
     ).fetchall()
     return [_privacy_view_audit_row_to_dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Privacy view access records (one-per-view access trail)
+# --------------------------------------------------------------------------- #
+
+
+def _privacy_view_access_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "sequence": row["sequence"],
+        "role": row["role"],
+        "row_count": row["row_count"],
+        "masked_count": row["masked_count"],
+        "created_at": row["created_at"],
+    }
+
+
+def list_privacy_view_access_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Every access record of one version, in write (sequence) order.
+
+    Exactly one record is written per successful view request, independent of
+    how many values it masked; ordering by ``sequence`` never relies on the
+    database's natural row order, and the sequence is continuous within the
+    version. Read-only and parameterless: the path dataset/version resolves
+    first (404); a non-empty request body or any query parameter is a 422
+    checked afterwards, with the same 404-before-422 precedence as the
+    masking-hit record list. A version without access records yields an empty
+    list; nothing is written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view access records endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view access records endpoint does not accept query "
+            "parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM privacy_view_access_records WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return [_privacy_view_access_row_to_dict(row) for row in rows]
 
 
 _PRIVACY_VIEW_AUDIT_SEARCH_PARAMETERS: frozenset[str] = frozenset(

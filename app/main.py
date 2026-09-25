@@ -26,6 +26,7 @@ from app.models import (
     PrivacyPolicy,
     PrivacyPolicyCreate,
     PrivacyPolicyEnabledUpdate,
+    PrivacyViewAccessRecord,
     PrivacyViewAuditRecord,
     PrivacyViewAuditDiffResponse,
     PrivacyViewAuditSummaryResponse,
@@ -610,6 +611,36 @@ def list_privacy_view_audit_records(
     return [
         PrivacyViewAuditRecord(**record)
         for record in repository.list_privacy_view_audit_records(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
+# Read-only one-per-view access trail appended after the privacy view path.
+# Exactly one record is written per successful view; the endpoint lists them
+# in sequence order and never writes anything itself.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/access-records",
+    response_model=list[PrivacyViewAccessRecord],
+)
+def list_privacy_view_access_records(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[PrivacyViewAccessRecord]:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/version is known,
+    # preserving 404 precedence, exactly like the masking-hit record list.
+    return [
+        PrivacyViewAccessRecord(**record)
+        for record in repository.list_privacy_view_access_records(
             conn,
             dataset_name,
             version,
