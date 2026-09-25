@@ -306,6 +306,16 @@ class PrivacyViewResponse(BaseModel):
     rows: list[dict[str, Any]]
 
 
+class PrivacyViewAuditRecord(BaseModel):
+    id: int
+    sequence: int
+    field: str
+    policy_id: int
+    role: str
+    masking: PrivacyMasking
+    created_at: str
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #

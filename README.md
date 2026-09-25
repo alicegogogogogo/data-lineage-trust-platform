@@ -231,6 +231,26 @@ data. Policies (including their enabled state) are persisted across restarts.
   - `null` values and fields without a policy are returned unchanged; rows
     missing a covered field are left without it.
 
+  Every successful view appends one immutable **masking-hit record** per field
+  value it actually masked; records persist across restarts. A value the role
+  is authorized to see, a `null` value, a field absent from the row and a
+  field covered only by a disabled policy produce no record, and a view with
+  empty rows or no covered fields writes nothing. Auditing never changes the
+  view's masking semantics, response fields or row order, and an auditing
+  failure never makes a view fail.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies/view-records` —
+  list every masking-hit record of the version, ordered by write sequence
+  ascending (continuous from `1`, independent of database natural order;
+  empty when there are none). Each record has `id`, `sequence`, `field`,
+  `policy_id` (the masking strategy that hit), `role` (the requesting role),
+  `masking` (`redact`/`partial`) and `created_at`. Multiple masked fields in
+  one view become multiple records (never merged), and concurrent views get
+  consecutive, non-repeating sequence numbers with no partial record. The
+  endpoint takes no request body and no query parameters (`422` if either is
+  present, with nothing written); unknown dataset/version → `404`. Records are
+  append-only: the database rejects updates and deletes and there is no
+  per-record HTTP route.
+
 ### Sensitive-field identification
 
 Sensitive-field identification produces candidate annotations for the fields of
