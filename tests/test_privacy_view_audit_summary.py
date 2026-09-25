@@ -157,16 +157,16 @@ def test_hit_count_counts_records_not_rows_or_fields(client: TestClient) -> None
          "allowed_roles": []},
     )
 
-    # Three masked rows in one view still write a single record.
+    # Three masked values in one view write three records.
     assert post_view(
         client, "guest", [{"email": "a@b.c"}, {"email": "d@e.f"}, {"email": "g@h.i"}]
     ).status_code == 200
-    # Each later view adds exactly one more record for the same group.
+    # The next view adds exactly one more record for the same group.
     assert post_view(client, "guest", [{"email": "x@y.z"}]).status_code == 200
 
     groups = get_summary(client)["groups"]
     assert len(groups) == 1
-    assert groups[0]["hit_count"] == 2
+    assert groups[0]["hit_count"] == 4
     assert groups[0]["field"] == "email"
 
 

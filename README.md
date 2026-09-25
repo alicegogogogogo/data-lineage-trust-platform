@@ -231,8 +231,9 @@ data. Policies (including their enabled state) are persisted across restarts.
   - `null` values and fields without a policy are returned unchanged; rows
     missing a covered field are left without it.
 
-  Every successful view also appends one audit record per field it actually
-  masked (a role in `allowed_roles`, a `null` value, an uncovered field or a
+  Every successful view also appends one audit record per value it actually
+  masked (the same field masked in several rows yields one record per masked
+  value; a role in `allowed_roles`, a `null` value, an uncovered field or a
   disabled policy never hits); the records are persisted per version and are
   append-only.
 - `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records`
