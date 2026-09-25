@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from fastapi import Depends, FastAPI, Query, Request, Response
@@ -21,6 +22,7 @@ from app.models import (
     LineageCreatedResponse,
     LineageImpactResponse,
     LineageResponse,
+    PrivacyComplianceExportResponse,
     MaskingSuggestion,
     MaskingSuggestionsRegisterRequest,
     PrivacyPolicy,
@@ -892,6 +894,51 @@ def confirm_privacy_view_audit_cleanup_request(
             query_keys=tuple(request.query_params.keys()),
         )
     )
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version privacy compliance export
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that returns the privacy compliance state of every
+# schema version at once. The path carries only the dataset name; there is no
+# request body or query parameter.
+PRIVACY_COMPLIANCE_EXPORT_PATH = (
+    "/datasets/{dataset_name}/privacy-compliance-export"
+)
+
+
+@app.get(
+    PRIVACY_COMPLIANCE_EXPORT_PATH,
+    response_model=PrivacyComplianceExportResponse,
+)
+def export_dataset_privacy_compliance(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset is known,
+    # preserving the same 404 precedence as the masking-hit record reads. The
+    # body is serialized directly (rather than through the default JSON
+    # response) so the key order is fixed, the whitespace is compact and the
+    # document ends with exactly one newline.
+    export = PrivacyComplianceExportResponse(
+        **repository.export_dataset_privacy_compliance(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        export.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #

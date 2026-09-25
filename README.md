@@ -352,6 +352,36 @@ data. Policies (including their enabled state) are persisted across restarts.
   endpoint → `422`; unknown dataset/version/request → `404` (precedence
   matches the hit-record reads), and confirming a confirmed request →
   `409`.
+- `GET /datasets/{dataset}/privacy-compliance-export` — read-only
+  cross-version export of the dataset's whole privacy compliance state,
+  computed fresh on every read (no caching; nothing is written, modified or
+  deleted, and no hit record, access record or cleanup request is touched).
+  The path carries only the dataset name; the request takes no body and no
+  query parameters (`422`); an unknown dataset → `404`, with the same
+  404-before-422 precedence as the hit-record reads. A dataset without
+  schema versions returns `200` with an empty `versions` array and all-zero
+  totals, never an error. The JSON document is deterministic (fixed key
+  order, compact whitespace, exactly one trailing newline):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"policies":[...],"hit_count":0,"masked_count":1,"view_count":2,"cleanup_requests":[...]}],"totals":{...}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions`, `totals` in that
+  order. `versions` is ordered by version number ascending and each entry
+  has exactly `version`, `policies`, `hit_count`, `masked_count`,
+  `view_count`, `cleanup_requests` in that order. `policies` lists the
+  version's registered policies ordered by policy id; each policy has `id`,
+  `field`, `classification`, `masking`, `allowed_roles` and `enabled`.
+  `cleanup_requests` lists the version's cleanup requests ordered by request
+  id (both pending and confirmed are retained); each has `id`, `reason`,
+  `status` and `created_at`. `hit_count` is the number of masking-hit
+  records currently stored for the version, `masked_count` is the sum of the
+  access records' masked-value counts and `view_count` is the number of
+  access records; all three reflect the records surviving a confirmed
+  cleanup. `totals` has exactly `policy_count`, `hit_count`, `masked_count`,
+  `view_count` and `cleanup_request_count`, each the sum of the per-version
+  values over the whole dataset.
 
 ### Sensitive-field identification
 

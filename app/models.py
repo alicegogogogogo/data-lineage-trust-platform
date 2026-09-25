@@ -477,6 +477,60 @@ class ConfirmedPrivacyViewAuditCleanupRequest(PrivacyViewAuditCleanupRequest):
     deleted_count: int
 
 
+# --------------------------------------------------------------------------- #
+# Read-only cross-version privacy compliance export
+# --------------------------------------------------------------------------- #
+
+
+# One version's registered privacy policy as it appears in the export, sorted
+# by policy ``id`` ascending. Carries the policy number plus its field name,
+# classification, masking, allowed roles and enabled state.
+class PrivacyComplianceExportPolicy(BaseModel):
+    id: int
+    field: str
+    classification: str
+    masking: PrivacyMasking
+    allowed_roles: list[str]
+    enabled: bool
+
+
+# One version's cleanup request as it appears in the export, sorted by request
+# ``id`` ascending. Pending and confirmed requests are both kept; the status
+# field distinguishes them. Only the number, reason, status and creation time
+# are exported.
+class PrivacyComplianceExportCleanupRequest(BaseModel):
+    id: int
+    reason: str
+    status: Literal["pending", "confirmed"]
+    created_at: str
+
+
+# One schema version's compliance summary. Exactly these keys, in this order;
+# the three counters are computed from the records surviving any confirmed
+# cleanup.
+class PrivacyComplianceExportVersion(BaseModel):
+    version: int
+    policies: list[PrivacyComplianceExportPolicy]
+    hit_count: int
+    masked_count: int
+    view_count: int
+    cleanup_requests: list[PrivacyComplianceExportCleanupRequest]
+
+
+class PrivacyComplianceExportTotals(BaseModel):
+    policy_count: int
+    hit_count: int
+    masked_count: int
+    view_count: int
+    cleanup_request_count: int
+
+
+# Deterministic whole-dataset export: exactly these keys, in this order.
+class PrivacyComplianceExportResponse(BaseModel):
+    dataset: str
+    versions: list[PrivacyComplianceExportVersion]
+    totals: PrivacyComplianceExportTotals
+
 
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
