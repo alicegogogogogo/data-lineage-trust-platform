@@ -215,6 +215,37 @@ schema version in a different (source) dataset.
   a lineage mapping invalidates the cached impacts of the mapping's source
   field and of every field that can reach it. Unrelated cache entries are
   preserved.
+- `GET /datasets/{dataset}/versions/{version}/lineage/impact/source-paths?field=<field>` —
+  read-only upstream companion of the impact query: the shortest-path
+  backtrace of one field's sources, computed fresh on every read (no caching;
+  nothing is written, and version definitions, lineage mappings and the
+  impact cache are never touched). The path and the `field` query parameter
+  together name an existing field, exactly as in the impact query — except
+  that the value is matched literally against the persisted field names
+  (it is not trimmed, so a whitespace-padded name simply names no field).
+  The JSON document is deterministic (fixed key order, compact whitespace,
+  exactly one trailing newline) with top-level keys `source`, `origins`,
+  `direct_count`, `indirect_count` and `source_dataset_count` in that order;
+  `source` is the start field reference (`{"dataset", "version", "field"}`).
+  A field's direct sources are the source fields of the mappings that name
+  it as target; every field reachable further upstream is an origin too,
+  while the start field itself never is. Each `origins` entry has exactly
+  the location keys `dataset`, `version`, `field`, then `path` and
+  `path_length`; entries are deduplicated and sorted by dataset, version and
+  field ascending. `path` is the shortest node sequence from the start field
+  up to the origin, including both ends, and each node has the same
+  `{"dataset", "version", "field"}` shape; `path_length` is the number of
+  edges on the path (`1` for a direct source, increasing for indirect ones).
+  Among several shortest paths, the lexicographically smallest node sequence
+  (compared by dataset, version and field) is chosen; cycles terminate.
+  `direct_count` counts sources one step away and `indirect_count` the
+  sources farther away; `source_dataset_count` is the number of distinct
+  dataset names the origin fields live in. A field with no sources returns
+  an empty `origins` array and all three counts zero, never an error. The
+  endpoint takes no request body and no query parameter other than `field`
+  (a missing, blank or repeated `field` is likewise a `422`); unknown
+  dataset/version/field → `404`, with `404` taking precedence over every
+  `422`.
 
 ### Quality rules
 

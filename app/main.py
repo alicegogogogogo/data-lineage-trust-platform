@@ -24,6 +24,7 @@ from app.models import (
     LineageImpactResponse,
     LineageImpactPathsResponse,
     LineageResponse,
+    LineageSourcePathsResponse,
     PrivacyComplianceExportResponse,
     PrivacyPolicyCoverageResponse,
     MaskingSuggestion,
@@ -481,6 +482,49 @@ def get_lineage_impact_paths(
     # dataset/version and the field have resolved, preserving 404 precedence.
     result = LineageImpactPathsResponse(
         **repository.get_lineage_impact_paths(
+            conn,
+            dataset_name,
+            version,
+            field,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+            field_values=tuple(request.query_params.getlist("field")),
+        )
+    )
+    payload = json.dumps(
+        result.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only upstream companion of the lineage impact query, appended one
+# segment after it: each origin field carries the shortest node sequence from
+# the start field up to it and its edge count. The body is serialized directly
+# (rather than through the default JSON response) so the key order is fixed,
+# the whitespace is compact and the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/lineage/impact/source-paths",
+    response_model=LineageSourcePathsResponse,
+)
+def get_lineage_source_paths(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    field: str | None = Query(default=None),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only: the paths are recomputed from the committed lineage graph on
+    # every read and the impact cache is never read or written. A missing,
+    # blank or repeated 'field' parameter, any other query parameter or any
+    # request body is a 422 validated in the repository once the path
+    # dataset/version and the field have resolved, preserving 404 precedence
+    # (mirrors the impact paths endpoint). The 'field' value is matched
+    # literally, without trimming.
+    result = LineageSourcePathsResponse(
+        **repository.get_lineage_source_paths(
             conn,
             dataset_name,
             version,

@@ -1244,6 +1244,171 @@ def get_lineage_impact_paths(
 
 
 # --------------------------------------------------------------------------- #
+# Lineage source shortest-path query (read-only, never cached)
+# --------------------------------------------------------------------------- #
+
+
+def _lineage_backward_edges(
+    conn: sqlite3.Connection,
+) -> dict[int, list[tuple[int, dict]]]:
+    """Adjacency of the lineage graph: target field id -> source field refs."""
+    rows = conn.execute(
+        """
+        SELECT  ll.target_field_id AS target_field_id,
+                ll.source_field_id AS source_field_id,
+                sd.name            AS source_dataset,
+                sv.version         AS source_version,
+                sf.name            AS source_field
+        FROM    lineage_links ll
+        JOIN    datasets sd ON sd.id = ll.source_dataset_id
+        JOIN    schema_versions sv ON sv.id = ll.source_version_id
+        JOIN    schema_fields sf ON sf.id = ll.source_field_id
+        """
+    ).fetchall()
+    edges: dict[int, list[tuple[int, dict]]] = {}
+    for row in rows:
+        ref = {
+            "dataset": row["source_dataset"],
+            "version": row["source_version"],
+            "field": row["source_field"],
+        }
+        edges.setdefault(row["target_field_id"], []).append(
+            (row["source_field_id"], ref)
+        )
+    return edges
+
+
+def _compute_source_paths(
+    conn: sqlite3.Connection, target_field_id: int
+) -> list[dict]:
+    """Shortest lineage path from the start field up to every upstream source.
+
+    Breadth-first traversal over the reversed lineage graph guarantees the
+    minimum number of edges; each node's incoming links are expanded in
+    location-key (dataset, version, field) order, so the first discovery of a
+    node is the lexicographically smallest node sequence among its shortest
+    paths. The start id is seeded as visited, so cycles terminate and the
+    start field itself never appears in the result. Every ordering is
+    computed explicitly here rather than read from database order (mirrors
+    the downstream impact paths computation).
+    """
+    edges = _lineage_backward_edges(conn)
+    refs = _lineage_field_refs(conn)
+    for sources in edges.values():
+        sources.sort(
+            key=lambda item: (
+                item[1]["dataset"],
+                item[1]["version"],
+                item[1]["field"],
+            )
+        )
+
+    shortest: dict[int, list[dict]] = {target_field_id: [refs[target_field_id]]}
+    queue = deque([target_field_id])
+    while queue:
+        current = queue.popleft()
+        current_path = shortest[current]
+        for source_field_id, ref in edges.get(current, ()):
+            if source_field_id in shortest:
+                continue
+            shortest[source_field_id] = current_path + [ref]
+            queue.append(source_field_id)
+
+    items: list[dict] = []
+    for source_field_id in sorted(
+        (field_id for field_id in shortest if field_id != target_field_id),
+        key=lambda field_id: (
+            refs[field_id]["dataset"],
+            refs[field_id]["version"],
+            refs[field_id]["field"],
+        ),
+    ):
+        path = shortest[source_field_id]
+        items.append(
+            {
+                "dataset": path[-1]["dataset"],
+                "version": path[-1]["version"],
+                "field": path[-1]["field"],
+                "path": path,
+                "path_length": len(path) - 1,
+            }
+        )
+    return items
+
+
+def get_lineage_source_paths(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version: int,
+    field: str | None,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+    field_values: tuple[str, ...] = (),
+) -> dict:
+    """Read-only shortest-path backtrace of one field's upstream sources.
+
+    The path dataset and version resolve first (404); a missing or blank
+    ``field`` parameter cannot name a resource and is a 422, after which the
+    field itself must exist (404). The ``field`` value is matched literally
+    against the persisted field names — it is not trimmed — so a name
+    carrying leading or trailing whitespace simply names no field and is a
+    404. Only then are request-body bytes, query parameters other than
+    ``field`` and a repeated ``field`` parameter rejected with 422, so an
+    unknown dataset, version or field always keeps its 404 precedence over
+    request-shape errors (mirroring the downstream impact paths query).
+    Computed fresh on every read: nothing is written and the impact cache is
+    never read or written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version)
+
+    if field is None or not field.strip():
+        raise RequestInvalidError(
+            "Query parameter 'field' is required and must be a non-empty "
+            "field name"
+        )
+
+    field_row = conn.execute(
+        "SELECT id FROM schema_fields WHERE version_id = ? AND name = ?",
+        (version_row["id"], field),
+    ).fetchone()
+    if field_row is None:
+        raise NotFoundError(
+            f"Source field '{field}' does not exist in version "
+            f"{version} of dataset '{dataset['name']}'"
+        )
+
+    if body:
+        raise RequestInvalidError(
+            "The lineage source paths endpoint does not accept a request body"
+        )
+    unknown_keys = sorted(set(query_keys) - {"field"})
+    if unknown_keys:
+        raise RequestInvalidError(
+            "Unknown query parameter(s): " + ", ".join(unknown_keys)
+        )
+    if len(field_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'field' must be provided exactly once"
+        )
+
+    origins = _compute_source_paths(conn, field_row["id"])
+    direct_count = sum(1 for item in origins if item["path_length"] == 1)
+    return {
+        "source": {
+            "dataset": dataset["name"],
+            "version": version,
+            "field": field,
+        },
+        "origins": origins,
+        "direct_count": direct_count,
+        "indirect_count": len(origins) - direct_count,
+        "source_dataset_count": len({item["dataset"] for item in origins}),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Quality rules
 # --------------------------------------------------------------------------- #
 
