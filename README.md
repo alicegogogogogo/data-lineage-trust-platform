@@ -241,6 +241,19 @@ data. Policies (including their enabled state) are persisted across restarts.
   `sequence`, `field`, `policy_id`, `role`, `masking` and `created_at`. The
   endpoint takes no request body and no query parameters (`422`); unknown
   dataset/version → `404`. Nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records/summary`
+  — read-only compliance summary computed fresh from the persisted records on
+  every read (no caching, nothing is written or deleted). Response:
+  `{"dataset", "version", "groups"}`; `groups` is an empty array when the
+  version has no records. Each group merges records with the same `field`,
+  `policy_id`, `role` and `masking` (different roles or masking modes stay
+  separate) and lists `field`, `policy_id`, `role`, `masking`, `hit_count`
+  (one record counts as one hit), `first_hit_at` and `last_hit_at` (the
+  earliest and latest record `created_at` in the group). Groups sort by
+  `field`, then `policy_id`, `role` and `masking`, all ascending. The
+  endpoint takes no request body and no query parameters (`422`); unknown
+  dataset/version → `404`, with the same 404-before-422 precedence as the
+  record list.
 
 ### Sensitive-field identification
 

@@ -318,6 +318,26 @@ class PrivacyViewAuditRecord(BaseModel):
     created_at: str
 
 
+# Read-only roll-up of the masking-hit records: one group per distinct
+# (field, policy, role, masking) combination, with the number of hits and the
+# timestamps of the group's earliest and latest written records. Recomputed
+# from the persisted records on every read; nothing is cached or written.
+class PrivacyViewAuditSummaryGroup(BaseModel):
+    field: str
+    policy_id: int
+    role: str
+    masking: PrivacyMasking
+    hit_count: int
+    first_hit_at: str
+    last_hit_at: str
+
+
+class PrivacyViewAuditSummaryResponse(BaseModel):
+    dataset: str
+    version: int
+    groups: list[PrivacyViewAuditSummaryGroup]
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #
