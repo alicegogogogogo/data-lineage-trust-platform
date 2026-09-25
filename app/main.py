@@ -619,6 +619,41 @@ def list_privacy_view_audit_records(
     ]
 
 
+# Read-only filtered search appended after the hit-record query path. Every
+# filter is optional; the response is the same record collection as the full
+# list, in the same sequence order, and nothing is ever written.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/audit-records/search",
+    response_model=list[PrivacyViewAuditRecord],
+)
+def search_privacy_view_audit_records(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    role: str | None = Query(default=None),
+    field: str | None = Query(default=None),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    conn=Depends(get_db),
+) -> list[PrivacyViewAuditRecord]:
+    return [
+        PrivacyViewAuditRecord(**record)
+        for record in repository.search_privacy_view_audit_records(
+            conn,
+            dataset_name,
+            version,
+            role=role,
+            field=field,
+            start=start,
+            end=end,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
 # Read-only compliance summary appended after the hit-record query path. The
 # summary is recomputed from the persisted records on every read.
 @app.get(

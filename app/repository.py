@@ -1823,6 +1823,108 @@ def list_privacy_view_audit_records(
     return [_privacy_view_audit_row_to_dict(row) for row in rows]
 
 
+_PRIVACY_VIEW_AUDIT_SEARCH_PARAMETERS: frozenset[str] = frozenset(
+    {"role", "field", "start", "end"}
+)
+
+
+def _parse_audit_interval_timestamp(raw: str, param: str) -> datetime:
+    """Parse one bound of the search write-time interval.
+
+    The bound must be an ISO-8601 date-time carrying a timezone designator
+    (offset or 'Z'); anything else (including an empty value) is a 422.
+    """
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise RequestInvalidError(
+            f"Query parameter '{param}' must be an ISO-8601 date-time"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RequestInvalidError(
+            f"Query parameter '{param}' must include a timezone"
+        )
+    return parsed
+
+
+def search_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    role: str | None = None,
+    field: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Masking-hit records of a version matching optional read-only filters.
+
+    The filters are all optional and combine with AND: ``role`` and ``field``
+    match the stored values exactly apart from letter case (no trimming, no
+    substring matching); ``start``/``end`` are timezone-aware ISO-8601 bounds
+    of a closed interval on the record write time, either one being omissible.
+    Matched records keep the full-list field shape and sequence-ascending
+    order. No match yields an empty list; an interval whose start is later
+    than its end is a 422.
+
+    Read-only: the path dataset/version resolves first (404); a non-empty
+    request body, an unknown query parameter, an unparseable or timezone-less
+    bound, or a reversed interval is a 422 checked afterwards, mirroring the
+    full record list. Nothing is written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit records search endpoint does not accept "
+            "a request body"
+        )
+    unknown_keys = sorted(set(query_keys) - _PRIVACY_VIEW_AUDIT_SEARCH_PARAMETERS)
+    if unknown_keys:
+        raise RequestInvalidError(
+            "Unknown query parameter(s): " + ", ".join(unknown_keys)
+        )
+
+    start_at = (
+        _parse_audit_interval_timestamp(start, "start")
+        if start is not None
+        else None
+    )
+    end_at = (
+        _parse_audit_interval_timestamp(end, "end") if end is not None else None
+    )
+    if start_at is not None and end_at is not None and start_at > end_at:
+        raise RequestInvalidError(
+            "Query parameter 'start' must not be later than 'end'"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM privacy_view_audit_records WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+
+    role_match = role.lower() if role is not None else None
+    field_match = field.lower() if field is not None else None
+    results: list[dict] = []
+    for row in rows:
+        if role_match is not None and row["role"].lower() != role_match:
+            continue
+        if field_match is not None and row["field"].lower() != field_match:
+            continue
+        if start_at is not None or end_at is not None:
+            written_at = datetime.fromisoformat(row["created_at"])
+            if start_at is not None and written_at < start_at:
+                continue
+            if end_at is not None and written_at > end_at:
+                continue
+        results.append(_privacy_view_audit_row_to_dict(row))
+    return results
+
+
 def summarize_privacy_view_audit_records(
     conn: sqlite3.Connection,
     dataset_name: str,
