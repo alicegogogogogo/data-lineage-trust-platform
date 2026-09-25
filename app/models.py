@@ -615,6 +615,59 @@ class MaskingSuggestionsRegisterRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version privacy policy coverage check
+# --------------------------------------------------------------------------- #
+
+
+# One field's policy coverage as it appears in the check, sorted by field
+# name. ``coverage`` is "enabled" when an enabled policy is registered for the
+# field, "disabled" when the registered policy is disabled and "unregistered"
+# when the field has no policy; the registered policy's classification,
+# masking and enabled state are reported alongside and are all null when no
+# policy is registered.
+class PrivacyPolicyCoverageField(BaseModel):
+    field: str
+    coverage: Literal["enabled", "disabled", "unregistered"]
+    classification: str | None
+    masking: PrivacyMasking | None
+    enabled: bool | None
+
+
+# Advisory candidate for a field that was identified with at least one name or
+# sample hit but carries no privacy policy yet, sorted by identification
+# record id ascending. Only the field name and the suggested classification
+# and masking are reported; a candidate never registers a policy.
+class PrivacyPolicyCoverageCandidate(BaseModel):
+    field: str
+    classification: MaskingSuggestionClassification
+    masking: PrivacyMasking
+
+
+# One schema version's coverage summary. Exactly these keys, in this order.
+class PrivacyPolicyCoverageVersion(BaseModel):
+    version: int
+    fields: list[PrivacyPolicyCoverageField]
+    candidates: list[PrivacyPolicyCoverageCandidate]
+
+
+class PrivacyPolicyCoverageTotals(BaseModel):
+    version_count: int
+    field_count: int
+    enabled_count: int
+    disabled_count: int
+    unregistered_count: int
+    candidate_count: int
+
+
+# Deterministic whole-dataset coverage check: exactly these keys, in this
+# order.
+class PrivacyPolicyCoverageResponse(BaseModel):
+    dataset: str
+    versions: list[PrivacyPolicyCoverageVersion]
+    totals: PrivacyPolicyCoverageTotals
+
+
+# --------------------------------------------------------------------------- #
 # Row snapshots
 # --------------------------------------------------------------------------- #
 

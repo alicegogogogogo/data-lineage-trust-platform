@@ -382,6 +382,40 @@ data. Policies (including their enabled state) are persisted across restarts.
   cleanup. `totals` has exactly `policy_count`, `hit_count`, `masked_count`,
   `view_count` and `cleanup_request_count`, each the sum of the per-version
   values over the whole dataset.
+- `GET /datasets/{dataset}/privacy-policy-coverage` — read-only cross-version
+  check of the dataset's privacy policy coverage, computed fresh on every
+  read (no caching; nothing is written, modified or deleted, and no policy
+  or identification record is touched). The path carries only the dataset
+  name; the request takes no body and no query parameters (`422`); an
+  unknown dataset → `404`, with the same 404-before-422 precedence as the
+  compliance export. A dataset without schema versions returns `200` with an
+  empty `versions` array and all-zero totals, never an error. The JSON
+  document is deterministic (fixed key order, compact whitespace, exactly
+  one trailing newline):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"fields":[...],"candidates":[...]}],"totals":{...}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions`, `totals` in that
+  order. `versions` is ordered by version number ascending and each entry
+  has exactly `version`, `fields`, `candidates` in that order. `fields`
+  lists every field of the version ordered by field name; each entry has
+  `field`, `coverage`, `classification`, `masking` and `enabled`, where
+  `coverage` is `enabled` (an enabled policy is registered), `disabled` (a
+  policy is registered but disabled) or `unregistered` (no policy), and the
+  last three keys report the registered policy's classification, masking and
+  enabled state (all `null` when no policy is registered). `candidates`
+  lists the advisory suggestions for fields that were identified with at
+  least one name or sample hit but carry no privacy policy yet, ordered by
+  identification record id ascending; each candidate has exactly `field`,
+  `classification` and `masking`, and an identified field whose name and
+  samples both missed does not appear. The candidates are a compliance
+  self-check reference only: they never register a policy and never rewrite
+  an identification record. `totals` has exactly `version_count`,
+  `field_count`, `enabled_count`, `disabled_count`, `unregistered_count`
+  and `candidate_count`, each the sum of the per-version values over the
+  whole dataset.
 
 ### Sensitive-field identification
 
