@@ -618,6 +618,129 @@ def summarize_schema_version_evolution(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only per-field cross-version trajectory
+# --------------------------------------------------------------------------- #
+
+
+def get_field_version_trajectory(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    field_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only cross-version trajectory of one field of a dataset.
+
+    ``trajectory`` lists every schema version of the dataset, ordered by
+    version number ascending, each with the field's persisted definition
+    (type and nullability only) or null where the field does not exist.
+    ``changes`` lists one entry per adjacent version pair with the field's
+    status: ``added`` (new on the target side), ``removed`` (gone on the
+    target side), ``type_changed``, ``nullable_tightened``,
+    ``nullable_loosened`` or ``unchanged``; a type change and a nullable
+    tightening on the same pair collapse into one ``type_changed`` entry.
+    Each change entry also carries ``impacted`` — the direct and indirect
+    downstream fields of the field along the lineage mappings, computed with
+    the same start-field rule as the pairwise compatibility impact response
+    (the same-named field of the base version and, when it still exists, of
+    the target version), deduplicated, never containing a start field itself
+    (cycles terminate), sorted by dataset, version and field ascending — and
+    ``impacted_datasets``, the distinct dataset names appearing in it, sorted
+    ascending. A dataset with fewer than two versions yields an empty change
+    list, never an error.
+
+    The trajectory is recomputed from the persisted definitions and lineage
+    mappings on every read: it caches nothing and never writes, so version
+    definitions, lineage mappings and the impact cache are all left
+    untouched, and quality, privacy, snapshot or task state plays no role.
+    The dataset resolves first (404), then a field that never appears in any
+    version is a 404; any request body bytes (including whitespace-only
+    bytes) or any query parameter is a 422 checked afterwards, and every
+    ordering is computed explicitly rather than read from database order.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions WHERE dataset_id = ?",
+        (dataset["id"],),
+    ).fetchall()
+    ordered = sorted(version_rows, key=lambda row: row["version"])
+    definitions = [
+        _version_field_definitions(conn, row["id"]) for row in ordered
+    ]
+
+    if not any(field_name in fields for fields in definitions):
+        raise NotFoundError(
+            f"Field '{field_name}' does not exist in any version of dataset "
+            f"'{dataset['name']}'"
+        )
+
+    if body:
+        raise RequestInvalidError(
+            "The field trajectory endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The field trajectory endpoint does not accept query parameters"
+        )
+
+    trajectory = [
+        {"version": row["version"], "definition": fields.get(field_name)}
+        for row, fields in zip(ordered, definitions)
+    ]
+
+    changes: list[dict] = []
+    pairs = zip(zip(ordered, definitions), zip(ordered[1:], definitions[1:]))
+    for (base_row, base_fields), (target_row, target_fields) in pairs:
+        before = base_fields.get(field_name)
+        after = target_fields.get(field_name)
+        if before is None:
+            status = "unchanged" if after is None else "added"
+        elif after is None:
+            status = "removed"
+        elif before["type"] != after["type"]:
+            status = "type_changed"
+        elif before["nullable"] and not after["nullable"]:
+            status = "nullable_tightened"
+        elif not before["nullable"] and after["nullable"]:
+            status = "nullable_loosened"
+        else:
+            status = "unchanged"
+
+        # Same start-field rule as the pairwise compatibility impact
+        # response: the base version's field and, when it still exists, the
+        # target version's same-named field.
+        start_ids = [
+            field_id
+            for field_id in (
+                _field_id_by_name(conn, base_row["id"], field_name),
+                _field_id_by_name(conn, target_row["id"], field_name),
+            )
+            if field_id is not None
+        ]
+        impacted = _compute_impacted_multi(conn, start_ids)
+        changes.append(
+            {
+                "base_version": base_row["version"],
+                "target_version": target_row["version"],
+                "status": status,
+                "impacted": impacted,
+                "impacted_datasets": sorted(
+                    {item["dataset"] for item in impacted}
+                ),
+            }
+        )
+
+    return {
+        "dataset": dataset["name"],
+        "field": field_name,
+        "trajectory": trajectory,
+        "changes": changes,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Lineage
 # --------------------------------------------------------------------------- #
 

@@ -81,6 +81,7 @@ from app.models import (
     VersionCompatibilityImpactResponse,
     VersionDiffResponse,
     VersionEvolutionSummaryResponse,
+    FieldTrajectoryResponse,
 )
 
 app = FastAPI(title="Data Lineage Trust Platform", version="0.1.0")
@@ -342,6 +343,45 @@ def get_schema_version_evolution_summary(
     )
     payload = json.dumps(
         summary.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only cross-version trajectory of a single field: its definition in
+# every schema version of the dataset plus the status change and downstream
+# impact of each adjacent step. The path carries only the dataset and field
+# names. The body is serialized directly (rather than through the default
+# JSON response) so the key order is fixed, the whitespace is compact and the
+# document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/fields/{field_name}/trajectory",
+    response_model=FieldTrajectoryResponse,
+)
+def get_field_version_trajectory(
+    request: Request,
+    dataset_name: str,
+    field_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset and field are
+    # known, preserving the same 404 precedence as the evolution summary.
+    # Nothing is written: version definitions, lineage mappings and the
+    # impact cache are all left untouched.
+    trajectory = FieldTrajectoryResponse(
+        **repository.get_field_version_trajectory(
+            conn,
+            dataset_name,
+            field_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        trajectory.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )
