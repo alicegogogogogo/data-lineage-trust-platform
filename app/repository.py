@@ -10,7 +10,7 @@ import sqlite3
 import threading
 from collections import Counter
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.errors import ConflictError, NotFoundError, RequestInvalidError
@@ -1704,6 +1704,9 @@ def _record_privacy_view_audit(
                 (version_id,),
             ).fetchone()
             sequence = (tail["max_sequence"] or 0) + 1
+            # All records of one batch share a single write time, so a view
+            # never straddles a UTC-day boundary in the audit log.
+            created_at = utc_now_iso()
             try:
                 for field, policy_id, masking in hits:
                     conn.execute(
@@ -1718,7 +1721,7 @@ def _record_privacy_view_audit(
                             policy_id,
                             role,
                             masking,
-                            utc_now_iso(),
+                            created_at,
                         ),
                     )
                     sequence += 1
@@ -1845,6 +1848,123 @@ def summarize_privacy_view_audit_records(
     return {
         "dataset": dataset["name"],
         "version": version_row["version"],
+        "groups": groups,
+    }
+
+
+def _utc_day(created_at: str) -> date:
+    """UTC calendar day of a stored hit-record write time."""
+    return datetime.fromisoformat(created_at).astimezone(timezone.utc).date()
+
+
+def _aggregate_audit_day(rows: list[sqlite3.Row]) -> dict[tuple, dict]:
+    """Per-group hit stats of one UTC calendar day.
+
+    One record is one hit; the first/last hit times are the earliest and
+    latest stored write times of the group's records.
+    """
+    stats: dict[tuple, dict] = {}
+    for row in rows:
+        key = (row["field"], row["policy_id"], row["role"], row["masking"])
+        entry = stats.get(key)
+        if entry is None:
+            stats[key] = {
+                "hit_count": 1,
+                "first_hit_at": row["created_at"],
+                "last_hit_at": row["created_at"],
+            }
+        else:
+            entry["hit_count"] += 1
+            entry["first_hit_at"] = min(entry["first_hit_at"], row["created_at"])
+            entry["last_hit_at"] = max(entry["last_hit_at"], row["created_at"])
+    return stats
+
+
+def diff_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only day-over-day diff of the masking-hit records of a version.
+
+    Records are bucketed into UTC calendar days by their write time; the two
+    most recent days with records are compared, the earlier day being the
+    baseline (``from_period``) and the later one the target (``to_period``).
+    Groups are keyed by ``(field, policy_id, role, masking)``: a group present
+    only in the target period is ``added``, only in the baseline ``removed``,
+    in both ``changed``. The missing side of an added/removed group is null
+    (never omitted) and counts as zero hits for ``hit_count_delta``. Groups
+    sort by the four keys ascending, never by database order. When the
+    records span fewer than two UTC calendar days the comparison is
+    explicitly empty (null periods, empty group list), never an error. The
+    diff is recomputed from the persisted records on every call: it caches
+    nothing and writes nothing.
+
+    Like the record list, the path dataset/version resolves first (404); a
+    non-empty request body or any query parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit diff endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit diff endpoint does not accept query "
+            "parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT field, policy_id, role, masking, created_at "
+        "FROM privacy_view_audit_records WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchall()
+
+    empty = {"from_period": None, "to_period": None, "groups": []}
+
+    by_day: dict[date, list[sqlite3.Row]] = {}
+    for row in rows:
+        by_day.setdefault(_utc_day(row["created_at"]), []).append(row)
+    if len(by_day) < 2:
+        return empty
+
+    from_day, to_day = sorted(by_day)[-2:]
+    before_stats = _aggregate_audit_day(by_day[from_day])
+    after_stats = _aggregate_audit_day(by_day[to_day])
+
+    groups: list[dict] = []
+    for key in sorted(set(before_stats) | set(after_stats)):
+        before = before_stats.get(key)
+        after = after_stats.get(key)
+        if before is None:
+            kind = "added"
+        elif after is None:
+            kind = "removed"
+        else:
+            kind = "changed"
+        groups.append(
+            {
+                "field": key[0],
+                "policy_id": key[1],
+                "role": key[2],
+                "masking": key[3],
+                "kind": kind,
+                "before": before,
+                "after": after,
+                "hit_count_delta": (after["hit_count"] if after is not None else 0)
+                - (before["hit_count"] if before is not None else 0),
+            }
+        )
+
+    return {
+        "from_period": from_day.isoformat(),
+        "to_period": to_day.isoformat(),
         "groups": groups,
     }
 

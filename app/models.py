@@ -338,6 +338,43 @@ class PrivacyViewAuditSummaryResponse(BaseModel):
     groups: list[PrivacyViewAuditSummaryGroup]
 
 
+# Read-only day-over-day comparison of the masking-hit records: the two most
+# recent UTC calendar days with records are compared (earlier day is the
+# baseline, later day the target). Recomputed from the persisted records on
+# every read; nothing is cached or written.
+PrivacyViewAuditDiffKind = Literal["added", "removed", "changed"]
+
+
+class PrivacyViewAuditDiffSide(BaseModel):
+    hit_count: int
+    first_hit_at: str
+    last_hit_at: str
+
+
+class PrivacyViewAuditDiffGroup(BaseModel):
+    field: str
+    policy_id: int
+    role: str
+    masking: PrivacyMasking
+    # "added" appears only in the target period, "removed" only in the
+    # baseline, "changed" in both.
+    kind: PrivacyViewAuditDiffKind
+    # Null on the side whose period has no record for this group; never
+    # omitted. A missing side counts as zero hits.
+    before: PrivacyViewAuditDiffSide | None
+    after: PrivacyViewAuditDiffSide | None
+    # Target-side hits minus baseline-side hits (a missing side is zero).
+    hit_count_delta: int
+
+
+class PrivacyViewAuditDiffResponse(BaseModel):
+    # Null (with an empty group list) when the records span fewer than two
+    # UTC calendar days.
+    from_period: str | None
+    to_period: str | None
+    groups: list[PrivacyViewAuditDiffGroup]
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #
