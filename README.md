@@ -288,6 +288,23 @@ data. Policies (including their enabled state) are persisted across restarts.
   endpoint takes no request body and no query parameters (`422`); unknown
   dataset/version → `404`, with the same 404-before-422 precedence as the
   record list.
+- `GET /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records/reconcile`
+  — read-only per-day cross-check of the access trail against the masking-hit
+  log, computed fresh from the persisted records on every read (no caching,
+  nothing is written). Records of both kinds are bucketed by the UTC calendar
+  day of their `created_at` write time. Response: `{"dataset", "version",
+  "days", "totals"}`. Each day item lists `day` (`YYYY-MM-DD`), `view_count`
+  (access records of the day), `masked_count` (the day's access records'
+  `masked_count` values summed), `hit_count` (hit records of the day) and
+  `consistent` (`true` exactly when the summed masked count equals the hit
+  count); a day with records of only one kind counts zero on the missing
+  side. Days sort by calendar date ascending and only days with at least one
+  record of either kind appear (recordless days are not zero-filled).
+  `totals` sums `view_count`, `masked_count` and `hit_count` over the whole
+  version, so each total equals the per-day values added up; with no records
+  at all `days` is empty and every total is zero. The endpoint takes no
+  request body and no query parameters (`422`); unknown dataset/version →
+  `404`, with the same 404-before-422 precedence as the record list.
 
 ### Sensitive-field identification
 

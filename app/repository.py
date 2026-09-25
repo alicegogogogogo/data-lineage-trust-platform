@@ -2210,6 +2210,99 @@ def diff_privacy_view_audit_records(
     return {"from_period": from_period, "to_period": to_period, "groups": groups}
 
 
+def reconcile_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only per-day cross-check of the access trail against the hit log.
+
+    Access records and masking-hit records are bucketed by the UTC calendar
+    day of their ``created_at`` write time. Each day that has at least one
+    record of either kind reports ``view_count`` (access records of the day),
+    ``masked_count`` (the day's access records' ``masked_count`` values summed)
+    and ``hit_count`` (hit records of the day); a day with records of only one
+    kind counts zero on the missing side. ``consistent`` is true exactly when
+    the day's summed masked count equals its hit count — the access record's
+    ``masked_count`` is the number of hit records the same view wrote, so the
+    two logs must agree day by day. Days sort by calendar date ascending,
+    never relying on database order, and days without any record of either
+    kind are simply absent (never zero-filled). ``totals`` sums the same three
+    counters over the whole version, so each total equals the per-day values
+    added up; with no records at all ``days`` is empty and every total is
+    zero.
+
+    The reconciliation is recomputed from the persisted records on every call:
+    it caches nothing, writes nothing and never touches either log. Like the
+    record list, the path dataset/version resolves first (404); a non-empty
+    request body or any query parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit reconcile endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit reconcile endpoint does not accept query "
+            "parameters"
+        )
+
+    access_rows = conn.execute(
+        "SELECT date(created_at) AS day, COUNT(*) AS view_count, "
+        "SUM(masked_count) AS masked_count "
+        "FROM privacy_view_access_records WHERE version_id = ? GROUP BY day",
+        (version_row["id"],),
+    ).fetchall()
+    hit_rows = conn.execute(
+        "SELECT date(created_at) AS day, COUNT(*) AS hit_count "
+        "FROM privacy_view_audit_records WHERE version_id = ? GROUP BY day",
+        (version_row["id"],),
+    ).fetchall()
+
+    per_day: dict[str, dict[str, int]] = {}
+    for row in access_rows:
+        counts = per_day.setdefault(
+            row["day"], {"view_count": 0, "masked_count": 0, "hit_count": 0}
+        )
+        counts["view_count"] = row["view_count"]
+        counts["masked_count"] = row["masked_count"]
+    for row in hit_rows:
+        counts = per_day.setdefault(
+            row["day"], {"view_count": 0, "masked_count": 0, "hit_count": 0}
+        )
+        counts["hit_count"] = row["hit_count"]
+
+    totals = {"view_count": 0, "masked_count": 0, "hit_count": 0}
+    days: list[dict] = []
+    for day in sorted(per_day):
+        counts = per_day[day]
+        days.append(
+            {
+                "day": day,
+                "view_count": counts["view_count"],
+                "masked_count": counts["masked_count"],
+                "hit_count": counts["hit_count"],
+                "consistent": counts["masked_count"] == counts["hit_count"],
+            }
+        )
+        for key in totals:
+            totals[key] += counts[key]
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "days": days,
+        "totals": totals,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #

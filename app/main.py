@@ -29,6 +29,7 @@ from app.models import (
     PrivacyViewAccessRecord,
     PrivacyViewAuditRecord,
     PrivacyViewAuditDiffResponse,
+    PrivacyViewAuditReconcileResponse,
     PrivacyViewAuditSummaryResponse,
     PrivacyViewRequest,
     PrivacyViewResponse,
@@ -733,6 +734,36 @@ def diff_privacy_view_audit_records(
     # preserving 404 precedence, exactly like the hit-record list.
     return PrivacyViewAuditDiffResponse(
         **repository.diff_privacy_view_audit_records(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+# Read-only per-day reconciliation appended after the hit-record query path.
+# Access records and hit records are aligned by the UTC calendar day of their
+# write time and their counts are cross-checked per day; the result is
+# recomputed from the persisted records on every read and never writes.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/audit-records/reconcile",
+    response_model=PrivacyViewAuditReconcileResponse,
+)
+def reconcile_privacy_view_audit_records(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> PrivacyViewAuditReconcileResponse:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/version is known,
+    # preserving 404 precedence, exactly like the hit-record list.
+    return PrivacyViewAuditReconcileResponse(
+        **repository.reconcile_privacy_view_audit_records(
             conn,
             dataset_name,
             version,
