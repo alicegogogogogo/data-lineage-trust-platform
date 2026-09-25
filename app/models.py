@@ -338,6 +338,36 @@ class PrivacyViewAuditSummaryResponse(BaseModel):
     groups: list[PrivacyViewAuditSummaryGroup]
 
 
+# Read-only day-over-day comparison of the masking-hit records: the records of
+# the two most recent UTC calendar days are grouped by
+# (field, policy, role, masking) and each side reports its hit count and the
+# timestamps of the group's earliest and latest records of that day. A group
+# present on only one side keeps a null ``before``/``after`` for the missing
+# side. Recomputed from the persisted records on every read; nothing is cached
+# or written.
+class PrivacyViewAuditDiffSide(BaseModel):
+    hit_count: int
+    first_hit_at: str
+    last_hit_at: str
+
+
+class PrivacyViewAuditDiffGroup(BaseModel):
+    field: str
+    policy_id: int
+    role: str
+    masking: PrivacyMasking
+    kind: Literal["added", "removed", "changed"]
+    before: PrivacyViewAuditDiffSide | None
+    after: PrivacyViewAuditDiffSide | None
+    hit_count_delta: int
+
+
+class PrivacyViewAuditDiffResponse(BaseModel):
+    from_period: str | None
+    to_period: str | None
+    groups: list[PrivacyViewAuditDiffGroup]
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #

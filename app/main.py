@@ -27,6 +27,7 @@ from app.models import (
     PrivacyPolicyCreate,
     PrivacyPolicyEnabledUpdate,
     PrivacyViewAuditRecord,
+    PrivacyViewAuditDiffResponse,
     PrivacyViewAuditSummaryResponse,
     PrivacyViewRequest,
     PrivacyViewResponse,
@@ -637,6 +638,35 @@ def get_privacy_view_audit_summary(
     # preserving 404 precedence, exactly like the hit-record list.
     return PrivacyViewAuditSummaryResponse(
         **repository.summarize_privacy_view_audit_records(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+# Read-only day-over-day comparison appended after the hit-record query path.
+# The two most recent UTC calendar days with records are compared; the diff is
+# recomputed from the persisted records on every read and never writes.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/audit-records/diff",
+    response_model=PrivacyViewAuditDiffResponse,
+)
+def diff_privacy_view_audit_records(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> PrivacyViewAuditDiffResponse:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/version is known,
+    # preserving 404 precedence, exactly like the hit-record list.
+    return PrivacyViewAuditDiffResponse(
+        **repository.diff_privacy_view_audit_records(
             conn,
             dataset_name,
             version,

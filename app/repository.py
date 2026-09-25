@@ -1704,6 +1704,8 @@ def _record_privacy_view_audit(
                 (version_id,),
             ).fetchone()
             sequence = (tail["max_sequence"] or 0) + 1
+            # All records of one view request share a single write timestamp.
+            created_at = utc_now_iso()
             try:
                 for field, policy_id, masking in hits:
                     conn.execute(
@@ -1718,7 +1720,7 @@ def _record_privacy_view_audit(
                             policy_id,
                             role,
                             masking,
-                            utc_now_iso(),
+                            created_at,
                         ),
                     )
                     sequence += 1
@@ -1847,6 +1849,115 @@ def summarize_privacy_view_audit_records(
         "version": version_row["version"],
         "groups": groups,
     }
+
+
+def diff_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only day-over-day diff of the masking-hit records of a version.
+
+    Records are bucketed by the UTC calendar day of their ``created_at`` write
+    time; the two most recent days with records are compared, the earlier day
+    being the baseline (``from_period``) and the later one the target
+    (``to_period``). Each side is grouped by ``(field, policy_id, role,
+    masking)``; a group reports its record count (one record is one hit) and
+    the earliest/latest ``created_at`` of its records of that day. A group
+    present on both days is ``changed``; one only on the target day is
+    ``added`` and one only on the baseline day is ``removed``. The missing
+    side of a one-sided group is null (never omitted) and counts as zero in
+    ``hit_count_delta`` (target minus baseline). Groups sort by field, policy
+    id, role and masking, all ascending, never relying on database order.
+
+    With fewer than two calendar days of records the comparison is explicitly
+    empty (null periods, empty group list), never an error. The diff is
+    recomputed from the persisted records on every call: it caches nothing,
+    writes nothing and never touches the hit records.
+
+    Like the record list, the path dataset/version resolves first (404); a
+    non-empty request body or any query parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit diff endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit diff endpoint does not accept query "
+            "parameters"
+        )
+
+    day_rows = conn.execute(
+        "SELECT DISTINCT date(created_at) AS day "
+        "FROM privacy_view_audit_records WHERE version_id = ? "
+        "ORDER BY day DESC LIMIT 2",
+        (version_row["id"],),
+    ).fetchall()
+
+    if len(day_rows) < 2:
+        return {"from_period": None, "to_period": None, "groups": []}
+
+    to_period = day_rows[0]["day"]
+    from_period = day_rows[1]["day"]
+
+    rows = conn.execute(
+        "SELECT field, policy_id, role, masking, date(created_at) AS day, "
+        "COUNT(*) AS hit_count, "
+        "MIN(created_at) AS first_hit_at, "
+        "MAX(created_at) AS last_hit_at "
+        "FROM privacy_view_audit_records "
+        "WHERE version_id = ? AND date(created_at) IN (?, ?) "
+        "GROUP BY field, policy_id, role, masking, day",
+        (version_row["id"], from_period, to_period),
+    ).fetchall()
+
+    def side(row: sqlite3.Row) -> dict:
+        return {
+            "hit_count": row["hit_count"],
+            "first_hit_at": row["first_hit_at"],
+            "last_hit_at": row["last_hit_at"],
+        }
+
+    by_key: dict[tuple, dict[str, dict | None]] = {}
+    for row in rows:
+        key = (row["field"], row["policy_id"], row["role"], row["masking"])
+        entry = by_key.setdefault(key, {"before": None, "after": None})
+        entry["before" if row["day"] == from_period else "after"] = side(row)
+
+    groups: list[dict] = []
+    for key in sorted(by_key):
+        field, policy_id, role, masking = key
+        before = by_key[key]["before"]
+        after = by_key[key]["after"]
+        if before is None:
+            kind = "added"
+        elif after is None:
+            kind = "removed"
+        else:
+            kind = "changed"
+        groups.append(
+            {
+                "field": field,
+                "policy_id": policy_id,
+                "role": role,
+                "masking": masking,
+                "kind": kind,
+                "before": before,
+                "after": after,
+                "hit_count_delta": (after or {"hit_count": 0})["hit_count"]
+                - (before or {"hit_count": 0})["hit_count"],
+            }
+        )
+
+    return {"from_period": from_period, "to_period": to_period, "groups": groups}
 
 
 # --------------------------------------------------------------------------- #
