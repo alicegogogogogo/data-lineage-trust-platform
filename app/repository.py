@@ -1704,13 +1704,31 @@ def _append_privacy_view_audit_batch(
     """Insert all hit records of one view as the next sequences of the version.
 
     All records of one view request share a single write timestamp.
+
+    Sequences come from the version's high-water counter rather than
+    ``MAX(sequence)``: confirmed cleanup requests delete records (so the max
+    would move backwards), but the counter survives those deletions, keeping
+    the run continuous with no reused sequence. A database created before the
+    counter existed seeds it from the current maximum once.
     """
+    # Connections already seed every version's counter, so this only covers a
+    # version whose row somehow does not exist yet. INSERT OR IGNORE avoids
+    # the parser ambiguity between ON CONFLICT and a join ON after a SELECT.
+    conn.execute(
+        "INSERT OR IGNORE INTO privacy_view_audit_sequences "
+        "(version_id, next_sequence) "
+        "SELECT ?, COALESCE(("
+        "SELECT MAX(sequence) FROM privacy_view_audit_records "
+        "WHERE version_id = ?"
+        "), 0) + 1",
+        (version_id, version_id),
+    )
     tail = conn.execute(
-        "SELECT MAX(sequence) AS max_sequence "
-        "FROM privacy_view_audit_records WHERE version_id = ?",
+        "SELECT next_sequence FROM privacy_view_audit_sequences "
+        "WHERE version_id = ?",
         (version_id,),
     ).fetchone()
-    sequence = (tail["max_sequence"] or 0) + 1
+    sequence = tail["next_sequence"]
     # All records of one view request share a single write timestamp.
     created_at = utc_now_iso()
     for field, policy_id, masking in hits:
@@ -1730,6 +1748,11 @@ def _append_privacy_view_audit_batch(
             ),
         )
         sequence += 1
+    conn.execute(
+        "UPDATE privacy_view_audit_sequences SET next_sequence = ? "
+        "WHERE version_id = ?",
+        (sequence, version_id),
+    )
 
 
 def _append_privacy_view_access_record(
@@ -2435,6 +2458,322 @@ def trend_privacy_view_audit_records(
             "day_count": len(all_days),
         },
     }
+
+
+# --------------------------------------------------------------------------- #
+# Privacy view masking-hit cleanup requests (preview then two-stage confirm)
+# --------------------------------------------------------------------------- #
+
+
+# Fields accepted by a cleanup-request creation body; anything else is a 422.
+_PRIVACY_VIEW_AUDIT_CLEANUP_FIELDS: frozenset[str] = frozenset(
+    {"reason", "before"}
+)
+
+
+def _parse_cleanup_request_body(body: bytes) -> tuple[str, str, datetime]:
+    """Validate and parse a raw cleanup-request creation body.
+
+    The body must be a JSON object carrying exactly ``reason`` (a non-empty
+    string after trimming whitespace) and ``before`` (an ISO-8601 date-time
+    carrying a timezone). Returns the reason, the raw ``before`` string (echoed
+    back verbatim) and the parsed cutoff. Every structural problem is a 422;
+    the request row is written only afterwards.
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    extra_keys = sorted(set(payload) - _PRIVACY_VIEW_AUDIT_CLEANUP_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError(
+            "Unknown field(s): " + ", ".join(extra_keys)
+        )
+
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise RequestInvalidError("'reason' must be a non-empty string")
+
+    raw_before = payload.get("before")
+    if not isinstance(raw_before, str):
+        raise RequestInvalidError(
+            "'before' must be an ISO-8601 date-time with a timezone"
+        )
+    try:
+        before_at = datetime.fromisoformat(raw_before)
+    except ValueError as exc:
+        raise RequestInvalidError(
+            "'before' must be an ISO-8601 date-time with a timezone"
+        ) from exc
+    if before_at.tzinfo is None or before_at.utcoffset() is None:
+        raise RequestInvalidError("'before' must include a timezone")
+    return reason, raw_before, before_at
+
+
+def _reject_cleanup_query_parameters(query_keys: tuple[str, ...], *, what: str) -> None:
+    if query_keys:
+        raise RequestInvalidError(
+            f"The privacy view audit record cleanup {what} endpoint does not "
+            "accept query parameters"
+        )
+
+
+def _cleanup_preview_for_rows(rows: list[sqlite3.Row]) -> dict:
+    """Build the preview block from the selected target rows."""
+    if not rows:
+        return {"hit_count": 0, "first_hit_at": None, "last_hit_at": None,
+                "fields": []}
+    # The rows arrive sequence-ascending; the earliest and latest are picked
+    # by parsed write time, never relying on the database's natural order or
+    # on text collation.
+    earliest = latest = rows[0]
+    for row in rows[1:]:
+        if datetime.fromisoformat(row["created_at"]) < datetime.fromisoformat(
+            earliest["created_at"]
+        ):
+            earliest = row
+        if datetime.fromisoformat(row["created_at"]) > datetime.fromisoformat(
+            latest["created_at"]
+        ):
+            latest = row
+    return {
+        "hit_count": len(rows),
+        "first_hit_at": earliest["created_at"],
+        "last_hit_at": latest["created_at"],
+        "fields": sorted({row["field"] for row in rows}),
+    }
+
+
+def _cleanup_request_row_to_dict(row: sqlite3.Row) -> dict:
+    result = {
+        "id": row["id"],
+        "reason": row["reason"],
+        "before": row["before"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "preview": json.loads(row["preview"]),
+    }
+    if row["status"] == "confirmed":
+        result["confirmed_at"] = row["confirmed_at"]
+        result["deleted_count"] = row["deleted_count"]
+    return result
+
+
+def create_privacy_view_audit_cleanup_request(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Create a cleanup request and return its fixed preview.
+
+    Only records whose hit write time is strictly earlier than ``before`` are
+    selected; the selected set is frozen into
+    ``privacy_view_audit_cleanup_targets`` at creation, so later writes never
+    enter this request. Nothing is deleted or modified. At most one pending
+    request may exist per version (409).
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    reason, raw_before, before_at = _parse_cleanup_request_body(body)
+    _reject_cleanup_query_parameters(query_keys, what="request")
+    clean_reason = reason.strip()
+
+    open_request = conn.execute(
+        "SELECT id FROM privacy_view_audit_cleanup_requests "
+        "WHERE version_id = ? AND status = 'pending'",
+        (version_row["id"],),
+    ).fetchone()
+    if open_request is not None:
+        raise ConflictError(
+            f"Version {version_number} of dataset '{dataset_name}' already has "
+            f"a pending masking-hit cleanup request ({open_request['id']})"
+        )
+
+    # Fix the target set at creation time: only records written strictly
+    # before the cutoff participate, and later writes are out of scope even if
+    # they would otherwise match.
+    rows = conn.execute(
+        "SELECT id, field, created_at FROM privacy_view_audit_records "
+        "WHERE version_id = ? ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    target_rows = [
+        row
+        for row in rows
+        if datetime.fromisoformat(row["created_at"]) < before_at
+    ]
+    preview = _cleanup_preview_for_rows(target_rows)
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO privacy_view_audit_cleanup_requests ("
+            "version_id, reason, before, status, preview, deleted_count, "
+            "created_at"
+            ") VALUES (?, ?, ?, 'pending', ?, NULL, ?)",
+            (
+                version_row["id"],
+                clean_reason,
+                raw_before,
+                json.dumps(preview),
+                utc_now_iso(),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        # Lost a race against a concurrent pending-request insert.
+        raise ConflictError(
+            f"Version {version_number} of dataset '{dataset_name}' already has "
+            "a pending masking-hit cleanup request"
+        ) from exc
+    request_id = cursor.lastrowid
+    conn.executemany(
+        "INSERT INTO privacy_view_audit_cleanup_targets "
+        "(request_id, audit_record_id) VALUES (?, ?)",
+        [(request_id, row["id"]) for row in target_rows],
+    )
+    stored = conn.execute(
+        "SELECT * FROM privacy_view_audit_cleanup_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()
+    return _cleanup_request_row_to_dict(stored)
+
+
+def list_privacy_view_audit_cleanup_requests(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """List a version's cleanup requests by request id ascending.
+
+    Confirmed requests remain listed forever; requests survive process
+    restarts. Read-only and parameterless, with the same 404-before-422
+    precedence as the masking-hit record list.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit record cleanup request list endpoint does "
+            "not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit record cleanup request list endpoint does "
+            "not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM privacy_view_audit_cleanup_requests "
+        "WHERE version_id = ? ORDER BY id ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return [_cleanup_request_row_to_dict(row) for row in rows]
+
+
+def _get_scoped_cleanup_request_row(
+    conn: sqlite3.Connection, version_id: int, request_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM privacy_view_audit_cleanup_requests "
+        "WHERE id = ? AND version_id = ?",
+        (request_id, version_id),
+    ).fetchone()
+
+
+def confirm_privacy_view_audit_cleanup_request(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    request_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Confirm a cleanup request, atomically deleting its frozen targets.
+
+    The record deletion and the status change commit together: either both
+    take effect or neither does. A request that is already confirmed is a 409
+    and its records are never touched again.
+    """
+    # Take the write lock before any read so two concurrent confirms cannot
+    # deadlock on a read-then-upgrade race: the loser blocks here until the
+    # winner commits, then sees status 'confirmed' and fails with 409.
+    conn.execute("BEGIN IMMEDIATE")
+
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    request_row = _get_scoped_cleanup_request_row(
+        conn, version_row["id"], request_id
+    )
+    if request_row is None:
+        raise NotFoundError(
+            f"Masking-hit cleanup request {request_id} does not exist for "
+            f"version {version_number} of dataset '{dataset_name}'"
+        )
+
+    # Resource resolution (dataset/version/request) precedes request-content
+    # validation, preserving the 404-before-422 precedence of the hit-record
+    # reads.
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit record cleanup confirm endpoint does not "
+            "accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit record cleanup confirm endpoint does not "
+            "accept query parameters"
+        )
+
+    if request_row["status"] != "pending":
+        raise ConflictError(
+            f"Masking-hit cleanup request {request_id} is "
+            f"'{request_row['status']}'; only pending requests can be confirmed"
+        )
+
+    # The database-level immutability trigger allows exactly these rows: the
+    # frozen target set of this request. Deleting and confirming ride one
+    # transaction, so a crash or a lost race can never leave the records half
+    # deleted.
+    deleted_cursor = conn.execute(
+        "DELETE FROM privacy_view_audit_records WHERE id IN ("
+        "SELECT audit_record_id FROM privacy_view_audit_cleanup_targets "
+        "WHERE request_id = ?"
+        ")",
+        (request_id,),
+    )
+    deleted_count = deleted_cursor.rowcount
+    confirmed_at = utc_now_iso()
+    updated_cursor = conn.execute(
+        "UPDATE privacy_view_audit_cleanup_requests "
+        "SET status = 'confirmed', confirmed_at = ?, deleted_count = ? "
+        "WHERE id = ? AND status = 'pending'",
+        (confirmed_at, deleted_count, request_id),
+    )
+    if updated_cursor.rowcount == 0:
+        # Another process confirmed it first; roll the delete back and report
+        # the conflict.
+        raise ConflictError(
+            f"Masking-hit cleanup request {request_id} is already confirmed"
+        )
+
+    updated = conn.execute(
+        "SELECT * FROM privacy_view_audit_cleanup_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()
+    return _cleanup_request_row_to_dict(updated)
 
 
 # --------------------------------------------------------------------------- #

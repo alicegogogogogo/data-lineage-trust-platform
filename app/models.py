@@ -445,6 +445,39 @@ class PrivacyViewAuditTrendResponse(BaseModel):
     totals: PrivacyViewAuditTrendTotals
 
 
+# Two-stage preview/confirm cleanup of masking-hit records. A request is
+# created with a reason and a timezone-bearing ``before`` cutoff; creating one
+# only previews the target set (records whose hit time is earlier than the
+# cutoff) and never deletes anything. The target set is fixed at creation, so
+# the preview block is stored with the request and stays identical after a
+# later confirmation removes the records. Creation bodies are parsed from raw
+# bytes in the repository (rather than through a Pydantic request model) so
+# that unknown dataset/version keeps its 404 precedence over body-level 422s.
+class PrivacyViewAuditCleanupPreview(BaseModel):
+    hit_count: int
+    first_hit_at: str | None
+    last_hit_at: str | None
+    fields: list[str]
+
+
+class PrivacyViewAuditCleanupRequest(BaseModel):
+    id: int
+    reason: str
+    before: str
+    status: Literal["pending", "confirmed"]
+    created_at: str
+    preview: PrivacyViewAuditCleanupPreview
+
+
+# Confirmation freezes the request: the response adds the confirmation time
+# and the number of records actually deleted. Re-confirming a confirmed
+# request is a 409 and never touches data again.
+class ConfirmedPrivacyViewAuditCleanupRequest(PrivacyViewAuditCleanupRequest):
+    confirmed_at: str
+    deleted_count: int
+
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #

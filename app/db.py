@@ -177,6 +177,60 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (version_id, sequence)
     )
     """,
+    # High-water allocator for masking-hit sequences. Cleaning removes hit
+    # records (so MAX(sequence) can no longer be used to continue the run),
+    # but this counter survives those deletions: new hits keep the continuous,
+    # never-reused sequence rule. One row per version that has ever written a
+    # hit record; ``next_sequence`` is the sequence of the next hit to append.
+    """
+    CREATE TABLE IF NOT EXISTS privacy_view_audit_sequences (
+        version_id    INTEGER PRIMARY KEY
+                      REFERENCES schema_versions(id) ON DELETE CASCADE,
+        next_sequence INTEGER NOT NULL CHECK (next_sequence >= 1)
+    )
+    """,
+    # Two-stage preview/confirm cleanup of masking-hit records. A request is
+    # created under a version's hit-record collection with a reason and a
+    # timezone-bearing ``before`` cutoff; its target set is fixed at creation
+    # time (snapshotted in privacy_view_audit_cleanup_targets) and only removed
+    # when the request is confirmed. ``preview`` keeps the exact preview block
+    # returned at creation so the request stays fully readable after the target
+    # records have been deleted. The version link is a plain integer, mirroring
+    # snapshot_deletion_requests.
+    """
+    CREATE TABLE IF NOT EXISTS privacy_view_audit_cleanup_requests (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id    INTEGER NOT NULL,
+        reason        TEXT NOT NULL,
+        before        TEXT NOT NULL,
+        status        TEXT NOT NULL CHECK (status IN ('pending', 'confirmed')),
+        preview       TEXT NOT NULL,
+        deleted_count INTEGER CHECK (deleted_count IS NULL OR deleted_count >= 0),
+        created_at    TEXT NOT NULL,
+        confirmed_at  TEXT
+    )
+    """,
+    # At most one pending cleanup request per version; a confirmed request
+    # never blocks a new one.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_privacy_view_audit_cleanup_one_pending
+    ON privacy_view_audit_cleanup_requests (version_id)
+    WHERE status = 'pending'
+    """,
+    # Frozen target set of a cleanup request: one row per masking-hit record
+    # the request selected at creation time. Rows are retained after the
+    # records are deleted, keeping the request history and the delete trigger's
+    # decision auditable.
+    """
+    CREATE TABLE IF NOT EXISTS privacy_view_audit_cleanup_targets (
+        request_id      INTEGER NOT NULL
+                        REFERENCES privacy_view_audit_cleanup_requests(id)
+                        ON DELETE CASCADE,
+        audit_record_id INTEGER NOT NULL,
+        PRIMARY KEY (request_id, audit_record_id)
+    )
+    """,
     # Candidate sensitive-field identification results, one per (version,
     # field): a re-run refreshes evidence/confidence/field_type in place while
     # the id and created_at stay fixed. The submitted samples are deliberately
@@ -368,9 +422,20 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         SELECT RAISE(ABORT, 'privacy view audit records are immutable');
     END
     """,
+    # Privacy view audit records are append-only apart from the two-stage
+    # cleanup flow: the database refuses updates outright and refuses deletes
+    # except for records frozen as the target of a cleanup request (see
+    # privacy_view_audit_cleanup_targets). The trigger is dropped and recreated
+    # so databases initialized by an earlier revision pick up the gated form.
+    "DROP TRIGGER IF EXISTS trg_privacy_view_audit_records_no_delete",
     """
     CREATE TRIGGER IF NOT EXISTS trg_privacy_view_audit_records_no_delete
     BEFORE DELETE ON privacy_view_audit_records
+    FOR EACH ROW
+    WHEN NOT EXISTS (
+        SELECT 1 FROM privacy_view_audit_cleanup_targets
+        WHERE audit_record_id = OLD.id
+    )
     BEGIN
         SELECT RAISE(ABORT, 'privacy view audit records are immutable');
     END
@@ -408,6 +473,23 @@ def _connect() -> sqlite3.Connection:
     # request works against an initialized database file.
     for statement in SCHEMA_STATEMENTS:
         conn.execute(statement)
+    # Establish every version's sequence high-water before any cleanup-aware
+    # code can delete records: at this point the surviving maximum equals the
+    # historical maximum, so seeding here (and INSERT OR IGNORE on every later
+    # connect) keeps the counter ahead of cleaned sequences forever.
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO privacy_view_audit_sequences
+            (version_id, next_sequence)
+        SELECT versions.id,
+               COALESCE((
+                   SELECT MAX(records.sequence)
+                   FROM privacy_view_audit_records AS records
+                   WHERE records.version_id = versions.id
+               ), 0) + 1
+        FROM schema_versions AS versions
+        """
+    )
     conn.commit()
     return conn
 

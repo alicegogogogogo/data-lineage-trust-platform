@@ -306,6 +306,52 @@ data. Policies (including their enabled state) are persisted across restarts.
   per-policy day union). The endpoint takes no request body and no query
   parameters (`422`); unknown dataset/version → `404`, with the same
   404-before-422 precedence as the record list.
+- `POST /datasets/{dataset}/versions/{version}/privacy-policies/view/audit-records/cleanup-requests`
+  — open a two-stage retention cleanup request for the version's masking-hit
+  records. Body contains exactly `reason` and `before`:
+  `{"reason": "legal hold expired", "before": "2026-01-01T00:00:00Z"}`.
+  `reason` must be a string that is non-empty after trimming whitespace;
+  `before` must be an ISO-8601 date-time carrying a timezone (offset or `Z`),
+  and a record belongs to the target set only when its hit write time is
+  strictly earlier than that instant. Creating a request only returns a
+  preview — no hit record is deleted or modified, and the record list,
+  search, summary, diff, reconcile and trend responses stay unchanged.
+  Returns `201` with `id`, `reason` (trimmed), `before` (echoed as
+  submitted), `status` (`pending`), `created_at` and a `preview` block:
+  `hit_count` (the number of records that would be cleaned up),
+  `first_hit_at` / `last_hit_at` (the earliest and latest hit times in the
+  target set, `null` when the set is empty) and `fields` (the distinct field
+  names involved, sorted ascending; `[]` when empty). The target set is
+  fixed at creation time: masking-hit records written afterwards never enter
+  the request even when they precede the cutoff by clock time. At most one
+  pending request may exist per version; creating another while one is open
+  returns `409` and writes nothing (confirmed requests never block a new
+  one). Unknown dataset/version → `404`; missing/non-string/blank `reason`,
+  missing/unparseable/timezone-less `before`, an extra body field, a
+  non-JSON/non-object body or any query parameter → `422` and nothing is
+  written, with 404 taking precedence.
+- `GET .../privacy-policies/view/audit-records/cleanup-requests` — list the
+  version's cleanup requests sorted by request `id` ascending (empty when
+  there are none). Confirmed requests stay listed and requests survive
+  process restarts. The endpoint takes no request body and no query
+  parameters (`422`); unknown dataset/version → `404`.
+- `POST .../privacy-policies/view/audit-records/cleanup-requests/{request_id}/confirm`
+  — confirm a request with an empty request body and no query parameters.
+  Confirmation atomically deletes exactly the target set frozen at creation
+  and sets `status` to `confirmed`; the response is the request plus
+  `confirmed_at` and `deleted_count` (the number of records actually
+  deleted, possibly zero). Confirming an already-confirmed request returns
+  `409` and never changes data again; concurrent confirmations have exactly
+  one winner (the others get `409`) and can never leave the records half
+  deleted. After a cleanup the surviving hit records keep their original
+  `sequence` numbers and later hits continue the existing increasing run
+  without reusing cleaned numbers; the record list and search return only
+  surviving records, and summary, trend, diff and reconcile recompute from
+  them. Access records are not cleaned up and the processing-task audit
+  chain remains immutable. A request body or query parameter on the confirm
+  endpoint → `422`; unknown dataset/version/request → `404` (precedence
+  matches the hit-record reads), and confirming a confirmed request →
+  `409`.
 
 ### Sensitive-field identification
 

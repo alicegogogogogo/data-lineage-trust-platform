@@ -32,6 +32,8 @@ from app.models import (
     PrivacyViewAuditReconcileResponse,
     PrivacyViewAuditSummaryResponse,
     PrivacyViewAuditTrendResponse,
+    PrivacyViewAuditCleanupRequest,
+    ConfirmedPrivacyViewAuditCleanupRequest,
     PrivacyViewRequest,
     PrivacyViewResponse,
     ProcessingRunCancel,
@@ -798,6 +800,94 @@ def get_privacy_view_audit_trend(
             conn,
             dataset_name,
             version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+# Two-stage preview/confirm cleanup of masking-hit records, nested under the
+# version's hit-record collection. Creating a request only freezes and returns
+# a preview — no record is deleted; a subsequent confirm removes exactly the
+# frozen target set atomically.
+PRIVACY_VIEW_AUDIT_CLEANUP_REQUESTS_PATH = (
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/audit-records/cleanup-requests"
+)
+
+
+@app.post(
+    PRIVACY_VIEW_AUDIT_CLEANUP_REQUESTS_PATH,
+    response_model=PrivacyViewAuditCleanupRequest,
+    status_code=201,
+)
+def create_privacy_view_audit_cleanup_request(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> PrivacyViewAuditCleanupRequest:
+    # The body is parsed in the repository (after the path dataset/version
+    # resolves) so a missing/malformed/extra field stays a 422 while an
+    # unknown dataset or version keeps its 404 precedence.
+    return PrivacyViewAuditCleanupRequest(
+        **repository.create_privacy_view_audit_cleanup_request(
+            conn,
+            dataset_name,
+            version,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.get(
+    PRIVACY_VIEW_AUDIT_CLEANUP_REQUESTS_PATH,
+    response_model=list[PrivacyViewAuditCleanupRequest],
+)
+def list_privacy_view_audit_cleanup_requests(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[PrivacyViewAuditCleanupRequest]:
+    # Read-only and parameterless, with the same 404-before-422 precedence as
+    # the masking-hit record list.
+    return [
+        PrivacyViewAuditCleanupRequest(**cleanup_request)
+        for cleanup_request in repository.list_privacy_view_audit_cleanup_requests(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+
+
+@app.post(
+    f"{PRIVACY_VIEW_AUDIT_CLEANUP_REQUESTS_PATH}/{{request_id}}/confirm",
+    response_model=ConfirmedPrivacyViewAuditCleanupRequest,
+)
+def confirm_privacy_view_audit_cleanup_request(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    request_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> ConfirmedPrivacyViewAuditCleanupRequest:
+    # Empty body and no query parameters; both are 422 checked in the
+    # repository after the path dataset/version/request resolves, so a missing
+    # resource stays a 404 and an already-confirmed request stays a 409.
+    return ConfirmedPrivacyViewAuditCleanupRequest(
+        **repository.confirm_privacy_view_audit_cleanup_request(
+            conn,
+            dataset_name,
+            version,
+            request_id,
             body=body,
             query_keys=tuple(request.query_params.keys()),
         )
