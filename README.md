@@ -87,6 +87,32 @@ traces.
   is deterministic (fixed key order, compact whitespace, exactly one trailing
   newline). The read is fully side-effect free: version definitions, lineage
   mappings and the impact cache are never written.
+- `GET /datasets/{dataset}/evolution-summary` — read-only whole-dataset
+  summary of adjacent-version breaking changes and their downstream impact,
+  computed fresh on every read (no caching; nothing is written, and version
+  definitions, lineage mappings and the impact cache are never touched).
+  Quality and privacy state play no role. The path carries only the dataset
+  name; the request takes no body and no query parameters (`422`); an unknown
+  dataset → `404`, with the same 404-before-422 precedence as the
+  compatibility reads. A dataset with fewer than two versions returns `200`
+  with an empty `pairs` array and all-zero totals, never an error. The JSON
+  document is deterministic (fixed key order, compact whitespace, exactly one
+  trailing newline) with top-level keys `dataset`, `pairs` and `totals`.
+  `pairs` is ordered by base version number ascending and lists every
+  adjacent version pair, including pairs without breaking changes; each entry
+  has exactly `base_version`, `target_version`, `breaking_count`,
+  `impacted_count` and `impacted_datasets` in that order. `breaking_count` is
+  the number of breaking entries of the pair, judged exactly as in the
+  pairwise compatibility impact response (`removed`, `type_changed` or
+  `nullable_tightened`; several changes of one field collapse into a single
+  entry). The pair's impacted set is the union of every breaking entry's
+  downstream fields — same start-field rule as the pairwise impact response,
+  merged and deduplicated, never containing a start field itself (cycles
+  terminate) — `impacted_count` is its size and `impacted_datasets` lists the
+  distinct dataset names appearing in it, sorted ascending. `totals` has
+  exactly `pair_count` (the number of pairs), `breaking_count` and
+  `impacted_count`, each the sum of the per-pair values over the whole
+  dataset.
 
 ### Field-level lineage
 

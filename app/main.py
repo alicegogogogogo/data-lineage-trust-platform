@@ -80,6 +80,7 @@ from app.models import (
     VersionCompatibilityResponse,
     VersionCompatibilityImpactResponse,
     VersionDiffResponse,
+    VersionEvolutionSummaryResponse,
 )
 
 app = FastAPI(title="Data Lineage Trust Platform", version="0.1.0")
@@ -305,6 +306,42 @@ def check_schema_version_compatibility_impact(
     )
     payload = json.dumps(
         impact.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only whole-dataset summary of adjacent-version breaking changes and
+# their downstream impact. The path carries only the dataset name. The body is
+# serialized directly (rather than through the default JSON response) so the
+# key order is fixed, the whitespace is compact and the document ends with
+# exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/evolution-summary",
+    response_model=VersionEvolutionSummaryResponse,
+)
+def get_schema_version_evolution_summary(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset is known,
+    # preserving the same 404 precedence as the compatibility reads. Nothing
+    # is written: version definitions, lineage mappings and the impact cache
+    # are all left untouched.
+    summary = VersionEvolutionSummaryResponse(
+        **repository.summarize_schema_version_evolution(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        summary.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

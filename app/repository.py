@@ -415,6 +415,65 @@ def _compute_impacted_multi(
     return [impacted[key] for key in sorted(impacted)]
 
 
+def _breaking_changes_with_impact(
+    conn: sqlite3.Connection,
+    base_row: sqlite3.Row,
+    target_row: sqlite3.Row,
+) -> list[dict]:
+    """Breaking-change entries of the target version against the base.
+
+    Shared by the pairwise compatibility impact check and the per-dataset
+    evolution summary. A breaking change is exactly one of ``removed``,
+    ``type_changed`` or ``nullable_tightened``; a field with several changes
+    collapses into one entry, a type change winning over a nullable
+    tightening. Each entry additionally carries ``impacted``: every field
+    directly or indirectly downstream of the broken field along the lineage
+    mappings. The traversal starts from the same-named field of the base
+    version and, when the field still exists in the target version, also from
+    the target version's field; the merged set is deduplicated, never
+    contains a start field itself (cycles terminate) and is sorted by
+    dataset, version and field ascending. Entries are sorted by field name.
+    """
+    base_fields = _version_field_definitions(conn, base_row["id"])
+    target_fields = _version_field_definitions(conn, target_row["id"])
+
+    breaking_changes: list[dict] = []
+    for name in sorted(set(base_fields) | set(target_fields)):
+        before = base_fields.get(name)
+        after = target_fields.get(name)
+        if before is None:
+            # Added in the target: never breaking.
+            continue
+        if after is None:
+            kind = "removed"
+        elif before["type"] != after["type"]:
+            kind = "type_changed"
+        elif before["nullable"] and not after["nullable"]:
+            kind = "nullable_tightened"
+        else:
+            continue
+
+        # The base version always has the broken field; the target version's
+        # same-named field joins the traversal only when it still exists.
+        start_ids = [_field_id_by_name(conn, base_row["id"], name)]
+        if after is not None:
+            start_ids.append(_field_id_by_name(conn, target_row["id"], name))
+        impacted = _compute_impacted_multi(
+            conn, [field_id for field_id in start_ids if field_id is not None]
+        )
+
+        breaking_changes.append(
+            {
+                "field": name,
+                "kind": kind,
+                "before": before,
+                "after": after,
+                "impacted": impacted,
+            }
+        )
+    return breaking_changes
+
+
 def check_schema_version_compatibility_impact(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -467,50 +526,95 @@ def check_schema_version_compatibility_impact(
             "parameters"
         )
 
-    base_fields = _version_field_definitions(conn, base_row["id"])
-    target_fields = _version_field_definitions(conn, target_row["id"])
-
-    breaking_changes: list[dict] = []
-    for name in sorted(set(base_fields) | set(target_fields)):
-        before = base_fields.get(name)
-        after = target_fields.get(name)
-        if before is None:
-            # Added in the target: never breaking.
-            continue
-        if after is None:
-            kind = "removed"
-        elif before["type"] != after["type"]:
-            kind = "type_changed"
-        elif before["nullable"] and not after["nullable"]:
-            kind = "nullable_tightened"
-        else:
-            continue
-
-        # The base version always has the broken field; the target version's
-        # same-named field joins the traversal only when it still exists.
-        start_ids = [_field_id_by_name(conn, base_row["id"], name)]
-        if after is not None:
-            start_ids.append(_field_id_by_name(conn, target_row["id"], name))
-        impacted = _compute_impacted_multi(
-            conn, [field_id for field_id in start_ids if field_id is not None]
-        )
-
-        breaking_changes.append(
-            {
-                "field": name,
-                "kind": kind,
-                "before": before,
-                "after": after,
-                "impacted": impacted,
-            }
-        )
-
+    breaking_changes = _breaking_changes_with_impact(conn, base_row, target_row)
     return {
         "base_version": base_row["version"],
         "target_version": target_row["version"],
         "breaking_changes": breaking_changes,
         "breaking_change_count": len(breaking_changes),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Read-only per-dataset adjacent-version evolution summary
+# --------------------------------------------------------------------------- #
+
+
+def summarize_schema_version_evolution(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only summary of adjacent-version breaking changes and impact.
+
+    One entry per adjacent version pair of the dataset, ordered by base
+    version number ascending; a pair with no breaking change is listed with
+    zero counts. The breaking entries of a pair are exactly those of
+    :func:`check_schema_version_compatibility_impact` (``removed``,
+    ``type_changed`` or ``nullable_tightened``, several changes of one field
+    collapsing into a single entry) and ``breaking_count`` is their number.
+    The pair's impacted set is the union of every entry's downstream fields —
+    same start-field rule as the pairwise impact response, merged and
+    deduplicated, never containing a start field itself (cycles terminate) —
+    and ``impacted_count`` is its size; ``impacted_datasets`` lists the
+    distinct dataset names appearing in it, sorted ascending. ``totals``
+    counts the pairs and sums the per-pair breaking and deduplicated impacted
+    counts over the whole dataset. A dataset with fewer than two versions
+    yields an empty pair list and all-zero totals, never an error.
+
+    The summary is recomputed from the persisted definitions and lineage
+    mappings on every read: it caches nothing and never writes, so version
+    definitions, lineage mappings and the impact cache are all left
+    untouched, and quality or privacy state plays no role. The dataset
+    resolves first (404); any request body bytes (including whitespace-only
+    bytes) or any query parameter is a 422 checked afterwards, and every
+    ordering is computed explicitly rather than read from database order.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    if body:
+        raise RequestInvalidError(
+            "The schema evolution summary endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The schema evolution summary endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions WHERE dataset_id = ?",
+        (dataset["id"],),
+    ).fetchall()
+    ordered = sorted(version_rows, key=lambda row: row["version"])
+
+    pairs: list[dict] = []
+    for base_row, target_row in zip(ordered, ordered[1:]):
+        breaking_changes = _breaking_changes_with_impact(conn, base_row, target_row)
+        impacted_refs = {
+            (item["dataset"], item["version"], item["field"])
+            for change in breaking_changes
+            for item in change["impacted"]
+        }
+        pairs.append(
+            {
+                "base_version": base_row["version"],
+                "target_version": target_row["version"],
+                "breaking_count": len(breaking_changes),
+                "impacted_count": len(impacted_refs),
+                "impacted_datasets": sorted({ref[0] for ref in impacted_refs}),
+            }
+        )
+
+    totals = {
+        "pair_count": len(pairs),
+        "breaking_count": sum(pair["breaking_count"] for pair in pairs),
+        "impacted_count": sum(pair["impacted_count"] for pair in pairs),
+    }
+    return {"dataset": dataset["name"], "pairs": pairs, "totals": totals}
 
 
 # --------------------------------------------------------------------------- #
