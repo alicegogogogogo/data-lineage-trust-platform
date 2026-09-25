@@ -1785,6 +1785,64 @@ def list_privacy_view_audit_records(
     return [_privacy_view_audit_row_to_dict(row) for row in rows]
 
 
+def summarize_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Roll up the version's masking-hit records by field/policy/role/masking.
+
+    Read-only and parameterless: the path dataset/version resolves first
+    (404); a non-empty request body or any query parameter is a 422 checked
+    afterwards, mirroring the audit records endpoint. The summary is computed
+    from the persisted records on every read; nothing is cached or written,
+    so a version without records yields an empty group list rather than an
+    error.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit summary endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit summary endpoint does not accept query "
+            "parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT field, policy_id, role, masking, "
+        "COUNT(*) AS hit_count, "
+        "MIN(created_at) AS first_hit_at, MAX(created_at) AS last_hit_at "
+        "FROM privacy_view_audit_records WHERE version_id = ? "
+        "GROUP BY field, policy_id, role, masking "
+        "ORDER BY field ASC, policy_id ASC, role ASC, masking ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "groups": [
+            {
+                "field": row["field"],
+                "policy_id": row["policy_id"],
+                "role": row["role"],
+                "masking": row["masking"],
+                "count": row["hit_count"],
+                "first_hit_at": row["first_hit_at"],
+                "last_hit_at": row["last_hit_at"],
+            }
+            for row in rows
+        ],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #

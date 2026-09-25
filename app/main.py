@@ -27,6 +27,7 @@ from app.models import (
     PrivacyPolicyCreate,
     PrivacyPolicyEnabledUpdate,
     PrivacyViewAuditRecord,
+    PrivacyViewAuditSummary,
     PrivacyViewRequest,
     PrivacyViewResponse,
     ProcessingRunCancel,
@@ -615,6 +616,32 @@ def list_privacy_view_audit_records(
             query_keys=tuple(request.query_params.keys()),
         )
     ]
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/audit-records/summary",
+    response_model=PrivacyViewAuditSummary,
+)
+def summarize_privacy_view_audit_records(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> PrivacyViewAuditSummary:
+    # Read-only rollup computed from the persisted records on every read;
+    # parameterless like the audit records endpoint, with the same 404
+    # precedence over the 422 body/query rejection.
+    return PrivacyViewAuditSummary(
+        **repository.summarize_privacy_view_audit_records(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
 
 
 # --------------------------------------------------------------------------- #
