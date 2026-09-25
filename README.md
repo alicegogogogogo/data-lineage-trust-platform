@@ -113,6 +113,42 @@ traces.
   exactly `pair_count` (the number of pairs), `breaking_count` and
   `impacted_count`, each the sum of the per-pair values over the whole
   dataset.
+- `GET /datasets/{dataset}/fields/{field}/trajectory` — read-only
+  cross-version trajectory of one named field of the dataset, computed fresh
+  on every read (no caching; nothing is written, and version definitions,
+  lineage mappings and the impact cache are never touched). Only the
+  persisted version field definitions and lineage mappings are read; quality,
+  privacy, snapshot and processing-task state play no role. The path carries
+  the dataset name and the field name; the request takes no body and no query
+  parameters (`422`); an unknown dataset → `404`, and a field that does not
+  appear in any of the dataset's versions → `404`, both with the same
+  404-before-422 precedence as the evolution summary. A dataset with fewer
+  than two versions returns `200` with an empty `changes` array, never an
+  error. The JSON document is deterministic (fixed key order, compact
+  whitespace, exactly one trailing newline) with top-level keys `dataset`,
+  `field`, `entries` and `changes` in that order. `entries` lists every
+  schema version of the dataset ordered by version number ascending; each
+  entry has exactly `version` and `definition`, where `definition` is the
+  field's persisted definition in that version (`type` and `nullable` only)
+  or `null` — the key is never omitted — when the field does not exist
+  there. `changes` lists one entry per adjacent version pair, ordered by
+  base version ascending; each entry has exactly `base_version`,
+  `target_version`, `status`, `impacted` and `impacted_datasets` in that
+  order. `status` reuses the breaking-entry vocabulary of the compatibility
+  check — `added` (the field appears on the target side), `removed` (it
+  disappears on the target side), `type_changed`, `nullable_tightened` —
+  extended with `nullable_loosened` (only the nullability relaxes) and
+  `unchanged` (both definitions agree, including both absent); a field that
+  both changes type and tightens nullability collapses into a single
+  `type_changed` status. `impacted` lists every field directly or indirectly
+  downstream of the tracked field for that pair along the lineage mappings,
+  with the same start-field rule as the pairwise compatibility impact
+  response (the base version's same-named field and, when it exists, the
+  target version's); each item is `{"dataset", "version", "field"}`, the set
+  is deduplicated, never contains a start field itself (cycles terminate),
+  is sorted by dataset, version and field ascending and is empty when the
+  field has no downstream. `impacted_datasets` lists the distinct dataset
+  names appearing in `impacted`, sorted ascending.
 
 ### Field-level lineage
 

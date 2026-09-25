@@ -618,6 +618,143 @@ def summarize_schema_version_evolution(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only per-field cross-version trajectory
+# --------------------------------------------------------------------------- #
+
+
+def _field_status_change(before: dict | None, after: dict | None) -> str:
+    """Status literal of one field between two adjacent versions.
+
+    The literals reuse the breaking-entry vocabulary of the compatibility
+    check (``removed``, ``type_changed``, ``nullable_tightened``) extended
+    with the non-breaking outcomes: ``added`` when the field appears on the
+    target side, ``nullable_loosened`` when only the nullability relaxes and
+    ``unchanged`` when both definitions agree (including both absent).
+    Several changes of one field collapse into a single status, a type
+    change winning over a nullable tightening (mirrors the breaking-entry
+    rule of the compatibility check).
+    """
+    if before is None:
+        return "added" if after is not None else "unchanged"
+    if after is None:
+        return "removed"
+    if before == after:
+        return "unchanged"
+    if before["type"] != after["type"]:
+        return "type_changed"
+    if before["nullable"] and not after["nullable"]:
+        return "nullable_tightened"
+    return "nullable_loosened"
+
+
+def get_field_trajectory(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    field_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only cross-version trajectory of one field of a dataset.
+
+    ``entries`` lists every schema version of the dataset ordered by version
+    number ascending, each carrying the field's persisted definition in that
+    version (only ``type`` and ``nullable``) or ``None`` — key retained —
+    when the field does not exist there. ``changes`` lists one entry per
+    adjacent version pair, ordered by base version ascending; each entry
+    carries the pair's ``status`` (see :func:`_field_status_change`) and the
+    field's downstream impact for that pair, computed with the same
+    start-field rule as the compatibility impact response: the traversal
+    starts from the base version's same-named field and, when the field
+    exists in the target version, also from the target version's field. The
+    impacted set is deduplicated, never contains a start field itself
+    (cycles terminate), is sorted by dataset, version and field ascending
+    and is empty when the field has no downstream; ``impacted_datasets``
+    lists the distinct dataset names appearing in it, sorted ascending. A
+    dataset with fewer than two versions yields an empty change list, never
+    an error.
+
+    Only the persisted version field definitions and lineage mappings are
+    read; quality, privacy, snapshot and processing-task state play no
+    role. The trajectory is recomputed on every read: it caches nothing and
+    never writes, so version definitions, lineage mappings and the impact
+    cache are all left untouched, and every ordering is computed explicitly
+    rather than read from database order.
+
+    The dataset resolves first (404), then the field must appear in at
+    least one of the dataset's versions (404); any request body bytes
+    (including whitespace-only bytes) or any query parameter is a 422
+    checked afterwards, so both 404 cases keep precedence over the request
+    shape checks (mirroring the evolution summary endpoint).
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions WHERE dataset_id = ?",
+        (dataset["id"],),
+    ).fetchall()
+    ordered = sorted(version_rows, key=lambda row: row["version"])
+    definitions = [
+        _version_field_definitions(conn, row["id"]) for row in ordered
+    ]
+    if not any(field_name in fields for fields in definitions):
+        raise NotFoundError(
+            f"Field '{field_name}' does not exist in any schema version of "
+            f"dataset '{dataset_name}'"
+        )
+
+    if body:
+        raise RequestInvalidError(
+            "The field trajectory endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The field trajectory endpoint does not accept query parameters"
+        )
+
+    entries = [
+        {"version": row["version"], "definition": fields.get(field_name)}
+        for row, fields in zip(ordered, definitions)
+    ]
+
+    changes: list[dict] = []
+    for index, (base_row, target_row) in enumerate(zip(ordered, ordered[1:])):
+        before = definitions[index].get(field_name)
+        after = definitions[index + 1].get(field_name)
+        # The base version's same-named field starts the traversal when it
+        # exists; the target version's joins when it exists (the same
+        # start-field rule as the compatibility impact response).
+        start_ids = []
+        if before is not None:
+            start_ids.append(_field_id_by_name(conn, base_row["id"], field_name))
+        if after is not None:
+            start_ids.append(
+                _field_id_by_name(conn, target_row["id"], field_name)
+            )
+        impacted = _compute_impacted_multi(
+            conn, [field_id for field_id in start_ids if field_id is not None]
+        )
+        changes.append(
+            {
+                "base_version": base_row["version"],
+                "target_version": target_row["version"],
+                "status": _field_status_change(before, after),
+                "impacted": impacted,
+                "impacted_datasets": sorted(
+                    {item["dataset"] for item in impacted}
+                ),
+            }
+        )
+
+    return {
+        "dataset": dataset["name"],
+        "field": field_name,
+        "entries": entries,
+        "changes": changes,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Lineage
 # --------------------------------------------------------------------------- #
 

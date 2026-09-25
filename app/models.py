@@ -181,6 +181,46 @@ class VersionEvolutionSummaryResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only per-field cross-version trajectory
+# --------------------------------------------------------------------------- #
+
+
+# One version's definition of the tracked field; ``definition`` is null when
+# the field does not exist in that version and the key is never omitted.
+class FieldTrajectoryEntry(BaseModel):
+    version: int
+    definition: FieldChangeDefinition | None
+
+
+# The field's status change between two adjacent versions, together with the
+# downstream impact computed with the same start-field rule as the
+# compatibility impact response. ``impacted_datasets`` lists the distinct
+# dataset names appearing in ``impacted``, sorted ascending.
+class FieldStatusChange(BaseModel):
+    base_version: int
+    target_version: int
+    status: Literal[
+        "added",
+        "removed",
+        "type_changed",
+        "nullable_tightened",
+        "nullable_loosened",
+        "unchanged",
+    ]
+    impacted: list[LineageSourceRef]
+    impacted_datasets: list[str]
+
+
+# Deterministic cross-version trajectory of one field: exactly these keys, in
+# this order.
+class FieldTrajectoryResponse(BaseModel):
+    dataset: str
+    field: str
+    entries: list[FieldTrajectoryEntry]
+    changes: list[FieldStatusChange]
+
+
+# --------------------------------------------------------------------------- #
 # Quality rules
 # --------------------------------------------------------------------------- #
 
