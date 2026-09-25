@@ -21,6 +21,7 @@ from app.models import (
     FieldTrajectoryResponse,
     LineageCreate,
     LineageCreatedResponse,
+    LineageImpactPathsResponse,
     LineageImpactResponse,
     LineageResponse,
     PrivacyComplianceExportResponse,
@@ -454,6 +455,47 @@ def get_lineage_impact(
             conn, dataset_name, version, field.strip()
         )
     )
+
+
+# Read-only companion of the lineage impact query: the same impacted set,
+# each entry additionally carrying the shortest lineage path from the source
+# field and its edge length, plus the direct/indirect tier counts. The body
+# is serialized directly (rather than through the default JSON response) so
+# the key order is fixed, the whitespace is compact and the document ends
+# with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/lineage/impact-paths",
+    response_model=LineageImpactPathsResponse,
+)
+def get_lineage_impact_paths(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    field: str | None = Query(default=None),
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only; the dataset, version and field resolve first (404), then a
+    # missing/blank 'field' parameter, any request body bytes or any query
+    # parameter other than 'field' is a 422 validated in the repository, so
+    # every 404 keeps precedence. Nothing is written: version definitions,
+    # lineage mappings and the impact cache are all left untouched.
+    impact_paths = LineageImpactPathsResponse(
+        **repository.get_lineage_impact_paths(
+            conn,
+            dataset_name,
+            version,
+            field,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        impact_paths.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #

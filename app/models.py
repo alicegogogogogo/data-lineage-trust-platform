@@ -128,6 +128,24 @@ class LineageImpactResponse(BaseModel):
     impacted: list[LineageSourceRef]
 
 
+class LineageImpactPathEntry(BaseModel):
+    dataset: str
+    version: int
+    field: str
+    # Shortest node sequence from the source to this field, both ends
+    # included; every node is a {"dataset", "version", "field"} reference.
+    path: list[LineageSourceRef]
+    # Number of edges on the path: 1 for a direct downstream field.
+    path_length: int
+
+
+class LineageImpactPathsResponse(BaseModel):
+    source: LineageSourceRef
+    impacts: list[LineageImpactPathEntry]
+    direct_count: int
+    indirect_count: int
+
+
 # --------------------------------------------------------------------------- #
 # Read-only breaking-change compatibility check with downstream impact
 # --------------------------------------------------------------------------- #

@@ -8,7 +8,7 @@ import math
 import re
 import sqlite3
 import threading
-from collections import Counter
+from collections import Counter, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1086,6 +1086,138 @@ def get_lineage_impact(
     return {
         "source": {"dataset": dataset["name"], "version": version, "field": field},
         "impacted": impacted,
+    }
+
+
+def _compute_impact_paths(
+    conn: sqlite3.Connection, source_field_id: int, source_ref: dict
+) -> list[dict]:
+    """Shortest downstream path to every field reachable from the source.
+
+    Each item carries the impacted field's ``dataset``/``version``/``field``
+    reference, the shortest node sequence ``path`` from the source to that
+    field (both ends included, every node a ``dataset``/``version``/``field``
+    reference) and ``path_length``, the number of edges on the path. Among
+    several equally short paths the lexicographically smallest node sequence
+    wins, nodes compared by the same (dataset, version, field) key the result
+    is sorted by. The source field id is seeded into the visited set, so
+    cycles terminate and the source itself never appears in the result. Items
+    are deduplicated and sorted by dataset, version and field ascending.
+    Purely read-only: the impact cache is never touched.
+    """
+    edges = _lineage_forward_edges(conn)
+    refs: dict[int, dict] = {}
+    reverse: dict[int, list[int]] = {}
+    for source_id, targets in edges.items():
+        for target_field_id, ref in targets:
+            refs[target_field_id] = ref
+            reverse.setdefault(target_field_id, []).append(source_id)
+
+    # Breadth-first distances from the source, in edges.
+    dist = {source_field_id: 0}
+    queue = deque([source_field_id])
+    while queue:
+        current = queue.popleft()
+        for target_field_id, _ in edges.get(current, ()):
+            if target_field_id in dist:
+                continue
+            dist[target_field_id] = dist[current] + 1
+            queue.append(target_field_id)
+
+    def key_of(ref: dict) -> tuple[str, int, str]:
+        return (ref["dataset"], ref["version"], ref["field"])
+
+    # The lexicographically smallest shortest key sequence per node, computed
+    # level by level so every predecessor's best sequence is already known.
+    best: dict[int, tuple[tuple[str, int, str], ...]] = {
+        source_field_id: (key_of(source_ref),)
+    }
+    by_level: dict[int, list[int]] = {}
+    for field_id, distance in dist.items():
+        by_level.setdefault(distance, []).append(field_id)
+    for level in range(1, max(by_level) + 1):
+        for field_id in by_level[level]:
+            candidates = [
+                best[predecessor] + (key_of(refs[field_id]),)
+                for predecessor in reverse.get(field_id, ())
+                if dist.get(predecessor) == level - 1
+            ]
+            best[field_id] = min(candidates)
+
+    key_to_ref = {key_of(ref): ref for ref in refs.values()}
+    key_to_ref[key_of(source_ref)] = source_ref
+
+    impacts = [
+        {
+            **refs[field_id],
+            "path": [key_to_ref[key] for key in best[field_id]],
+            "path_length": distance,
+        }
+        for field_id, distance in dist.items()
+        if field_id != source_field_id
+    ]
+    impacts.sort(key=lambda item: (item["dataset"], item["version"], item["field"]))
+    return impacts
+
+
+def get_lineage_impact_paths(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version: int,
+    field: str | None,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only shortest-path explanation of one field's downstream impact.
+
+    The impacted set is exactly that of :func:`get_lineage_impact`, but each
+    entry additionally carries the shortest lineage path from the source to
+    the field (see :func:`_compute_impact_paths`). ``direct_count`` counts
+    the entries one edge away, ``indirect_count`` those several edges away; a
+    source without downstream fields yields an empty list and zero counts,
+    never an error.
+
+    The dataset, version and field resolve first (404); any request body
+    bytes (including whitespace-only bytes), any query parameter other than
+    ``field``, or a missing/blank ``field`` parameter is a 422 checked
+    afterwards, so every 404 keeps precedence over the request shape checks.
+    Nothing is written: version definitions, lineage mappings and the impact
+    cache are all left untouched, and every ordering is computed explicitly
+    rather than read from database order.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    _require_schema_version(conn, dataset, version)
+
+    if field is None or not field.strip():
+        raise RequestInvalidError(
+            "Query parameter 'field' is required and must be a non-empty "
+            "field name"
+        )
+    clean_field = field.strip()
+    _, field_id = _require_field(conn, dataset, version, clean_field, role="Source")
+
+    if body:
+        raise RequestInvalidError(
+            "The lineage impact paths endpoint does not accept a request body"
+        )
+    if any(key != "field" for key in query_keys):
+        raise RequestInvalidError(
+            "The lineage impact paths endpoint does not accept query "
+            "parameters other than 'field'"
+        )
+
+    source_ref = {
+        "dataset": dataset["name"],
+        "version": version,
+        "field": clean_field,
+    }
+    impacts = _compute_impact_paths(conn, field_id, source_ref)
+    return {
+        "source": source_ref,
+        "impacts": impacts,
+        "direct_count": sum(1 for item in impacts if item["path_length"] == 1),
+        "indirect_count": sum(1 for item in impacts if item["path_length"] > 1),
     }
 
 

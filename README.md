@@ -192,6 +192,30 @@ schema version in a different (source) dataset.
   a lineage mapping invalidates the cached impacts of the mapping's source
   field and of every field that can reach it. Unrelated cache entries are
   preserved.
+- `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
+  read-only shortest-path explanation of the same downstream impact. The
+  impacted set is exactly that of the impact query above, recomputed from the
+  persisted lineage mappings on every read (nothing is written; version
+  definitions, lineage mappings and the impact cache are never touched). The
+  JSON document is deterministic (fixed key order, compact whitespace,
+  exactly one trailing newline) with top-level keys `source`, `impacts`,
+  `direct_count` and `indirect_count` in that order. `source` is the start
+  field reference `{"dataset", "version", "field"}`. Each `impacts` entry has
+  exactly `dataset`, `version`, `field`, `path` and `path_length`: `path` is
+  the shortest node sequence from the source to the field (both ends
+  included, every node a `{"dataset", "version", "field"}` reference) and
+  `path_length` is its number of edges (`1` for a direct downstream field).
+  Among several equally short paths the lexicographically smallest node
+  sequence wins, nodes compared by the same dataset/version/field key the
+  result is sorted by. Entries are deduplicated, never contain the source
+  itself (cycles terminate) and are sorted by dataset, version and field
+  ascending. `direct_count` counts the entries one edge away and
+  `indirect_count` those several edges away; a source without downstream
+  fields returns `200` with an empty `impacts` array and zero counts, never
+  an error. The endpoint takes no request body and no query parameter other
+  than `field` (`422`); a missing, blank or invalid `field` parameter →
+  `422`; unknown dataset/version/field → `404`, with 404 taking precedence
+  over 422.
 
 ### Quality rules
 
