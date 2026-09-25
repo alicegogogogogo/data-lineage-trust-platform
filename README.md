@@ -208,6 +208,34 @@ schema version in a different (source) dataset.
   request body and no query parameter other than `field` (a missing, blank or
   repeated `field` is likewise a `422`); unknown dataset/version/field →
   `404`, with `404` taking precedence over every `422`.
+- `GET /datasets/{dataset}/versions/{version}/lineage/impact/source-paths?field=<field>` —
+  read-only upstream companion of the lineage impact query, computed fresh on
+  every read (no caching; nothing is written, and version definitions, lineage
+  mappings and the impact cache are never touched). The path and the `field`
+  query parameter together name an existing field; the `field` value is
+  matched literally (never trimmed), so a whitespace-padded name that matches
+  no stored field is a `404`. The JSON document is deterministic (fixed key
+  order, compact whitespace, exactly one trailing newline) with top-level keys
+  `source`, `origins`, `direct_count`, `indirect_count` and
+  `source_dataset_count` in that order; `source` is the start field reference
+  (`{"dataset", "version", "field"}`). Each `origins` entry has exactly the
+  location keys `dataset`, `version`, `field`, then `path` and `path_length`;
+  entries are deduplicated, never contain the start field and are sorted by
+  dataset, version and field ascending. An origin is a field whose mapping
+  points (directly or transitively) at the start field. `path` is the
+  shortest node sequence walking from the start field up to the origin,
+  including both ends, and each node has the same
+  `{"dataset", "version", "field"}` shape; `path_length` is the number of
+  edges on the path (`1` for a direct source, increasing for indirect ones).
+  Among several shortest paths, the lexicographically smallest node sequence
+  (compared by dataset, version and field) is chosen; cycles terminate.
+  `direct_count` counts origins at distance 1, `indirect_count` the origins
+  farther away and `source_dataset_count` the distinct dataset names among
+  all origins; a field with no sources returns an empty `origins` array and
+  all counts zero, never an error. The endpoint takes no request body and no
+  query parameter other than `field` (a missing, blank or repeated `field` is
+  likewise a `422`); unknown dataset/version/field → `404`, with `404`
+  taking precedence over every `422`.
 
   Impact results are cached persistently (they survive restarts) and every
   read reflects the currently committed lineage graph: creating a schema

@@ -148,6 +148,17 @@ class LineageImpactPathsResponse(BaseModel):
     indirect_count: int
 
 
+# Deterministic upstream companion of the lineage impact query: exactly these
+# keys, in this order. Each origin carries the same located-field-plus-path
+# shape as an impact path item.
+class LineageSourcePathsResponse(BaseModel):
+    source: LineageSourceRef
+    origins: list[LineageImpactPathItem]
+    direct_count: int
+    indirect_count: int
+    source_dataset_count: int
+
+
 # --------------------------------------------------------------------------- #
 # Read-only breaking-change compatibility check with downstream impact
 # --------------------------------------------------------------------------- #
