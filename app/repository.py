@@ -2210,6 +2210,98 @@ def diff_privacy_view_audit_records(
     return {"from_period": from_period, "to_period": to_period, "groups": groups}
 
 
+def reconcile_privacy_view_audit_records(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only per-day reconciliation of access records against hit records.
+
+    Both logs are bucketed by the UTC calendar day of their ``created_at``
+    write time. Each day with records on either side reports ``view_count``
+    (access records written that day), ``masked_count`` (the masked-value
+    counts of those access records summed) and ``hit_count`` (masking-hit
+    records written that day); a side without records on that day counts as
+    zero. ``consistent`` is true exactly when ``masked_count`` equals
+    ``hit_count`` — the access log's masked-value total cross-checks the hit
+    log. Days sort ascending by date, never relying on database order; days
+    without any record on either side do not appear. ``totals`` sums the
+    same three counts over the whole version, so it always equals the
+    per-day entries added together (all zero when there are no records).
+
+    The reconciliation is recomputed from the persisted records on every
+    call: it caches nothing, writes nothing and never touches either log.
+    Like the record list, the path dataset/version resolves first (404); a
+    non-empty request body or any query parameter is a 422 checked
+    afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body.strip():
+        raise RequestInvalidError(
+            "The privacy view audit reconcile endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy view audit reconcile endpoint does not accept query "
+            "parameters"
+        )
+
+    access_rows = conn.execute(
+        "SELECT date(created_at) AS day, COUNT(*) AS view_count, "
+        "SUM(masked_count) AS masked_count "
+        "FROM privacy_view_access_records WHERE version_id = ? "
+        "GROUP BY day",
+        (version_row["id"],),
+    ).fetchall()
+    hit_rows = conn.execute(
+        "SELECT date(created_at) AS day, COUNT(*) AS hit_count "
+        "FROM privacy_view_audit_records WHERE version_id = ? "
+        "GROUP BY day",
+        (version_row["id"],),
+    ).fetchall()
+
+    by_day: dict[str, dict[str, int]] = {}
+    for row in access_rows:
+        entry = by_day.setdefault(
+            row["day"], {"view_count": 0, "masked_count": 0, "hit_count": 0}
+        )
+        entry["view_count"] = row["view_count"]
+        entry["masked_count"] = row["masked_count"]
+    for row in hit_rows:
+        entry = by_day.setdefault(
+            row["day"], {"view_count": 0, "masked_count": 0, "hit_count": 0}
+        )
+        entry["hit_count"] = row["hit_count"]
+
+    days = [
+        {
+            "day": day,
+            "view_count": entry["view_count"],
+            "masked_count": entry["masked_count"],
+            "hit_count": entry["hit_count"],
+            "consistent": entry["masked_count"] == entry["hit_count"],
+        }
+        for day, entry in sorted(by_day.items())
+    ]
+    totals = {
+        "view_count": sum(entry["view_count"] for entry in days),
+        "masked_count": sum(entry["masked_count"] for entry in days),
+        "hit_count": sum(entry["hit_count"] for entry in days),
+    }
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "days": days,
+        "totals": totals,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #

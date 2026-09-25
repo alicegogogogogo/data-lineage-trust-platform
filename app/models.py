@@ -381,6 +381,35 @@ class PrivacyViewAuditDiffResponse(BaseModel):
     groups: list[PrivacyViewAuditDiffGroup]
 
 
+# Read-only per-day reconciliation of the access records against the
+# masking-hit records: both logs are bucketed by the UTC calendar day of
+# their write time and each day with records on either side reports the
+# access-record count, the summed masked-value count and the hit-record
+# count, plus whether the masked-value count matches the hit count. Days
+# sort ascending by date; ``totals`` sums the same counts over the whole
+# version. Recomputed from the persisted records on every read; nothing is
+# cached or written.
+class PrivacyViewAuditReconcileDay(BaseModel):
+    day: str
+    view_count: int
+    masked_count: int
+    hit_count: int
+    consistent: bool
+
+
+class PrivacyViewAuditReconcileTotals(BaseModel):
+    view_count: int
+    masked_count: int
+    hit_count: int
+
+
+class PrivacyViewAuditReconcileResponse(BaseModel):
+    dataset: str
+    version: int
+    days: list[PrivacyViewAuditReconcileDay]
+    totals: PrivacyViewAuditReconcileTotals
+
+
 # --------------------------------------------------------------------------- #
 # Sensitive-field identification (candidate annotation only)
 # --------------------------------------------------------------------------- #
