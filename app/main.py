@@ -78,6 +78,7 @@ from app.models import (
     SnapshotMetadata,
     SnapshotResponse,
     VersionCompatibilityResponse,
+    VersionCompatibilityImpactResponse,
     VersionDiffResponse,
 )
 
@@ -252,6 +253,45 @@ def check_schema_version_compatibility(
     # endpoint).
     compatibility = VersionCompatibilityResponse(
         **repository.check_schema_version_compatibility(
+            conn,
+            dataset_name,
+            base_version,
+            target_version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        compatibility.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only breaking-change compatibility check joined with the field-level
+# lineage impact of every breaking field. Appended one "impact" segment after
+# the compatibility check path; same direct serialization rules (fixed key
+# order, compact whitespace, exactly one trailing newline).
+@app.get(
+    "/datasets/{dataset_name}/versions/{base_version}"
+    "/compatibility/{target_version}/impact",
+    response_model=VersionCompatibilityImpactResponse,
+)
+def check_schema_version_compatibility_impact(
+    request: Request,
+    dataset_name: str,
+    base_version: int,
+    target_version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace included) or
+    # query parameters are a 422 validated in the repository once the path
+    # dataset and both versions are known, preserving 404 precedence exactly
+    # like the compatibility check it is appended to.
+    compatibility = VersionCompatibilityImpactResponse(
+        **repository.check_schema_version_compatibility_impact(
             conn,
             dataset_name,
             base_version,

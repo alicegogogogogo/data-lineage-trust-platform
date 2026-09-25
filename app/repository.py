@@ -376,6 +376,131 @@ def check_schema_version_compatibility(
     }
 
 
+def _version_field_id(conn: sqlite3.Connection, version_id: int, name: str) -> int | None:
+    row = conn.execute(
+        "SELECT id FROM schema_fields WHERE version_id = ? AND name = ?",
+        (version_id, name),
+    ).fetchone()
+    return None if row is None else row["id"]
+
+
+# --------------------------------------------------------------------------- #
+# Read-only compatibility impact: breaking changes with field-level downstream
+# --------------------------------------------------------------------------- #
+
+
+def check_schema_version_compatibility_impact(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    base_version: int,
+    target_version: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only breaking-change check joined with downstream field impact.
+
+    The breaking entries are computed exactly as in
+    :func:`check_schema_version_compatibility` (same kinds, same merge rule
+    that lets a type change win over a nullable tightening, same field-name
+    order); each entry additionally carries ``impacted``. The impact starts
+    at the base version's same-named field and, when the target version
+    still has the field, merges in the downstream of the target version's
+    field as well. The combined set is the direct and indirect downstream
+    fields along lineage mappings, deduplicated, sorted by
+    (dataset, version, field) and never containing a start point; cycles
+    terminate. A removed field only seeds the base side because no target
+    side exists.
+
+    The traversal is computed fresh from the persisted graph and never
+    consults or writes the lineage impact cache. The endpoint takes no
+    parameters: a non-positive version number is a 422 checked before path
+    resolution, while any request body bytes (including whitespace-only
+    bytes) or any query parameter is a 422 raised only after the path
+    dataset and both versions have resolved, so an unknown dataset/version
+    stays a 404 (mirroring the compatibility check). Nothing is written.
+    """
+    if base_version < 1 or target_version < 1:
+        raise RequestInvalidError(
+            "Version numbers in the compatibility impact path must be positive "
+            "integers"
+        )
+
+    dataset = require_dataset(conn, dataset_name)
+    base_row = _require_schema_version(conn, dataset, base_version)
+    target_row = _require_schema_version(conn, dataset, target_version)
+
+    if body:
+        raise RequestInvalidError(
+            "The version compatibility impact endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The version compatibility impact endpoint does not accept query "
+            "parameters"
+        )
+
+    base_fields = _version_field_definitions(conn, base_row["id"])
+    target_fields = _version_field_definitions(conn, target_row["id"])
+
+    breaking_changes: list[dict] = []
+    for name in sorted(set(base_fields) | set(target_fields)):
+        before = base_fields.get(name)
+        after = target_fields.get(name)
+        if before is None:
+            # Added in the target: never breaking.
+            continue
+        if after is None:
+            kind = "removed"
+            entry = {
+                "field": name,
+                "kind": kind,
+                "before": before,
+                "after": None,
+            }
+        elif before["type"] != after["type"]:
+            kind = "type_changed"
+            entry = {
+                "field": name,
+                "kind": kind,
+                "before": before,
+                "after": after,
+            }
+        elif before["nullable"] and not after["nullable"]:
+            kind = "nullable_tightened"
+            entry = {
+                "field": name,
+                "kind": kind,
+                "before": before,
+                "after": after,
+            }
+        else:
+            continue
+
+        # The base side always carries the field (it defines the breaking
+        # change); the target side only seeds the traversal when the field
+        # still exists there. Seeding both excludes each start from the
+        # merged downstream set.
+        seed_ids: list[int] = []
+        base_field_id = _version_field_id(conn, base_row["id"], name)
+        if base_field_id is not None:
+            seed_ids.append(base_field_id)
+        if kind != "removed":
+            target_field_id = _version_field_id(conn, target_row["id"], name)
+            if target_field_id is not None:
+                seed_ids.append(target_field_id)
+        entry["impacted"] = _compute_impacted(conn, tuple(seed_ids))
+        breaking_changes.append(entry)
+
+    return {
+        "base_version": base_row["version"],
+        "target_version": target_row["version"],
+        "breaking_changes": breaking_changes,
+        "breaking_change_count": len(breaking_changes),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Lineage
 # --------------------------------------------------------------------------- #
@@ -571,16 +696,24 @@ def _lineage_forward_edges(
     return edges
 
 
-def _compute_impacted(conn: sqlite3.Connection, source_field_id: int) -> list[dict]:
-    """All fields reachable downstream of the source, deduplicated and sorted.
+def _compute_impacted(
+    conn: sqlite3.Connection, source_field_ids: int | tuple[int, ...]
+) -> list[dict]:
+    """All fields reachable downstream of the seeded source field id(s).
 
-    The source field id is seeded into the visited set, so cycles terminate
-    and the source itself never appears in the result.
+    Every seed id is placed in the visited set up front, so cycles terminate
+    and neither a seed itself nor another seed (when several starts share a
+    name) ever appears in the result. Results are deduplicated by
+    (dataset, version, field) and sorted by those keys ascending.
     """
+    if isinstance(source_field_ids, int):
+        seeds: tuple[int, ...] = (source_field_ids,)
+    else:
+        seeds = tuple(source_field_ids)
     edges = _lineage_forward_edges(conn)
-    visited = {source_field_id}
+    visited = set(seeds)
     impacted: dict[tuple[str, int, str], dict] = {}
-    queue = [source_field_id]
+    queue = list(seeds)
     while queue:
         current = queue.pop()
         for target_field_id, ref in edges.get(current, ()):

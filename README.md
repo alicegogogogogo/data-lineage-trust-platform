@@ -70,6 +70,33 @@ traces.
   entries. Comparing a version with itself returns an empty list and a zero
   count. The verdict is advisory for release decisions only: it runs no
   migration or rollback.
+- `GET /datasets/{dataset}/versions/{base_version}/compatibility/{target_version}/impact` —
+  read-only breaking-change check with field-level lineage impact, appended
+  one `impact` segment after the compatibility check. It returns every
+  breaking entry the target introduces relative to the base using exactly
+  the same rules, order and top-level shape as the compatibility check
+  (`base_version`, `target_version`, `breaking_changes`,
+  `breaking_change_count`), except each entry carries a fifth key
+  `impacted` after `field`, `kind`, `before` and `after`. `impacted` lists
+  every field directly or indirectly reachable downstream of the breaking
+  field along lineage mappings, each entry being
+  `{"dataset", "version", "field"}`: traversal starts at the base version's
+  same-named field and, when the field still exists in the target version,
+  merges the target version's field downstream as well (a removed field
+  only seeds the base side). The set is deduplicated, never contains a
+  start point itself (cycles terminate), is sorted by dataset, version and
+  field ascending and is an empty array when the field has no downstream.
+  The impact is computed fresh from the persisted graph: nothing is
+  written, and version definitions, lineage mappings and the impact cache
+  are never touched. Comparing a version with itself returns empty entries
+  and a zero count; results are identical after a restart. The JSON
+  document is deterministic (fixed key order, compact whitespace,
+  lowercase booleans, exactly one trailing newline). The endpoint takes no
+  request body and no query parameters — a body (whitespace-only bytes
+  included) or a query parameter is a `422`; a missing, non-positive or
+  non-integer version is a `422`, and an unknown dataset or version is a
+  `404`, with the same 404-before-422 precedence as the compatibility
+  check.
 
 ### Field-level lineage
 

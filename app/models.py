@@ -129,6 +129,30 @@ class LineageImpactResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only compatibility impact (breaking changes plus downstream fields)
+# --------------------------------------------------------------------------- #
+
+
+class VersionBreakingChangeImpact(BaseModel):
+    field: str
+    kind: Literal["removed", "type_changed", "nullable_tightened"]
+    # Null on the side where the field does not exist; never omitted.
+    before: FieldChangeDefinition | None
+    after: FieldChangeDefinition | None
+    # Direct and indirect downstream fields of the breaking field, reached
+    # from the base version's field (and the target version's same-named
+    # field when it still exists); deduplicated, sorted, never a start point.
+    impacted: list[LineageSourceRef]
+
+
+class VersionCompatibilityImpactResponse(BaseModel):
+    base_version: int
+    target_version: int
+    breaking_changes: list[VersionBreakingChangeImpact]
+    breaking_change_count: int
+
+
+# --------------------------------------------------------------------------- #
 # Quality rules
 # --------------------------------------------------------------------------- #
 
