@@ -70,6 +70,26 @@ class VersionDiffResponse(BaseModel):
     changes: list[VersionFieldChange]
 
 
+# --------------------------------------------------------------------------- #
+# Read-only schema version compatibility check
+# --------------------------------------------------------------------------- #
+
+
+class VersionBreakingChange(BaseModel):
+    field: str
+    kind: Literal["removed", "type_changed", "nullable_tightened"]
+    # Null on the side where the field does not exist; never omitted.
+    before: FieldChangeDefinition | None
+    after: FieldChangeDefinition | None
+
+
+class VersionCompatibilityResponse(BaseModel):
+    base_version: int
+    target_version: int
+    breaking_changes: list[VersionBreakingChange]
+    breaking_change_count: int
+
+
 class LineageCreate(BaseModel):
     target_dataset: str
     target_version: int

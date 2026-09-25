@@ -284,6 +284,99 @@ def diff_schema_versions(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only schema version compatibility check
+# --------------------------------------------------------------------------- #
+
+
+def check_schema_version_compatibility(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    base_version: int,
+    target_version: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only breaking-change check of a target version against a base.
+
+    Only the persisted field definitions (name, type, nullable) are compared;
+    field position is not a difference. A breaking change is exactly one of:
+    the target removed a base field (``removed``), the target changed a
+    field's type (``type_changed``) or the target tightened a nullable field
+    to not nullable (``nullable_tightened``). Added fields and nullable
+    loosening are not breaking. Entries are sorted by field name and each
+    carries ``before`` (base) and ``after`` (target) definitions, null on the
+    side where the field does not exist. ``breaking_change_count`` equals the
+    number of entries. Comparing a version with itself yields an empty list
+    and a zero count; either version order is allowed.
+
+    The endpoint takes no parameters: a non-positive version number is a 422
+    checked before path resolution, while any request body bytes (including
+    whitespace-only bytes) or any query parameter is a 422 raised only after
+    the path dataset and both versions have resolved, so an unknown
+    dataset/version stays a 404 (mirroring the version diff endpoint).
+    Nothing is written.
+    """
+    if base_version < 1 or target_version < 1:
+        raise RequestInvalidError(
+            "Version numbers in the compatibility path must be positive integers"
+        )
+
+    dataset = require_dataset(conn, dataset_name)
+    base_row = _require_schema_version(conn, dataset, base_version)
+    target_row = _require_schema_version(conn, dataset, target_version)
+
+    if body:
+        raise RequestInvalidError(
+            "The version compatibility endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The version compatibility endpoint does not accept query parameters"
+        )
+
+    base_fields = _version_field_definitions(conn, base_row["id"])
+    target_fields = _version_field_definitions(conn, target_row["id"])
+
+    breaking_changes: list[dict] = []
+    for name in sorted(set(base_fields) | set(target_fields)):
+        before = base_fields.get(name)
+        after = target_fields.get(name)
+        if before is None:
+            # Added in the target: never breaking.
+            continue
+        if after is None:
+            breaking_changes.append(
+                {"field": name, "kind": "removed", "before": before, "after": None}
+            )
+        elif before["type"] != after["type"]:
+            breaking_changes.append(
+                {
+                    "field": name,
+                    "kind": "type_changed",
+                    "before": before,
+                    "after": after,
+                }
+            )
+        elif before["nullable"] and not after["nullable"]:
+            breaking_changes.append(
+                {
+                    "field": name,
+                    "kind": "nullable_tightened",
+                    "before": before,
+                    "after": after,
+                }
+            )
+
+    return {
+        "base_version": base_row["version"],
+        "target_version": target_row["version"],
+        "breaking_changes": breaking_changes,
+        "breaking_change_count": len(breaking_changes),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Lineage
 # --------------------------------------------------------------------------- #
 

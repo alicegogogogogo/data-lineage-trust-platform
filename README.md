@@ -52,6 +52,24 @@ traces.
   their fields.
 - `GET /datasets/{dataset}/versions/{version}` — read one version with its
   fields. Unknown dataset/version → `404`.
+- `GET /datasets/{dataset}/versions/{base_version}/compatibility/{target_version}` —
+  read-only breaking-change check of the target version against the base
+  version, computed fresh from the persisted field definitions on every read
+  (nothing is written; field order is not a difference). The endpoint takes no
+  request body and no query parameters (`422`); unknown dataset/version →
+  `404`, with the same 404-before-422 precedence as the version diff. The JSON
+  document is deterministic (fixed key order, compact whitespace, exactly one
+  trailing newline) with top-level keys `base_version`, `target_version`,
+  `breaking_changes` and `breaking_change_count`. A breaking change is exactly
+  one of: the target removed a base field (`removed`), changed a field's type
+  (`type_changed`) or tightened a nullable field to not nullable
+  (`nullable_tightened`); added fields and nullable loosening are not
+  breaking. Each entry has `field`, `kind`, `before` (base definition) and
+  `after` (target definition, `null` for a removed field), entries are sorted
+  by field name ascending and `breaking_change_count` equals the number of
+  entries. Comparing a version with itself returns an empty list and a zero
+  count. The verdict is advisory for release decisions only: it runs no
+  migration or rollback.
 
 ### Field-level lineage
 
