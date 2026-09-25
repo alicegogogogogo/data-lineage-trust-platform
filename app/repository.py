@@ -284,6 +284,92 @@ def diff_schema_versions(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only schema version compatibility check
+# --------------------------------------------------------------------------- #
+
+
+def check_version_compatibility(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    base_version: int,
+    target_version: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only breaking-change check of a target version against a baseline.
+
+    Only the persisted field definitions (name, type, nullable) are compared;
+    field position is not a difference. A change is breaking only when the
+    target removes a baseline field, changes a field's type or tightens a
+    field from nullable to not nullable; additions and nullable loosening are
+    not breaking. Breaking changes are sorted by field name and each carries
+    ``base`` and ``target`` definitions, null on the side where the field
+    does not exist. Comparing a version with itself yields an empty list.
+
+    The endpoint takes no parameters: a non-positive version number is a 422
+    checked before path resolution, while any request body bytes (whitespace
+    included) or any query parameter is a 422 raised only after the path
+    dataset and both versions have resolved, so an unknown dataset/version
+    stays a 404 (mirroring the version diff endpoint). Nothing is written.
+    """
+    if base_version < 1 or target_version < 1:
+        raise RequestInvalidError(
+            "Version numbers in the compatibility path must be positive integers"
+        )
+
+    dataset = require_dataset(conn, dataset_name)
+    base_row = _require_schema_version(conn, dataset, base_version)
+    target_row = _require_schema_version(conn, dataset, target_version)
+
+    if body:
+        raise RequestInvalidError(
+            "The version compatibility endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The version compatibility endpoint does not accept query parameters"
+        )
+
+    base_fields = _version_field_definitions(conn, base_row["id"])
+    target_fields = _version_field_definitions(conn, target_row["id"])
+
+    breaking: list[dict] = []
+    for name in sorted(base_fields):
+        before = base_fields[name]
+        after = target_fields.get(name)
+        if after is None:
+            breaking.append(
+                {"field": name, "kind": "removed", "base": before, "target": None}
+            )
+        elif before["type"] != after["type"]:
+            breaking.append(
+                {
+                    "field": name,
+                    "kind": "type_changed",
+                    "base": before,
+                    "target": after,
+                }
+            )
+        elif before["nullable"] and not after["nullable"]:
+            breaking.append(
+                {
+                    "field": name,
+                    "kind": "nullability_tightened",
+                    "base": before,
+                    "target": after,
+                }
+            )
+
+    return {
+        "base_version": base_row["version"],
+        "target_version": target_row["version"],
+        "breaking_changes": breaking,
+        "breaking_change_count": len(breaking),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Lineage
 # --------------------------------------------------------------------------- #
 

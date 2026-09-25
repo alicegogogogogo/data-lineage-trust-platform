@@ -78,6 +78,7 @@ from app.models import (
     SnapshotMetadata,
     SnapshotResponse,
     VersionDiffResponse,
+    VersionCompatibilityResponse,
 )
 
 app = FastAPI(title="Data Lineage Trust Platform", version="0.1.0")
@@ -226,6 +227,43 @@ def diff_schema_versions(
             query_keys=tuple(request.query_params.keys()),
         )
     )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{base_version}"
+    "/compatibility/{target_version}",
+    response_model=VersionCompatibilityResponse,
+)
+def check_version_compatibility(
+    request: Request,
+    dataset_name: str,
+    base_version: int,
+    target_version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset and both versions
+    # are known, preserving 404 precedence (mirrors the version diff
+    # endpoint). The body is serialized directly (rather than through the
+    # default JSON response) so the key order is fixed, the whitespace is
+    # compact and the document ends with exactly one newline.
+    compatibility = VersionCompatibilityResponse(
+        **repository.check_version_compatibility(
+            conn,
+            dataset_name,
+            base_version,
+            target_version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        compatibility.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #

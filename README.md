@@ -52,6 +52,33 @@ traces.
   their fields.
 - `GET /datasets/{dataset}/versions/{version}` — read one version with its
   fields. Unknown dataset/version → `404`.
+- `GET /datasets/{dataset}/versions/{base_version}/compatibility/{target_version}` —
+  read-only breaking-change check of the target version against the baseline
+  version, computed fresh from the persisted field definitions on every read
+  (nothing is written, modified or deleted; quality, privacy, snapshot and
+  processing state is never consulted). A change is breaking only when the
+  target removes a baseline field (`removed`), changes a field's type
+  (`type_changed`) or tightens a field from nullable to not nullable
+  (`nullability_tightened`); added fields, nullable loosening and field
+  reordering are not breaking. Comparing a version with itself returns an
+  empty result. The endpoint takes no request body (whitespace-only bytes
+  included) and no query parameters (`422`); a non-positive or non-integer
+  version number → `422`; unknown dataset/version → `404`, with 404 taking
+  precedence over body/query rejection. The JSON document is deterministic
+  (fixed key order, compact whitespace, exactly one trailing newline):
+
+  ```json
+  {"base_version":1,"target_version":2,"breaking_changes":[{"field":"note","kind":"removed","base":{"type":"string","nullable":true},"target":null}],"breaking_change_count":1}
+  ```
+
+  The top-level keys are exactly `base_version`, `target_version`,
+  `breaking_changes`, `breaking_change_count` in that order.
+  `breaking_changes` is sorted by field name ascending; each entry has
+  exactly `field`, `kind`, `base` and `target`, where `base`/`target` are the
+  field's `{"type", "nullable"}` definition on that side (`target` is `null`
+  for a removed field; neither key is ever omitted).
+  `breaking_change_count` equals the number of entries. The result is a
+  release-decision reference only: it runs no migration or rollback.
 
 ### Field-level lineage
 
