@@ -160,6 +160,24 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (version_id, sequence)
     )
     """,
+    # Append-only access trace of privacy views: exactly one record per
+    # successfully returned view request, whether or not it masked any value
+    # (an empty row set or a view that masked nothing is recorded too).
+    # ``sequence`` numbers the records of one version in write order;
+    # ``masked_count`` always equals the number of masking-hit records the
+    # same view wrote, so the two logs can be cross-checked.
+    """
+    CREATE TABLE IF NOT EXISTS privacy_view_access_records (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id   INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        sequence     INTEGER NOT NULL CHECK (sequence >= 1),
+        role         TEXT NOT NULL,
+        row_count    INTEGER NOT NULL CHECK (row_count >= 0),
+        masked_count INTEGER NOT NULL CHECK (masked_count >= 0),
+        created_at   TEXT NOT NULL,
+        UNIQUE (version_id, sequence)
+    )
+    """,
     # Candidate sensitive-field identification results, one per (version,
     # field): a re-run refreshes evidence/confidence/field_type in place while
     # the id and created_at stay fixed. The submitted samples are deliberately
@@ -356,6 +374,23 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON privacy_view_audit_records
     BEGIN
         SELECT RAISE(ABORT, 'privacy view audit records are immutable');
+    END
+    """,
+    # Privacy view access records are append-only as well: the database itself
+    # refuses updates and deletes so the per-view access trace cannot be
+    # rewritten.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_privacy_view_access_records_no_update
+    BEFORE UPDATE ON privacy_view_access_records
+    BEGIN
+        SELECT RAISE(ABORT, 'privacy view access records are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_privacy_view_access_records_no_delete
+    BEFORE DELETE ON privacy_view_access_records
+    BEGIN
+        SELECT RAISE(ABORT, 'privacy view access records are immutable');
     END
     """,
 )

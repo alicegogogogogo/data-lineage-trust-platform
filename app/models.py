@@ -318,6 +318,19 @@ class PrivacyViewAuditRecord(BaseModel):
     created_at: str
 
 
+# Append-only access trace of privacy views: exactly one record per
+# successfully returned view request, whether or not it masked any value.
+# ``sequence`` numbers the records of one version in write order;
+# ``masked_count`` equals the number of masking-hit records the same view
+# wrote, so the two logs can be cross-checked.
+class PrivacyViewAccessRecord(BaseModel):
+    sequence: int
+    role: str
+    row_count: int
+    masked_count: int
+    created_at: str
+
+
 # Read-only roll-up of the masking-hit records: one group per distinct
 # (field, policy, role, masking) combination, with the number of hits and the
 # timestamps of the group's earliest and latest written records. Recomputed

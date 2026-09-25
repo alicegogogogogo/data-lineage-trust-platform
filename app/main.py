@@ -29,6 +29,7 @@ from app.models import (
     PrivacyViewAuditRecord,
     PrivacyViewAuditDiffResponse,
     PrivacyViewAuditSummaryResponse,
+    PrivacyViewAccessRecord,
     PrivacyViewRequest,
     PrivacyViewResponse,
     ProcessingRunCancel,
@@ -590,6 +591,33 @@ def view_privacy_rows(
             conn, dataset_name, version, payload.role, payload.rows
         )
     )
+
+
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/privacy-policies/view/access-records",
+    response_model=list[PrivacyViewAccessRecord],
+)
+def list_privacy_view_access_records(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[PrivacyViewAccessRecord]:
+    # Read-only and parameterless; any body bytes or query parameters are a
+    # 422 validated in the repository once the path dataset/version is known,
+    # preserving 404 precedence (mirrors the hit-record list endpoint).
+    return [
+        PrivacyViewAccessRecord(**record)
+        for record in repository.list_privacy_view_access_records(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
 
 
 @app.get(
