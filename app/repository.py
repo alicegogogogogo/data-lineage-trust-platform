@@ -1354,6 +1354,73 @@ def get_lineage_impact(
     }
 
 
+def get_lineage_impact_cache_audit(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only consistency audit of the persisted lineage impact cache.
+
+    Every field of the path dataset's schema version is audited against its
+    current cache record: ``missing`` when the field has no record (a field
+    whose impact was never queried — not an error), ``cached`` when the
+    record matches a fresh recomputation exactly and ``mismatch`` when it
+    does not. The recomputation shares the impact query's semantics
+    (downstream traversal, deduplicated, the start field excluded, cycles
+    terminating). The path dataset and version resolve first (404); only
+    then are request-body bytes and any query parameter rejected with 422,
+    so an unknown dataset or version always keeps its 404 precedence over
+    request-shape errors (mirroring the other read-only lineage reads).
+    Computed fresh on every read: nothing is written, invalidated or
+    repaired and the lineage graph is never modified. Entries are sorted by
+    field name explicitly, never relying on database row order.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version)
+
+    if body:
+        raise RequestInvalidError(
+            "The lineage impact cache audit endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "Unknown query parameter(s): " + ", ".join(sorted(set(query_keys)))
+        )
+
+    rows = conn.execute(
+        "SELECT id, name FROM schema_fields WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchall()
+
+    entries: list[dict] = []
+    counts = {"cached": 0, "missing": 0, "mismatch": 0}
+    for row in sorted(rows, key=lambda item: item["name"]):
+        cached = _impact_cache_lookup(conn, dataset["name"], version, row["name"])
+        if cached is None:
+            status = "missing"
+        elif cached == _compute_impacted(conn, row["id"]):
+            status = "cached"
+        else:
+            status = "mismatch"
+        counts[status] += 1
+        entries.append({"field": row["name"], "status": status})
+
+    return {
+        "dataset": dataset["name"],
+        "version": version,
+        "entries": entries,
+        "counts": {
+            "cached_count": counts["cached"],
+            "missing_count": counts["missing"],
+            "mismatch_count": counts["mismatch"],
+        },
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Lineage impact shortest-path query (read-only, never cached)
 # --------------------------------------------------------------------------- #

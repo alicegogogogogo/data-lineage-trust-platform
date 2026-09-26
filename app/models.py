@@ -168,6 +168,32 @@ class LineageSourcePathsResponse(BaseModel):
     source_dataset_count: int
 
 
+# One audited field of a schema version together with the consistency status
+# of its persisted impact cache record: ``cached`` when the record matches a
+# fresh recomputation, ``missing`` when no record exists (not an error) and
+# ``mismatch`` when the record disagrees with the current lineage graph.
+class LineageImpactCacheAuditEntry(BaseModel):
+    field: str
+    status: Literal["cached", "missing", "mismatch"]
+
+
+# Per-status tallies of the audited entries; the keys are the three status
+# names each suffixed with ``_count``.
+class LineageImpactCacheAuditCounts(BaseModel):
+    cached_count: int
+    missing_count: int
+    mismatch_count: int
+
+
+# Deterministic read-only consistency audit of the lineage impact cache:
+# exactly these keys, in this order, with entries sorted by field name.
+class LineageImpactCacheAuditResponse(BaseModel):
+    dataset: str
+    version: int
+    entries: list[LineageImpactCacheAuditEntry]
+    counts: LineageImpactCacheAuditCounts
+
+
 # --------------------------------------------------------------------------- #
 # Read-only breaking-change compatibility check with downstream impact
 # --------------------------------------------------------------------------- #

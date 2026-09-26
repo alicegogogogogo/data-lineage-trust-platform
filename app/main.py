@@ -23,6 +23,7 @@ from app.models import (
     LineageCreatedResponse,
     LineageDeletedResponse,
     LineageImpactResponse,
+    LineageImpactCacheAuditResponse,
     LineageImpactPathsResponse,
     LineageResponse,
     LineageSourcePathsResponse,
@@ -488,6 +489,44 @@ def get_lineage_impact(
             field_values=tuple(request.query_params.getlist("field")),
         )
     )
+
+
+# Read-only consistency audit of the lineage impact cache, appended one
+# segment after the lineage impact query: every field of the path version is
+# checked against its current cache record. The body is serialized directly
+# (rather than through the default JSON response) so the key order is fixed,
+# the whitespace is compact and the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/lineage/impact/cache-audit",
+    response_model=LineageImpactCacheAuditResponse,
+)
+def get_lineage_impact_cache_audit(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only: the audit is recomputed from the committed lineage graph and
+    # the persisted cache records on every read; nothing is written,
+    # invalidated or repaired. Any request body (even whitespace-only bytes)
+    # or any query parameter is a 422 validated in the repository once the
+    # path dataset/version have resolved, preserving 404 precedence.
+    result = LineageImpactCacheAuditResponse(
+        **repository.get_lineage_impact_cache_audit(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        result.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # Read-only shortest-path companion of the lineage impact query, appended one
