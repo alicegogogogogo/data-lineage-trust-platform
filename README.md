@@ -854,6 +854,39 @@ time. Snapshots (including their rows) survive restarts.
   parameter or any request body bytes (whitespace-only included) → `422`; a
   side with no snapshot at or before its timestamp → `404` and nothing is
   written.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/at/diff/masked` —
+  role-masked time-travel diff, appended one segment after the bare-row time
+  diff and accepting POST only. The body contains exactly `role`, `from` and
+  `to`: `{"role": "guest", "from": "2026-01-01T00:00:00Z", "to":
+  "2026-02-01T00:00:00Z"}`; each side selects the latest snapshot whose
+  `created_at` is not later than its timestamp (the same selection as the
+  bare-row time diff). The diff is computed on the unmasked rows with the
+  bare time diff's exact semantics — the same multiset comparison and
+  counts, the same field sets, entries sorted by the canonical text of the
+  raw row; masking then rewrites only the `row` of each `added`/`removed`
+  entry, exactly as the masked view masks it (enabled policies only, judged
+  per the request role; nulls and uncovered fields pass through), never
+  merging or splitting entries. The response reuses the bare time diff's
+  document shape, key order and determinism (compact whitespace, exactly one
+  trailing newline), echoing the submitted `from`/`to` values. Every
+  successful read appends one masking-hit record per masked value occurrence
+  across both sides' snapshots (structurally identical to the regular
+  view's hit records and continuing the same per-version sequence run) plus
+  exactly one access record whose `row_count` is the two sides' combined row
+  count and whose `masked_count` equals the number of hit records written by
+  the read. The records enter all existing masking-hit/access reads,
+  filters, summaries, diffs, reconciliation, trends and cleanup previews;
+  records of one read share a write timestamp, sequences stay continuous
+  across processes, and a write obstruction never fails the read. The read
+  never modifies or deletes snapshots or their rows and never changes
+  policies or identification records. Unknown dataset/version → `404`,
+  checked before every request-shape check; no snapshot existing at or
+  before either timestamp → `404` (checked ahead of the remaining shape
+  checks whenever that timestamp is usable); a missing or wrong-typed
+  `role`/`from`/`to`, a role blank after trimming, an unparseable or
+  timezone-less timestamp, an extra body field, an empty, whitespace-only or
+  non-JSON body, a non-object body and any query parameter are `422` and
+  write nothing.
 - `POST /datasets/{dataset}/versions/{version}/snapshots/at/masked-view` —
   role-masked time travel, appended one segment after the bare-row time
   lookup and accepting POST only. The body contains exactly `role` and

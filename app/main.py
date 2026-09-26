@@ -1738,6 +1738,42 @@ def diff_snapshots_at(
     return Response(content=payload + "\n", media_type="application/json")
 
 
+# Role-masked time-travel diff, appended one segment after the bare-row time
+# diff and accepting POST only. The body carries exactly role/from/to; the
+# diff is computed on the unmasked rows with the bare time diff's semantics
+# and masking only rewrites each entry's row. The raw body is validated in
+# the repository so an unknown dataset/version or a missing snapshot stays a
+# 404 checked ahead of every body/query shape check (all 422), mirroring the
+# masked view. The body is serialized directly so the key order is fixed, the
+# whitespace is compact and the document ends with exactly one newline.
+@app.post(
+    f"{SNAPSHOTS_PATH}/at/diff/masked",
+    response_model=SnapshotAtDiffResponse,
+)
+def diff_snapshots_at_masked(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    diff = SnapshotAtDiffResponse(
+        **repository.diff_snapshots_at_masked(
+            conn,
+            dataset_name,
+            version,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
 @app.get(f"{SNAPSHOTS_PATH}/{{snapshot_id}}", response_model=SnapshotResponse)
 def get_snapshot(
     dataset_name: str,

@@ -5816,6 +5816,208 @@ def diff_snapshots_at(
     }
 
 
+# Exact fields accepted by the snapshot masked time-diff request body.
+_SNAPSHOT_AT_DIFF_MASKED_FIELDS = frozenset({"role", "from", "to"})
+
+
+def _parse_snapshot_at_diff_masked_body(body: bytes) -> tuple[str, str, str]:
+    """Validate and parse a raw snapshot masked time-diff request body.
+
+    The body must be a JSON object carrying exactly ``role`` (a string that is
+    non-empty after trimming whitespace) and ``from``/``to`` (ISO-8601
+    date-times carrying a timezone). Returns the trimmed role and the two raw
+    timestamp strings. Every structural problem is a 422.
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    extra_keys = sorted(set(payload) - _SNAPSHOT_AT_DIFF_MASKED_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError(
+            "Unknown field(s): " + ", ".join(extra_keys)
+        )
+    if "role" not in payload:
+        raise RequestInvalidError("'role' is required")
+    if "from" not in payload:
+        raise RequestInvalidError("'from' is required")
+    if "to" not in payload:
+        raise RequestInvalidError("'to' is required")
+
+    raw_role = payload["role"]
+    if not isinstance(raw_role, str):
+        raise RequestInvalidError("'role' must be a string")
+    clean_role = raw_role.strip()
+    if not clean_role:
+        raise RequestInvalidError("'role' must not be empty")
+
+    for key in ("from", "to"):
+        raw = payload[key]
+        if not isinstance(raw, str):
+            raise RequestInvalidError(
+                f"'{key}' must be an ISO-8601 date-time with a timezone"
+            )
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise RequestInvalidError(
+                f"'{key}' must be an ISO-8601 date-time with a timezone"
+            ) from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise RequestInvalidError(f"'{key}' must include a timezone")
+    return clean_role, payload["from"], payload["to"]
+
+
+def _probe_at_diff_masked_timestamps(
+    body: bytes,
+) -> tuple[datetime | None, datetime | None]:
+    """Best-effort parse of the body timestamps for the 404-precedence lookup.
+
+    Returns the parsed ``from``/``to`` instants, each only when the body is a
+    JSON object carrying a timezone-bearing ISO-8601 string for it; anything
+    else yields ``None`` for that side. Those shape problems are reported as
+    422 by the strict parser afterwards — but when a side's time can be
+    determined, its missing-snapshot 404 is checked ahead of every other
+    shape check (mirrors the masked view's probe).
+    """
+    if not body.strip():
+        return None, None
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    targets: list[datetime | None] = []
+    for key in ("from", "to"):
+        target: datetime | None = None
+        raw = payload.get(key)
+        if isinstance(raw, str):
+            try:
+                parsed = datetime.fromisoformat(raw)
+            except ValueError:
+                parsed = None
+            if (
+                parsed is not None
+                and parsed.tzinfo is not None
+                and parsed.utcoffset() is not None
+            ):
+                target = parsed
+        targets.append(target)
+    return targets[0], targets[1]
+
+
+def diff_snapshots_at_masked(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Role-masked row/field diff between the snapshots selected at two times.
+
+    Each side selects the newest snapshot whose ``created_at`` is not later
+    than its own timestamp, exactly as the bare-row time diff does, and the
+    diff itself is computed on the unmasked rows with the bare diff's exact
+    multiset semantics — the same counts, the same field sets and entries
+    sorted by the canonical text of the raw row. Masking then rewrites only
+    the row carried by each entry, with the masked view's exact semantics
+    (enabled policies only, judged per the request role; nulls and uncovered
+    fields pass through), never merging or splitting entries.
+
+    Every successful read leaves the masked view's trail: one masking-hit
+    record per masked value occurrence across both sides' snapshots plus
+    exactly one access record whose row count is the two sides' combined row
+    count and whose masked count equals the number of hit records. The read
+    never modifies snapshots, rows, policies or identification records.
+
+    The path resolves first: unknown dataset/version is a 404. Whenever a
+    side's body timestamp is usable, that side's snapshot is resolved next,
+    so a missing-snapshot 404 precedes every body/query shape check (missing
+    or blank role, extra fields, query parameters); only afterwards is the
+    body strictly parsed, with every shape problem a 422 that writes nothing.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    from_row: sqlite3.Row | None = None
+    to_row: sqlite3.Row | None = None
+    probe_from, probe_to = _probe_at_diff_masked_timestamps(body)
+    if probe_from is not None:
+        from_row = _select_snapshot_at(conn, version_row["id"], probe_from)
+        if from_row is None:
+            raise NotFoundError(
+                f"No snapshot of version {version_number} of dataset "
+                f"'{dataset_name}' exists at or before the 'from' timestamp"
+            )
+    if probe_to is not None:
+        to_row = _select_snapshot_at(conn, version_row["id"], probe_to)
+        if to_row is None:
+            raise NotFoundError(
+                f"No snapshot of version {version_number} of dataset "
+                f"'{dataset_name}' exists at or before the 'to' timestamp"
+            )
+
+    # Strict body validation comes afterwards; the probe and this parser
+    # accept exactly the same timestamps, so every unparseable/naive timestamp
+    # is rejected here (422) and never reaches the comparison.
+    clean_role, raw_from, raw_to = _parse_snapshot_at_diff_masked_body(body)
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot masked time diff endpoint does not accept query "
+            "parameters"
+        )
+    assert from_row is not None and to_row is not None  # shared grammar
+
+    from_rows = json.loads(from_row["rows"])
+    to_rows = json.loads(to_row["rows"])
+    added, removed = _row_multiset_diff(from_rows, to_rows)
+    fields_added, fields_removed = _snapshot_field_sets(from_rows, to_rows)
+
+    # Mask both sides' rows once: the hits are the trail (one per masked
+    # value occurrence, baseline side first) and the masked forms rewrite the
+    # diff entries' rows, keyed by the raw canonical row text.
+    policies = _enabled_privacy_policies(conn, version_row["id"])
+    masked_by_raw_key: dict[str, dict[str, Any]] = {}
+    hits: list[tuple[str, int, str]] = []
+    for rows in (from_rows, to_rows):
+        masked_rows, side_hits = _mask_rows_for_role(policies, clean_role, rows)
+        hits.extend(side_hits)
+        for raw_row, masked_row in zip(rows, masked_rows):
+            masked_by_raw_key.setdefault(_canonical_row_text(raw_row), masked_row)
+    for entry in added + removed:
+        entry["row"] = masked_by_raw_key[_canonical_row_text(entry["row"])]
+
+    # The append is best-effort (collisions retry, then a serialized fallback
+    # runs, then the obstruction is swallowed): the masked comparison is
+    # returned even when the trail cannot be written, and a failed append
+    # rolls back so no half trail remains.
+    _record_privacy_view_trail_best_effort(
+        conn,
+        version_row["id"],
+        clean_role,
+        len(from_rows) + len(to_rows),
+        hits,
+    )
+
+    return {
+        "from_timestamp": raw_from,
+        "to_timestamp": raw_to,
+        "from_snapshot_id": from_row["id"],
+        "to_snapshot_id": to_row["id"],
+        "added": added,
+        "removed": removed,
+        "fields_added": fields_added,
+        "fields_removed": fields_removed,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Read-only cross-version snapshot comparison
 # --------------------------------------------------------------------------- #
