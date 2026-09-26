@@ -840,6 +840,47 @@ def get_quality_gate(
     return Response(content=payload + "\n", media_type="application/json")
 
 
+# Point-in-time release-readiness verdict, appended one segment after the
+# current gate and accepting GET only. The body is serialized directly so the
+# document is byte-identical to the current gate's shape (fixed key order,
+# compact whitespace, exactly one trailing newline).
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/gate/at",
+    response_model=QualityGateResponse,
+)
+def get_quality_gate_at(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    timestamp: str | None = Query(default=None),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset/version resolves first (404); every request-shape
+    # problem — body bytes (whitespace included), unknown or repeated query
+    # parameters, a missing, unparseable or timezone-less timestamp — is a
+    # 422 validated in the repository afterwards. The verdict is read-only;
+    # the only write is the read's privacy-view trail, which never makes the
+    # read fail.
+    gate = QualityGateResponse(
+        **repository.get_quality_gate_at(
+            conn,
+            dataset_name,
+            version,
+            raw_timestamp=timestamp,
+            timestamp_values=tuple(request.query_params.getlist("timestamp")),
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        gate.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
 # --------------------------------------------------------------------------- #
 # Quality anomaly detection over the evaluation history
 # --------------------------------------------------------------------------- #

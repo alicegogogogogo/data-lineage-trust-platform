@@ -12,13 +12,17 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+
+from app import repository
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -404,6 +408,9 @@ def test_successful_masked_view_writes_hit_and_access_records(
     assert access[0]["role"] == "guest"
     assert access[0]["row_count"] == 3
     assert access[0]["masked_count"] == 3
+    # The hit batch and the access record of the same read share one write
+    # time.
+    assert access[0]["created_at"] == hits[0]["created_at"]
 
     # Reading again appends a second, independent trail and the hit run
     # continues without reusing sequences.
@@ -513,6 +520,44 @@ def test_masked_view_trail_enters_the_existing_aggregates(
 # --------------------------------------------------------------------------- #
 # Immutability
 # --------------------------------------------------------------------------- #
+
+
+def test_masked_view_still_returns_rows_when_the_trail_write_fails(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    make_dataset_with_version(client)
+    create_policy(
+        client,
+        {"field": "email", "classification": "PII", "masking": "redact",
+         "allowed_roles": []},
+    )
+    snapshot = make_snapshot(client, [{"id": 1, "email": "alice@example.com"}])
+    timestamp = (
+        datetime.fromisoformat(snapshot["created_at"]) + timedelta(seconds=1)
+    ).isoformat()
+
+    def failing_trail(*args, **kwargs):
+        raise sqlite3.OperationalError("simulated trail write failure")
+
+    # A dedicated MonkeyPatch context so undoing it does not revert the
+    # autouse fixture's DATA_LINEAGE_DB environment patch.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(repository, "_record_privacy_view_trail", failing_trail)
+        response = masked_view(client, "guest", timestamp)
+        assert response.status_code == 200, response.text
+        assert response.json()["rows"] == [{"id": 1, "email": "***"}]
+
+        # The failed append left neither a hit record nor an access record.
+        assert client.get(AUDIT_PATH).json() == []
+        assert client.get(ACCESS_PATH).json() == []
+
+    # The snapshot is untouched and later reads trace normally again.
+    again = masked_view(client, "guest", timestamp)
+    assert again.status_code == 200
+    assert again.json()["snapshot_id"] == snapshot["id"]
+    assert len(client.get(AUDIT_PATH).json()) == 1
+    assert len(client.get(ACCESS_PATH).json()) == 1
 
 
 def test_masked_view_does_not_modify_snapshot_or_policies(

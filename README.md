@@ -442,6 +442,33 @@ recorded for rules since disabled still count).
     bytes — including whitespace-only ones — or any query parameter are a
     `422`, checked after the path dataset/version resolves (`404` first).
     Nothing is written on any rejection.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/gate/at?timestamp=...`
+  — point-in-time review of the same verdict. Only evaluations and anomaly
+  records whose write time (`created_at`) is not later than `timestamp`
+  count; the evaluation with the highest sequence in that window is the
+  latest one, and a window without any evaluation is `undetermined` with an
+  empty `reasons` list (a normal response, never an error). The verdict
+  literals, the reason construction and the ordering/counting rules are
+  exactly those of the current gate, so a far-future timestamp returns the
+  same document byte for byte. The response is the same deterministic JSON
+  document (fixed key order, compact whitespace, exactly one trailing
+  newline).
+  - `timestamp` is required exactly once and must be a timezone-bearing
+    ISO-8601 date-time (e.g. `2026-09-01T12:00:00+00:00`); a missing,
+    duplicated, blank, unparseable or timezone-less value, any other query
+    parameter, or any request body bytes (whitespace-only included) are a
+    `422`. An unknown dataset/version is a `404` checked ahead of every
+    shape check. Errors keep the `{"error", "detail"}` shape and never
+    expose SQL or internals.
+  - The verdict computation is fully read-only: evaluations, anomaly
+    records and rule definitions are never modified and the answer is
+    reproducible after a restart. Each successful read additionally leaves
+    the same trail a masked read leaves — one privacy-view access record
+    with zero rows masked (no per-value hits) — so the read enters the
+    existing masking-hit comparison and per-day reconciliation under the
+    `quality_gate_at` role; the hit batch and access record of a read share
+    one write timestamp. If that trail cannot be written, the gate answer
+    is still returned normally.
 
 ### Privacy policies
 

@@ -2761,6 +2761,70 @@ def list_quality_anomalies(
 # --------------------------------------------------------------------------- #
 
 
+def _quality_gate_verdict(
+    evaluation_rows: list[sqlite3.Row],
+    anomaly_rows: list[sqlite3.Row],
+) -> tuple[str, list[dict]]:
+    """Verdict and reason list over the given evaluation and anomaly records.
+
+    The verdict is one of:
+
+    - ``undetermined`` — no evaluation is present; the reason list is empty.
+    - ``fail`` — the highest-sequence evaluation still has violating rows, or
+      any anomaly record is present.
+    - ``pass`` — the highest-sequence evaluation passed every rule and no
+      anomaly record is present.
+
+    Each rule with violations in the highest-sequence evaluation contributes
+    one ``violation`` reason (its violation row count in that evaluation), and
+    every anomaly record contributes one reason of its own kind; the two are
+    never merged or deduplicated, and violations of rules since disabled still
+    count. Reasons sort by kind, history sequence and rule id (null ids
+    first), all ascending, independent of database order. The evaluation list
+    is taken ordered by sequence ascending, so its last element is the
+    latest; the anomaly order is irrelevant to the sorted result.
+    """
+    reasons: list[dict] = []
+    if evaluation_rows:
+        latest = evaluation_rows[-1]
+        for result in json.loads(latest["results"]):
+            violation_count = len(result["violations"])
+            if violation_count:
+                reasons.append(
+                    {
+                        "kind": "violation",
+                        "sequence": latest["sequence"],
+                        "rule_id": result["rule_id"],
+                        "violation_count": violation_count,
+                    }
+                )
+    for row in anomaly_rows:
+        reasons.append(
+            {
+                "kind": row["kind"],
+                "sequence": row["sequence"],
+                "rule_id": row["rule_id"],
+                "violation_count": row["violation_count"],
+            }
+        )
+    reasons.sort(
+        key=lambda reason: (
+            reason["kind"],
+            reason["sequence"],
+            reason["rule_id"] if reason["rule_id"] is not None else 0,
+        )
+    )
+
+    if not evaluation_rows:
+        verdict = "undetermined"
+        reasons = []
+    elif reasons:
+        verdict = "fail"
+    else:
+        verdict = "pass"
+    return verdict, reasons
+
+
 def get_quality_gate(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -2818,44 +2882,7 @@ def get_quality_gate(
         (version_id,),
     ).fetchall()
 
-    reasons: list[dict] = []
-    if evaluation_rows:
-        latest = evaluation_rows[-1]
-        for result in json.loads(latest["results"]):
-            violation_count = len(result["violations"])
-            if violation_count:
-                reasons.append(
-                    {
-                        "kind": "violation",
-                        "sequence": latest["sequence"],
-                        "rule_id": result["rule_id"],
-                        "violation_count": violation_count,
-                    }
-                )
-    for row in anomaly_rows:
-        reasons.append(
-            {
-                "kind": row["kind"],
-                "sequence": row["sequence"],
-                "rule_id": row["rule_id"],
-                "violation_count": row["violation_count"],
-            }
-        )
-    reasons.sort(
-        key=lambda reason: (
-            reason["kind"],
-            reason["sequence"],
-            reason["rule_id"] if reason["rule_id"] is not None else 0,
-        )
-    )
-
-    if not evaluation_rows:
-        verdict = "undetermined"
-        reasons = []
-    elif reasons:
-        verdict = "fail"
-    else:
-        verdict = "pass"
+    verdict, reasons = _quality_gate_verdict(evaluation_rows, anomaly_rows)
 
     return {
         "dataset": dataset["name"],
@@ -2868,6 +2895,145 @@ def get_quality_gate(
             "reasons": len(reasons),
         },
     }
+
+
+# Only query parameter accepted by the point-in-time quality gate.
+_QUALITY_GATE_AT_PARAMETERS = frozenset({"timestamp"})
+
+# Role recorded on the privacy-view trail a point-in-time masked gate read
+# leaves: the gate answer carries no submitted rows, so the masking trail is
+# only ever the single access record, stamped with who made the read.
+_QUALITY_GATE_AT_VIEW_ROLE = "quality_gate_at"
+
+
+def _records_at_or_before(
+    conn: sqlite3.Connection,
+    table: str,
+    version_id: int,
+    target: datetime,
+) -> list[sqlite3.Row]:
+    """Rows of one append-only table written at or before ``target``.
+
+    Only the persisted ``created_at`` write time decides membership, so the
+    window holds exactly what a reader at the requested instant could have
+    seen; the parsed instants also normalize any offset carried by the stored
+    timestamps. The rows come back ordered by sequence (evaluations) or id
+    (anomalies) ascending — the same explicit order the current gate uses —
+    so the last evaluation of the list is the highest-sequence one, never
+    relying on the database's natural order.
+    """
+    order_column = (
+        "sequence" if table == "quality_rule_evaluations" else "id"
+    )
+    rows = conn.execute(
+        f"SELECT * FROM {table} WHERE version_id = ?",
+        (version_id,),
+    ).fetchall()
+    window = [
+        row
+        for row in rows
+        if datetime.fromisoformat(row["created_at"]) <= target
+    ]
+    window.sort(key=lambda row: row[order_column])
+    return window
+
+
+def get_quality_gate_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    raw_timestamp: str | None,
+    timestamp_values: tuple[str, ...] = (),
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Release-readiness verdict of one version as of a historical instant.
+
+    This is the point-in-time view of :func:`get_quality_gate`: only
+    evaluations and anomaly records whose ``created_at`` write time is not
+    later than the requested timestamp count, and the highest-sequence
+    evaluation in that window is the latest one. The verdict literals and the
+    reason/count construction are exactly those of the current gate — a
+    window without any evaluation is ``undetermined`` with an empty reason
+    list and a normal response, and a window whose latest evaluation still
+    has violating rows (or that contains any anomaly record) is ``fail``.
+    Records written after the instant, and the rule definitions, are never
+    consulted; the evaluation history, anomaly records and rules are never
+    modified.
+
+    Every successful read additionally leaves the same privacy-view trail a
+    masked read leaves — one access record (no per-value hits, since no rows
+    are masked), so it enters the existing hit comparison and per-day
+    reconciliation exactly like any other view. The trail write never makes
+    the read fail: if it cannot be committed, the gate answer is returned
+    regardless and nothing about the verdict changes.
+
+    The path dataset/version resolves first (404), ahead of every shape
+    check. Any request body bytes (whitespace-only included), an unknown or
+    repeated query parameter, or a missing, unparseable or timezone-less
+    ``timestamp`` is a 422 checked next and writes nothing.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    # Any request body bytes are a shape error, including a body that is only
+    # whitespace (truthiness, not a strip, so pure-whitespace bytes reject too).
+    if body:
+        raise RequestInvalidError(
+            "The point-in-time quality gate endpoint does not accept a "
+            "request body"
+        )
+    unknown_keys = sorted(set(query_keys) - _QUALITY_GATE_AT_PARAMETERS)
+    if unknown_keys:
+        raise RequestInvalidError(
+            "Unknown query parameter(s): " + ", ".join(unknown_keys)
+        )
+    if len(timestamp_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must be provided exactly once"
+        )
+    if raw_timestamp is None or not raw_timestamp:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' is required and must be an "
+            "ISO-8601 date-time"
+        )
+    target = _parse_at_timestamp(raw_timestamp)
+
+    version_id = version_row["id"]
+    evaluation_rows = _records_at_or_before(
+        conn, "quality_rule_evaluations", version_id, target
+    )
+    anomaly_rows = _records_at_or_before(
+        conn, "quality_anomaly_records", version_id, target
+    )
+    verdict, reasons = _quality_gate_verdict(evaluation_rows, anomaly_rows)
+
+    result = {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "verdict": verdict,
+        "reasons": reasons,
+        "counts": {
+            "evaluations": len(evaluation_rows),
+            "anomalies": len(anomaly_rows),
+            "reasons": len(reasons),
+        },
+    }
+
+    # Leave the same trail a masked read leaves (a single access record, no
+    # per-value hits) so the point-in-time read enters the existing hit
+    # comparison and per-day reconciliation. The read is read-only with
+    # respect to gate state and must answer even when the trail append cannot
+    # be committed, so a failed append is swallowed rather than raised.
+    try:
+        _record_privacy_view_trail(
+            conn, version_id, _QUALITY_GATE_AT_VIEW_ROLE, 0, []
+        )
+    except sqlite3.Error:
+        conn.rollback()
+
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -3134,10 +3300,11 @@ def _append_privacy_view_audit_batch(
     version_id: int,
     role: str,
     hits: list[tuple[str, int, str]],
-) -> None:
+) -> str:
     """Insert all hit records of one view as the next sequences of the version.
 
-    All records of one view request share a single write timestamp.
+    Every record of the batch shares one write timestamp, generated here and
+    returned so the view's access record can carry the very same one.
 
     Sequences come from the version's high-water counter rather than
     ``MAX(sequence)``: confirmed cleanup requests delete records (so the max
@@ -3163,7 +3330,6 @@ def _append_privacy_view_audit_batch(
         (version_id,),
     ).fetchone()
     sequence = tail["next_sequence"]
-    # All records of one view request share a single write timestamp.
     created_at = utc_now_iso()
     for field, policy_id, masking in hits:
         conn.execute(
@@ -3187,6 +3353,7 @@ def _append_privacy_view_audit_batch(
         "WHERE version_id = ?",
         (sequence, version_id),
     )
+    return created_at
 
 
 def _append_privacy_view_access_record(
@@ -3195,8 +3362,12 @@ def _append_privacy_view_access_record(
     role: str,
     row_count: int,
     masked_count: int,
+    created_at: str,
 ) -> None:
-    """Insert the single access record of one view as the next sequence."""
+    """Insert the single access record of one view as the next sequence.
+
+    Carries the same ``created_at`` write timestamp as the view's hit batch.
+    """
     tail = conn.execute(
         "SELECT MAX(sequence) AS max_sequence "
         "FROM privacy_view_access_records WHERE version_id = ?",
@@ -3207,7 +3378,7 @@ def _append_privacy_view_access_record(
         "INSERT INTO privacy_view_access_records ("
         "version_id, sequence, role, row_count, masked_count, created_at"
         ") VALUES (?, ?, ?, ?, ?, ?)",
-        (version_id, sequence, role, row_count, masked_count, utc_now_iso()),
+        (version_id, sequence, role, row_count, masked_count, created_at),
     )
 
 
@@ -3222,13 +3393,19 @@ def _append_privacy_view_trail(
 
     The access record's ``masked_count`` is the number of hit records the same
     view writes, so the two logs always cross-check. Both appends ride the
-    same transaction, so a collision rolls both back together and a retry
-    re-appends both — the trail is never half-written.
+    same transaction and share one write timestamp — the one the hit batch
+    stamps, or a freshly generated one for a read with no hits — so a read's
+    hit records and its access record never land on different write times. A
+    collision rolls both back together and a retry re-appends both, so the
+    trail is never half-written.
     """
-    if hits:
+    created_at = (
         _append_privacy_view_audit_batch(conn, version_id, role, hits)
+        if hits
+        else utc_now_iso()
+    )
     _append_privacy_view_access_record(
-        conn, version_id, role, row_count, len(hits)
+        conn, version_id, role, row_count, len(hits), created_at
     )
 
 
@@ -3268,6 +3445,11 @@ def _record_privacy_view_trail(
     trail behind. If the bounded retries are ever exhausted, the append falls
     back to a dedicated connection serialized by BEGIN IMMEDIATE, so the view
     request still succeeds and no record is lost.
+
+    A read's hit batch and its access record share one write time: the
+    timestamp is generated inside the single trail append that actually
+    commits, and a failed attempt (including the serialized fallback) is
+    rolled back before another can commit.
     """
     with _privacy_view_audit_lock(version_id):
         for attempt in range(_PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS):
@@ -5276,17 +5458,23 @@ def view_snapshot_masked_at(
     masked_rows, hits = _mask_rows_for_role(policies, clean_role, snapshot_rows)
 
     # The trail is exactly the one a regular privacy view leaves: per-value
-    # hit records plus one access record whose row count is the snapshot's row
-    # count and whose masked count equals the number of hit records. An empty
-    # snapshot, an allowed role, all-null values or a version without policies
-    # leaves only the access record. The append never makes the read fail.
-    _record_privacy_view_trail(
-        conn,
-        version_row["id"],
-        clean_role,
-        len(snapshot_rows),
-        hits,
-    )
+    # hit records plus one access record sharing a single write timestamp, the
+    # access record's row count being the snapshot's row count and its masked
+    # count equalling the number of hit records. An empty snapshot, an allowed
+    # role, all-null values or a version without policies leaves only the
+    # access record. The append never makes the read fail: if it cannot be
+    # committed even through the serialized fallback, the masked rows are
+    # returned and the failed trail write is rolled back.
+    try:
+        _record_privacy_view_trail(
+            conn,
+            version_row["id"],
+            clean_role,
+            len(snapshot_rows),
+            hits,
+        )
+    except sqlite3.Error:
+        conn.rollback()
 
     return {
         "dataset": dataset["name"],
