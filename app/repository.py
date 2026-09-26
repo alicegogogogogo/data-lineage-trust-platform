@@ -1847,16 +1847,20 @@ def _json_combo_key(combo: tuple) -> str:
     return json.dumps(combo, sort_keys=True, separators=(",", ":"))
 
 
-def evaluate_quality_rules(
-    conn: sqlite3.Connection, dataset_name: str, version_number: int, rows: list[dict]
-) -> dict:
-    dataset = require_dataset(conn, dataset_name)
-    version_row = _require_schema_version(conn, dataset, version_number)
+def _evaluate_enabled_rules(
+    conn: sqlite3.Connection, version_id: int, rows: list[dict]
+) -> list[dict]:
+    """Run every enabled rule of one version against the given rows.
 
+    Shared by the submitted-rows evaluation and the persisted-snapshot
+    evaluation so both apply identical violation semantics (a missing field
+    counts as null, numeric range bounds are inclusive) and identical result
+    ordering (rules by id, violations as ascending row indices).
+    """
     rule_rows = conn.execute(
         "SELECT id, name, kind, params, enabled "
         "FROM quality_rules WHERE version_id = ? AND enabled = 1 ORDER BY id",
-        (version_row["id"],),
+        (version_id,),
     ).fetchall()
 
     results: list[dict] = []
@@ -1904,9 +1908,80 @@ def evaluate_quality_rules(
             }
         )
 
+    return results
+
+
+def evaluate_quality_rules(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int, rows: list[dict]
+) -> dict:
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    results = _evaluate_enabled_rules(conn, version_row["id"], rows)
+
     # Every successful evaluation appends an immutable summary to the history
     # (an empty submission is recorded too, with zero violations). A rejected
     # or failed evaluation raises above and leaves no record.
+    _record_quality_rule_evaluation(
+        conn,
+        version_row["id"],
+        row_count=len(rows),
+        violation_row_count=len(
+            {index for result in results for index in result["violations"]}
+        ),
+        results=results,
+    )
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "results": results,
+    }
+
+
+def evaluate_snapshot_quality_rules(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Evaluate the enabled rules against the persisted rows of one snapshot.
+
+    The snapshot's stored rows are checked exactly as submitted rows are by
+    ``evaluate_quality_rules``; the snapshot itself is only read, never
+    modified. The path is resolved first (unknown dataset/version/snapshot is
+    a 404, a snapshot owned by another version is a 422) and only then are
+    body bytes and query parameters rejected (422), so a rejected request
+    leaves no history record. A successful evaluation appends the same kind
+    of summary a submitted-rows evaluation appends, with the snapshot's
+    actual row count as ``row_count`` (zero for an empty snapshot).
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    snapshot_row = _find_snapshot_globally(conn, snapshot_id)
+    if snapshot_row is None:
+        raise NotFoundError(f"Snapshot {snapshot_id} does not exist")
+    if snapshot_row["version_id"] != version_row["id"]:
+        raise RequestInvalidError(
+            f"Snapshot {snapshot_id} does not belong to version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    if body.strip():
+        raise RequestInvalidError(
+            "The snapshot evaluation endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot evaluation endpoint does not accept query parameters"
+        )
+
+    rows = json.loads(snapshot_row["rows"])
+    results = _evaluate_enabled_rules(conn, version_row["id"], rows)
+
     _record_quality_rule_evaluation(
         conn,
         version_row["id"],

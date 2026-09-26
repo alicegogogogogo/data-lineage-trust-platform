@@ -1463,6 +1463,34 @@ def diff_snapshots(
     )
 
 
+# Parameterless like the other evaluation-history endpoints: the path is
+# resolved first (unknown dataset/version/snapshot stays a 404, a snapshot of
+# another version is a 422), then any body bytes or query parameters are a
+# 422 validated in the repository.
+@app.post(
+    f"{SNAPSHOTS_PATH}/{{snapshot_id}}/quality-rules/evaluate",
+    response_model=QualityRuleEvaluateResponse,
+)
+def evaluate_snapshot_quality_rules(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> QualityRuleEvaluateResponse:
+    return QualityRuleEvaluateResponse(
+        **repository.evaluate_snapshot_quality_rules(
+            conn,
+            dataset_name,
+            version,
+            snapshot_id,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #
