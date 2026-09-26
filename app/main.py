@@ -72,6 +72,7 @@ from app.models import (
     QualityGateResponse,
     RetentionPolicy,
     RetentionPolicyCreate,
+    RetentionSweepResponse,
     RetentionException,
     RetentionExceptionCreate,
     SensitiveIdentification,
@@ -1870,6 +1871,44 @@ def confirm_snapshot_deletion_request(
             conn, dataset_name, version, snapshot_id, request_id
         )
     )
+
+
+# Batch retention sweep mounted under the version's snapshot collection. The
+# body is serialized directly (rather than through the default JSON response)
+# so the key order is fixed, the whitespace is compact and the document ends
+# with exactly one newline.
+@app.post(
+    f"{SNAPSHOTS_PATH}/retention-sweep",
+    response_model=RetentionSweepResponse,
+)
+def sweep_snapshot_retention(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The raw body is validated in the repository once the path dataset and
+    # version have resolved, so an unknown dataset/version stays a 404 while a
+    # malformed body, an empty or whitespace-only body, extra fields, a
+    # missing/blank reason or any query parameter is a 422 that writes
+    # nothing. The sweep itself is one transaction: every expired snapshot
+    # without an open request gets a new deletion request, or none does.
+    sweep = RetentionSweepResponse(
+        **repository.sweep_snapshot_retention(
+            conn,
+            dataset_name,
+            version,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        sweep.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #

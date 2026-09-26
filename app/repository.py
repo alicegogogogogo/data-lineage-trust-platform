@@ -6059,6 +6059,175 @@ def confirm_snapshot_deletion_request(
 
 
 # --------------------------------------------------------------------------- #
+# Retention sweep: batch deletion requests for a version's expired snapshots
+# --------------------------------------------------------------------------- #
+
+
+# Fields accepted by a retention-sweep body; anything else is a 422.
+_RETENTION_SWEEP_FIELDS: frozenset[str] = frozenset({"reason"})
+
+
+def _parse_retention_sweep_body(body: bytes) -> str:
+    """Validate and parse a raw retention-sweep body.
+
+    The body must be a JSON object carrying exactly ``reason`` (a non-empty
+    string after trimming whitespace); the trimmed reason is returned. Every
+    structural problem is a 422 and nothing is written.
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    extra_keys = sorted(set(payload) - _RETENTION_SWEEP_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError(
+            "Unknown field(s): " + ", ".join(extra_keys)
+        )
+
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise RequestInvalidError("'reason' must be a non-empty string")
+    return reason.strip()
+
+
+def sweep_snapshot_retention(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Open a deletion request for every expired snapshot of one version.
+
+    A snapshot is expired when its age has reached the version policy's
+    ``retention_days`` — the same cutoff the confirm endpoint applies. Every
+    expired snapshot without an open (pending/blocked) request gets a new
+    request carrying the submitted reason; its status is ``blocked`` when the
+    version has downstream fields and ``pending`` otherwise, exactly like the
+    single-snapshot endpoint. Snapshots that already have an open request are
+    skipped (the existing request is echoed, never duplicated or modified) and
+    snapshots younger than the retention age are skipped silently. A version
+    without any snapshots yields empty collections and zero counts.
+
+    An unknown dataset/version is a 404 checked ahead of every request-shape
+    check; a missing retention policy is the same 404 as in the
+    single-snapshot endpoint; a malformed body or any query parameter is a
+    422. The whole sweep runs in this request's transaction: either every new
+    request is written or none is, and losing a race against a concurrent
+    open-request insert surfaces as a 409.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    clean_reason = _parse_retention_sweep_body(body)
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot retention sweep endpoint does not accept query "
+            "parameters"
+        )
+
+    policy_row = conn.execute(
+        "SELECT id, retention_days FROM retention_policies WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchone()
+    if policy_row is None:
+        raise NotFoundError(
+            f"No retention policy exists for version {version_number} of "
+            f"dataset '{dataset_name}'"
+        )
+
+    snapshot_rows = conn.execute(
+        "SELECT id, created_at FROM snapshots WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchall()
+    # The scan order is pinned to snapshot id ascending explicitly instead of
+    # relying on the database's natural row order.
+    snapshot_rows = sorted(snapshot_rows, key=lambda row: row["id"])
+
+    # The downstream impact of a deletion request depends only on the version,
+    # so one reachability walk covers every snapshot of the sweep.
+    impacted = _compute_version_field_impacted(conn, version_row["id"])
+    status = "blocked" if impacted else "pending"
+    impacted_json = json.dumps(impacted)
+
+    now = datetime.now(timezone.utc)
+    retention_age = timedelta(days=policy_row["retention_days"])
+
+    created: list[dict] = []
+    skipped: list[dict] = []
+    not_expired = 0
+    for snapshot_row in snapshot_rows:
+        snapshot_id = snapshot_row["id"]
+        created_at = datetime.fromisoformat(snapshot_row["created_at"])
+        if now - created_at < retention_age:
+            not_expired += 1
+            continue
+
+        open_request = conn.execute(
+            "SELECT id, status, reason FROM snapshot_deletion_requests "
+            "WHERE snapshot_id = ? AND status IN ('pending', 'blocked')",
+            (snapshot_id,),
+        ).fetchone()
+        if open_request is not None:
+            skipped.append(
+                {
+                    "snapshot_id": snapshot_id,
+                    "request_id": open_request["id"],
+                    "status": open_request["status"],
+                    "reason": open_request["reason"],
+                }
+            )
+            continue
+
+        try:
+            cursor = conn.execute(
+                "INSERT INTO snapshot_deletion_requests ("
+                "version_id, snapshot_id, policy_id, reason, status, impacted, "
+                "created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    version_row["id"],
+                    snapshot_id,
+                    policy_row["id"],
+                    clean_reason,
+                    status,
+                    impacted_json,
+                    utc_now_iso(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # A concurrent request opened a deletion request for this snapshot
+            # first; the whole sweep rolls back with this transaction.
+            raise ConflictError(
+                f"Snapshot {snapshot_id} already has an open deletion request"
+            ) from exc
+        created.append(
+            {
+                "snapshot_id": snapshot_id,
+                "request_id": cursor.lastrowid,
+                "status": status,
+                "reason": clean_reason,
+            }
+        )
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "created": created,
+        "skipped": skipped,
+        "created_count": len(created),
+        "skipped_count": len(skipped),
+        "not_expired_count": not_expired,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Retention exceptions (compliance holds blocking snapshot deletion)
 # --------------------------------------------------------------------------- #
 

@@ -937,6 +937,27 @@ downstream fields. Policies and requests are persisted across restarts.
   the status change to `confirmed`, and the response adds `confirmed_at`. Once
   deleted, the snapshot no longer appears in snapshot read, list, `at` or diff
   responses.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/retention-sweep` —
+  batch-scan every snapshot of the version and open a deletion request for
+  each expired one. Body contains only a non-empty `reason`, used for every
+  request the sweep creates. A snapshot is expired when its age has reached
+  the policy's `retention_days` (the confirm endpoint's cutoff). Expired
+  snapshots that already have a `pending`/`blocked` request are skipped
+  (the existing request is never duplicated or modified); younger snapshots
+  are skipped silently. Returns `200` with a deterministic JSON document
+  (fixed key order, compact whitespace, one trailing newline): `dataset`,
+  `version`, `created` and `skipped` (both sorted by snapshot id ascending,
+  entries carry `snapshot_id`, `request_id`, `status`, `reason`) and the
+  matching `created_count`, `skipped_count` and `not_expired_count`. The whole
+  sweep commits as one transaction — either every new request is written or
+  none is — and losing a race against a concurrent request returns `409`.
+
+  Unknown dataset/version → `404` (checked before any body validation); no
+  retention policy for the version → `404`; a missing/blank/non-string
+  `reason`, extra body fields, an empty/whitespace-only/malformed body or any
+  query parameter → `422` and nothing is written. A version without snapshots
+  returns zero counts. Created requests join the regular deletion-request
+  collection and confirm flow above.
 
   Unknown dataset/version/snapshot/policy/request → `404`; other invalid input
   → `422` and nothing is written.
