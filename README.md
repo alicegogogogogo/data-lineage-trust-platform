@@ -1010,6 +1010,35 @@ downstream fields. Policies and requests are persisted across restarts.
   the status change to `confirmed`, and the response adds `confirmed_at`. Once
   deleted, the snapshot no longer appears in snapshot read, list, `at` or diff
   responses.
+- `POST .../snapshots/{snapshot_id}/deletion-requests/{request_id}/recheck` —
+  controlled recomputation of an undecided request's blockage, appended one
+  segment after the deletion-request resource and accepting POST only. The
+  service recomputes, against the current lineage graph, the direct and
+  indirect downstream fields of every field of the snapshot's version with
+  exactly the reachability semantics of request creation: the set is
+  deduplicated, cycles terminate, no start field appears and the entries sort
+  by dataset, version and field ascending. While the request is still
+  undecided (`pending`/`blocked`) its `impacted` set is replaced by the
+  recomputation and its `status` is updated accordingly — `blocked` when any
+  downstream field exists, `pending` when none does — so a downstream added
+  after creation flips a `pending` request back to `blocked` (preventing the
+  deletion of a snapshot still in use), while a removed downstream flips a
+  `blocked` request back to `pending`, after which it confirms under the
+  existing age rule. The endpoint takes no request body and no query
+  parameters: any body bytes (whitespace-only or invalid JSON included) or any
+  query parameter are a `422`, checked after the path resources resolve.
+  Unknown dataset, version or request → `404`; a request that exists but does
+  not belong to the path snapshot → `422`; rechecking an already confirmed
+  request, even after its snapshot has been deleted, → `409` and no field
+  changes. Concurrent rechecks of the same request, and a recheck racing a
+  confirmation or the batch retention sweep, have exactly one winner — the
+  loser receives `409` and writes nothing — through a process-local guard and
+  a fail-fast write transaction. Success returns the updated request in the
+  creation response shape with the recomputed `status` and `impacted` and all
+  other fields unchanged; the rewritten set and status survive restarts and
+  the deletion-request list keeps returning records by `id` ascending. The
+  recheck never deletes a snapshot, never creates a request and never changes
+  retention policies, the snapshot-age rule or lineage mappings.
 
   Unknown dataset/version/snapshot/policy/request → `404`; other invalid input
   → `422` and nothing is written.

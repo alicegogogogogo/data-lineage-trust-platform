@@ -1977,6 +1977,61 @@ def confirm_snapshot_deletion_request(
     )
 
 
+# Controlled recomputation of an open deletion request's blocked/pending
+# state. The process-local guard is declared before the database dependency so
+# the lock is taken before the request connection opens and — dependencies
+# tearing down in reverse order — released only after the transaction commits;
+# a concurrent recheck of the same request therefore meets a held lock and
+# loses with a 409 instead of waiting (mirrors the impact cache repair guard).
+def _deletion_request_recheck_guard(request_id: int) -> Iterator[None]:
+    lock = repository.deletion_request_recheck_lock(request_id)
+    if not lock.acquire(blocking=False):
+        raise ConflictError(
+            f"Snapshot deletion request {request_id} is already being "
+            f"rechecked by another request"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@app.post(
+    f"{DELETION_REQUESTS_PATH}/{{request_id}}/recheck",
+    response_model=SnapshotDeletionRequest,
+)
+def recheck_snapshot_deletion_request(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    request_id: int,
+    body: bytes = Depends(_read_request_body),
+    _recheck: None = Depends(_deletion_request_recheck_guard),
+    conn=Depends(get_db),
+) -> SnapshotDeletionRequest:
+    # Recompute the version fields' direct and indirect downstream set
+    # against the current lineage graph and replace the impacted set and the
+    # status of an undecided request; confirmed requests stay untouched (409),
+    # even once their snapshot is gone. The endpoint accepts only POST with no
+    # request body and no query parameters — any body bytes, invalid JSON or
+    # query parameter are a 422, judged after every path resource resolves
+    # (404 first; a request owned by another snapshot is a 422). Concurrent
+    # rechecks and a recheck racing a confirmation or the batch sweep have a
+    # single winner; the loser is a 409 and writes nothing.
+    return SnapshotDeletionRequest(
+        **repository.recheck_snapshot_deletion_request(
+            conn,
+            dataset_name,
+            version,
+            snapshot_id,
+            request_id,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
 # Batch retention cleanup of the version's snapshots, appended one segment
 # after the version's snapshot collection and accepting POST only. Every
 # expired snapshot without an open deletion request gets one in a single
