@@ -3018,6 +3018,45 @@ def _mask_value(value: Any, masking: str) -> Any:
     return REDACTED
 
 
+def _mask_rows_for_role(
+    conn: sqlite3.Connection,
+    version_id: int,
+    clean_role: str,
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[tuple[str, int, str]]]:
+    """Mask ``rows`` for ``clean_role`` under the version's enabled policies.
+
+    Returns the order-preserving masked copy together with one hit per value
+    actually masked, in row order (the fields of one row in policy id order):
+    the same field masked in several rows hits once per row, and different
+    fields hit independently. A null value, an allowed role, an uncovered
+    field, a field missing from the row or a disabled policy never hits.
+    """
+    policy_rows = conn.execute(
+        "SELECT id, field, masking, allowed_roles FROM privacy_policies "
+        "WHERE version_id = ? AND enabled = 1 ORDER BY id",
+        (version_id,),
+    ).fetchall()
+
+    policies: dict[str, tuple[int, str, set[str]]] = {
+        row["field"]: (row["id"], row["masking"], set(json.loads(row["allowed_roles"])))
+        for row in policy_rows
+    }
+
+    masked_rows: list[dict[str, Any]] = []
+    hits: list[tuple[str, int, str]] = []
+    for row in rows:
+        masked_row = dict(row)
+        for field, (policy_id, masking, allowed_roles) in policies.items():
+            if field in masked_row and clean_role not in allowed_roles:
+                value = masked_row[field]
+                masked_row[field] = _mask_value(value, masking)
+                if value is not None:
+                    hits.append((field, policy_id, masking))
+        masked_rows.append(masked_row)
+    return masked_rows, hits
+
+
 def view_privacy_rows(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -3032,33 +3071,9 @@ def view_privacy_rows(
     if not clean_role:
         raise RequestInvalidError("Role must not be empty")
 
-    policy_rows = conn.execute(
-        "SELECT id, field, masking, allowed_roles FROM privacy_policies "
-        "WHERE version_id = ? AND enabled = 1 ORDER BY id",
-        (version_row["id"],),
-    ).fetchall()
-
-    policies: dict[str, tuple[int, str, set[str]]] = {
-        row["field"]: (row["id"], row["masking"], set(json.loads(row["allowed_roles"])))
-        for row in policy_rows
-    }
-
-    masked_rows: list[dict[str, Any]] = []
-    # One audit hit per value actually masked by this request, in row order
-    # (the fields of one row in policy id order): the same field masked in
-    # several rows hits once per row, and different fields hit independently.
-    # A null value, an allowed role, an uncovered field, a field missing from
-    # the row or a disabled policy never hits.
-    hits: list[tuple[str, int, str]] = []
-    for row in rows:
-        masked_row = dict(row)
-        for field, (policy_id, masking, allowed_roles) in policies.items():
-            if field in masked_row and clean_role not in allowed_roles:
-                value = masked_row[field]
-                masked_row[field] = _mask_value(value, masking)
-                if value is not None:
-                    hits.append((field, policy_id, masking))
-        masked_rows.append(masked_row)
+    masked_rows, hits = _mask_rows_for_role(
+        conn, version_row["id"], clean_role, rows
+    )
 
     # Every successful view leaves exactly one access record, whether or not
     # any value was masked (an empty row set or a view that masked nothing is
@@ -5061,6 +5076,33 @@ def _parse_at_timestamp(raw: str) -> datetime:
     return parsed
 
 
+def _select_snapshot_row_at(
+    conn: sqlite3.Connection, version_id: int, target: datetime
+) -> sqlite3.Row | None:
+    """Newest snapshot of the version created at or before ``target``.
+
+    The newest is picked chronologically (ties broken by the highest id);
+    comparing parsed instants also handles any offset in the target. Returns
+    the full snapshot row, or ``None`` when no snapshot is eligible.
+    """
+    candidates = conn.execute(
+        "SELECT id, created_at FROM snapshots WHERE version_id = ?",
+        (version_id,),
+    ).fetchall()
+    eligible = [
+        (datetime.fromisoformat(row["created_at"]), row["id"])
+        for row in candidates
+        if datetime.fromisoformat(row["created_at"]) <= target
+    ]
+    if not eligible:
+        return None
+    match_id = max(eligible, key=lambda item: (item[0], item[1]))[1]
+    return conn.execute(
+        "SELECT id, row_count, rows, created_at FROM snapshots WHERE id = ?",
+        (match_id,),
+    ).fetchone()
+
+
 def get_snapshot_at(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -5076,31 +5118,117 @@ def get_snapshot_at(
     dataset = require_dataset(conn, dataset_name)
     version_row = _require_schema_version(conn, dataset, version_number)
 
-    # Select the newest snapshot chronologically (ties broken by the highest
-    # id); comparing parsed instants also handles any offset in the target.
-    candidates = conn.execute(
-        "SELECT id, created_at FROM snapshots WHERE version_id = ?",
-        (version_row["id"],),
-    ).fetchall()
-    eligible = [
-        (datetime.fromisoformat(row["created_at"]), row["id"])
-        for row in candidates
-        if datetime.fromisoformat(row["created_at"]) <= target
-    ]
-    if not eligible:
+    row = _select_snapshot_row_at(conn, version_row["id"], target)
+    if row is None:
         raise NotFoundError(
             f"No snapshot of version {version_number} of dataset "
             f"'{dataset_name}' exists at or before the requested timestamp"
         )
-    match_id = max(eligible, key=lambda item: (item[0], item[1]))[1]
-
-    row = conn.execute(
-        "SELECT id, row_count, rows, created_at FROM snapshots WHERE id = ?",
-        (match_id,),
-    ).fetchone()
     result = _snapshot_metadata(row, dataset["name"], version_row["version"])
     result["rows"] = json.loads(row["rows"])
     return result
+
+
+_SNAPSHOT_MASKED_VIEW_FIELDS: frozenset[str] = frozenset({"role", "timestamp"})
+
+
+def view_snapshot_masked_rows(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Role-scoped masked read of the snapshot selected by time travel.
+
+    The body is a JSON object carrying exactly ``role`` and ``timestamp``;
+    the newest snapshot created at or before ``timestamp`` is masked with
+    exactly the privacy view's semantics (only the version's enabled
+    policies, same per-value hit rule) and returned in its stored row order.
+    The read never modifies or deletes the snapshot, its rows, the policies
+    or the identification records.
+
+    The path dataset/version resolves first (404), then the body must yield
+    a usable ``timestamp`` so the snapshot can be selected (404 when none
+    matches); every remaining shape problem — a blank role, an extra field,
+    a query parameter — is a 422 checked afterwards, so both 404s keep
+    precedence over the shape checks. Every rejection writes nothing.
+
+    Like the privacy view, every successful read appends one masking-hit
+    record per masked value and exactly one access record (``row_count`` is
+    the snapshot's row count, ``masked_count`` the number of hit records),
+    through the same trail append with the same continuity and never-fail
+    guarantees.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    raw_timestamp = payload.get("timestamp")
+    if not isinstance(raw_timestamp, str) or not raw_timestamp:
+        raise RequestInvalidError(
+            "'timestamp' must be an ISO-8601 date-time with a timezone"
+        )
+    try:
+        target = datetime.fromisoformat(raw_timestamp)
+    except ValueError as exc:
+        raise RequestInvalidError(
+            "'timestamp' must be an ISO-8601 date-time with a timezone"
+        ) from exc
+    if target.tzinfo is None or target.utcoffset() is None:
+        raise RequestInvalidError("'timestamp' must include a timezone")
+
+    row = _select_snapshot_row_at(conn, version_row["id"], target)
+    if row is None:
+        raise NotFoundError(
+            f"No snapshot of version {version_number} of dataset "
+            f"'{dataset_name}' exists at or before the requested timestamp"
+        )
+
+    # Both 404s are settled; only now do the remaining shape checks run.
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot masked view endpoint does not accept query "
+            "parameters"
+        )
+    extra_keys = sorted(set(payload) - _SNAPSHOT_MASKED_VIEW_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra_keys))
+    role = payload.get("role")
+    if not isinstance(role, str):
+        raise RequestInvalidError("'role' must be a non-empty string")
+    clean_role = role.strip()
+    if not clean_role:
+        raise RequestInvalidError("Role must not be empty")
+
+    rows = json.loads(row["rows"])
+    masked_rows, hits = _mask_rows_for_role(
+        conn, version_row["id"], clean_role, rows
+    )
+    _record_privacy_view_trail(
+        conn,
+        version_row["id"],
+        clean_role,
+        len(rows),
+        hits,
+    )
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "snapshot_id": row["id"],
+        "created_at": row["created_at"],
+        "rows": masked_rows,
+    }
 
 
 def _find_snapshot_globally(

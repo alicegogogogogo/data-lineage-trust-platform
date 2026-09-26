@@ -227,6 +227,28 @@ schema version in a different (source) dataset.
   body bytes (whitespace-only included) or query parameter → `422`, and an
   unknown dataset or version → `404`, with `404` taking precedence over
   `422` as in the impact query.
+- `POST /datasets/{dataset}/versions/{version}/lineage/impact/cache-audit/repair`
+  — controlled repair of the version's impact cache, appended one segment
+  after the read-only cache audit address and accepting POST only. Every
+  field of the version is recomputed against the committed lineage graph
+  with exactly the impact-query semantics (downstream fields merged and
+  deduplicated, the start field excluded, cycles terminating): a field
+  without a cache record gets one (`created`), a stored record that
+  disagrees with the recomputation is rewritten (`updated`) and a record
+  that already matches is left untouched (`unchanged`). The JSON document is
+  deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline) with top-level keys `dataset`, `version`, `entries` and `counts`
+  in that order; each entry is `{"field", "action"}` sorted by field name
+  ascending and `counts` gives `created_count`, `updated_count` and
+  `unchanged_count`. Written records are ordinary cache rows, so they are
+  immediately visible to impact queries and survive restarts, and a
+  subsequent audit reports every field as `cached`. The endpoint takes no
+  request body and no query parameters; any body bytes (whitespace-only
+  included) or query parameter → `422`, and an unknown dataset or version →
+  `404`, with `404` taking precedence over `422` as in the cache audit.
+  Concurrent repairs of the same version have a single winner — the loser
+  gets `409` and changes nothing — and every other rejection writes nothing
+  either.
 - `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
   read-only shortest-path explanation of the same impact, computed fresh on
   every read (no caching; nothing is written, and version definitions, lineage
@@ -764,6 +786,35 @@ time. Snapshots (including their rows) survive restarts.
   ISO-8601 date-time (an offset or trailing `Z`): missing, invalid or
   timezone-less values return `422`; unknown dataset/version → `404`; when no
   snapshot exists at or before the timestamp the response is `404`.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/masked-view` —
+  role-scoped masked companion of the time-travel read, appended one segment
+  after the snapshots collection and accepting POST only. The body is a JSON
+  object carrying exactly `role` and `timestamp`:
+  `{"role": "guest", "timestamp": "2026-01-01T00:00:00Z"}`. The newest
+  snapshot whose `created_at` is not later than `timestamp` is selected
+  exactly as in the time-travel read, and its rows are returned in their
+  stored order, masked with exactly the privacy view's semantics: only the
+  version's enabled policies apply, a value is masked when the role is not
+  in the policy's `allowed_roles`, `redact` replaces every non-`null` value
+  with `"***"` and `partial` keeps the first character and last two
+  characters of strings longer than 4 characters. The response is
+  `{"dataset", "version", "snapshot_id", "created_at", "rows"}` with the
+  selected snapshot's id and creation time. An empty snapshot, an allowed
+  role, all-`null` values and a version without policies all succeed and
+  mask nothing. Every masked value appends one masking-hit record and every
+  successful read appends exactly one access record (`row_count` is the
+  snapshot's row count, `masked_count` the number of hit records the same
+  read wrote) — the same records the privacy view writes, listed, searched,
+  summarized, diffed, reconciled, trended and cleaned up through the
+  existing privacy view audit endpoints, with the same continuous
+  per-version sequences and shared write timestamps. The read never modifies
+  or deletes the snapshot or its rows and never rewrites policies or
+  identification records. Unknown dataset/version → `404`, and no snapshot
+  at or before the timestamp → `404`, both checked before the request-shape
+  rules; a missing or wrongly typed `role`/`timestamp`, a role blank after
+  trimming, an unparseable or timezone-less `timestamp`, an extra body
+  field, an empty or whitespace-only body, malformed JSON, a non-object body
+  or any query parameter → `422`, and every rejection writes nothing.
 - `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/diff/{other_snapshot_id}` —
   compare two snapshots as JSON-object multisets. Object key order does not
   affect equality, while array order and JSON value types do (e.g. `1`, `1.0`,

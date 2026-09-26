@@ -83,6 +83,7 @@ from app.models import (
     ConfirmedSnapshotDeletionRequest,
     SnapshotDeletionRequestCreate,
     SnapshotDiffResponse,
+    SnapshotMaskedViewResponse,
     SnapshotMetadata,
     SnapshotResponse,
     VersionCompatibilityResponse,
@@ -1572,6 +1573,33 @@ def get_snapshot_at(
 ) -> SnapshotResponse:
     return SnapshotResponse(
         **repository.get_snapshot_at(conn, dataset_name, version, timestamp)
+    )
+
+
+# Role-scoped masked companion of the time-travel read, appended one segment
+# after the snapshots collection and accepting POST only. Declared before the
+# "/{snapshot_id}" route so the literal "masked-view" segment is never parsed
+# as a snapshot id.
+@app.post(f"{SNAPSHOTS_PATH}/masked-view", response_model=SnapshotMaskedViewResponse)
+def view_snapshot_masked_rows(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> SnapshotMaskedViewResponse:
+    # The body is parsed in the repository (after the path dataset/version
+    # resolves and the timestamp selects a snapshot) so an unknown
+    # dataset/version and an unmatched timestamp keep their 404 precedence
+    # over every request-shape 422.
+    return SnapshotMaskedViewResponse(
+        **repository.view_snapshot_masked_rows(
+            conn,
+            dataset_name,
+            version,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
     )
 
 

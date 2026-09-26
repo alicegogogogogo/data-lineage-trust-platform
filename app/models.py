@@ -929,6 +929,17 @@ class SnapshotResponse(SnapshotMetadata):
     rows: list[dict[str, Any]]
 
 
+# Role-scoped masked read of the snapshot selected by time travel: the rows
+# of the newest snapshot created at or before the requested timestamp, masked
+# exactly as the privacy view masks submitted rows.
+class SnapshotMaskedViewResponse(BaseModel):
+    dataset: str
+    version: int
+    snapshot_id: int
+    created_at: str
+    rows: list[dict[str, Any]]
+
+
 class SnapshotDiffEntry(BaseModel):
     row: dict[str, Any]
     count: int
