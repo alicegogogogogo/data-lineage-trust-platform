@@ -366,6 +366,40 @@ immutable anomaly records that persist across restarts.
   when there are none, never an error). Same `404`/`422` rules as the scan
   endpoint; nothing is written.
 
+### Quality gate
+
+The quality gate is the release-readiness verdict of a schema version. It is
+computed fresh from the persisted records on every read — nothing is cached,
+re-run or written, and the rule definitions are never consulted (violations
+recorded for rules since disabled still count).
+
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/gate` — return the
+  verdict as a deterministic JSON document (fixed key order, compact
+  whitespace, exactly one trailing newline):
+  `{"dataset", "version", "verdict", "reasons", "counts"}`.
+  - `verdict` is one of:
+    - `pass` — the latest recorded evaluation passed every rule and no
+      anomaly record exists; a zero-violation evaluation left by an empty
+      `rows` submission is a valid basis.
+    - `undetermined` — no evaluation was ever recorded; `reasons` is empty
+      and the read succeeds (never an error).
+    - `fail` — the latest recorded evaluation still has violating rows, or
+      the version carries any anomaly record.
+  - `reasons` lists every factor that lowers the verdict, sorted by `kind`,
+    `sequence` and `rule_id` (null ids first), all ascending. Each reason has
+    `kind`, `sequence`, `rule_id` and `violation_count` (a missing rule id is
+    `null`, never omitted). Every rule with violations in the latest
+    evaluation contributes one `violation` reason with its violation row
+    count; every persisted anomaly record contributes one reason of its own
+    kind (`row_limit`, `rule_limit` or `trend`). A rule that appears in both
+    yields two reasons — they are never merged or deduplicated.
+  - `counts` reports how many persisted records the verdict examined:
+    `evaluations`, `anomalies` and `reasons` (the length of the reason list).
+  - The endpoint takes no request body and no query parameters: any body
+    bytes — including whitespace-only ones — or any query parameter are a
+    `422`, checked after the path dataset/version resolves (`404` first).
+    Nothing is written on any rejection.
+
 ### Privacy policies
 
 Privacy policies attach a sensitivity classification and masking strategy to a

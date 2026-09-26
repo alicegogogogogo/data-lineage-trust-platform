@@ -411,6 +411,42 @@ class QualityAnomalyRecord(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Quality gate: release readiness verdict over the persisted records
+# --------------------------------------------------------------------------- #
+
+
+QualityGateVerdict = Literal["pass", "undetermined", "fail"]
+
+# 'violation' marks a rule with violations in the latest evaluation; the other
+# kinds reuse the anomaly record literals.
+QualityGateReasonKind = Literal["violation", "row_limit", "rule_limit", "trend"]
+
+
+class QualityGateReason(BaseModel):
+    kind: QualityGateReasonKind
+    # History sequence of the evaluation the reason points to.
+    sequence: int
+    # Null when the reason is not tied to one rule (row_limit/trend records);
+    # the key is never omitted.
+    rule_id: int | None
+    violation_count: int
+
+
+class QualityGateCounts(BaseModel):
+    evaluations: int
+    anomalies: int
+    reasons: int
+
+
+class QualityGateResponse(BaseModel):
+    dataset: str
+    version: int
+    verdict: QualityGateVerdict
+    reasons: list[QualityGateReason]
+    counts: QualityGateCounts
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 

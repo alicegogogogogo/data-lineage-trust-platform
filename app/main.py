@@ -66,6 +66,7 @@ from app.models import (
     QualityRuleEvaluateResponse,
     QualityRuleEvaluationDiffResponse,
     QualityRuleEvaluationRecord,
+    QualityGateResponse,
     RetentionPolicy,
     RetentionPolicyCreate,
     RetentionException,
@@ -694,6 +695,43 @@ def list_quality_rule_evaluations(
             query_keys=tuple(request.query_params.keys()),
         )
     ]
+
+
+# Read-only release-readiness verdict of the version, computed fresh from the
+# persisted evaluation history and anomaly records on every call; nothing is
+# cached or written. The body is serialized directly (rather than through the
+# default JSON response) so the key order is fixed, the whitespace is compact
+# and the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/gate",
+    response_model=QualityGateResponse,
+)
+def get_quality_gate(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset/version is known, preserving 404 precedence (mirrors the
+    # evaluation history endpoint).
+    gate = QualityGateResponse(
+        **repository.get_quality_gate(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        gate.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #

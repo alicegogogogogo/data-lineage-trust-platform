@@ -2534,6 +2534,120 @@ def list_quality_anomalies(
 
 
 # --------------------------------------------------------------------------- #
+# Quality gate: release readiness verdict over the persisted records
+# --------------------------------------------------------------------------- #
+
+
+def get_quality_gate(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Release-readiness verdict of one version, computed fresh on every read.
+
+    Only the persisted records are consulted — the evaluation history and the
+    anomaly records — never the rule definitions, and nothing is re-run,
+    cached or written. The verdict is one of:
+
+    - ``undetermined`` — no evaluation was ever recorded; the reason list is
+      empty and the read succeeds (never an error).
+    - ``fail`` — the latest recorded evaluation still has violating rows, or
+      the version carries any anomaly record.
+    - ``pass`` — the latest recorded evaluation passed every rule and no
+      anomaly record exists; a zero-violation evaluation left by an empty row
+      submission is a valid basis.
+
+    Each rule with violations in the latest evaluation contributes one
+    ``violation`` reason (its violation row count in that evaluation), and
+    every persisted anomaly record contributes one reason of its own kind;
+    the two are never merged or deduplicated, and violations of rules since
+    disabled still count. Reasons sort by kind, history sequence and rule id
+    (null ids first), all ascending, independent of database order.
+
+    The path dataset/version resolves first (404); any request body bytes —
+    including whitespace-only ones — or any query parameter are a 422 checked
+    afterwards (unlike the other read-only endpoints, which tolerate
+    whitespace-only bodies).
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body:
+        raise RequestInvalidError(
+            "The quality gate endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The quality gate endpoint does not accept query parameters"
+        )
+    version_id = version_row["id"]
+
+    evaluation_rows = conn.execute(
+        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_id,),
+    ).fetchall()
+    anomaly_rows = conn.execute(
+        "SELECT * FROM quality_anomaly_records WHERE version_id = ? "
+        "ORDER BY id ASC",
+        (version_id,),
+    ).fetchall()
+
+    reasons: list[dict] = []
+    if evaluation_rows:
+        latest = evaluation_rows[-1]
+        for result in json.loads(latest["results"]):
+            violation_count = len(result["violations"])
+            if violation_count:
+                reasons.append(
+                    {
+                        "kind": "violation",
+                        "sequence": latest["sequence"],
+                        "rule_id": result["rule_id"],
+                        "violation_count": violation_count,
+                    }
+                )
+    for row in anomaly_rows:
+        reasons.append(
+            {
+                "kind": row["kind"],
+                "sequence": row["sequence"],
+                "rule_id": row["rule_id"],
+                "violation_count": row["violation_count"],
+            }
+        )
+    reasons.sort(
+        key=lambda reason: (
+            reason["kind"],
+            reason["sequence"],
+            reason["rule_id"] if reason["rule_id"] is not None else 0,
+        )
+    )
+
+    if not evaluation_rows:
+        verdict = "undetermined"
+        reasons = []
+    elif reasons:
+        verdict = "fail"
+    else:
+        verdict = "pass"
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "verdict": verdict,
+        "reasons": reasons,
+        "counts": {
+            "evaluations": len(evaluation_rows),
+            "anomalies": len(anomaly_rows),
+            "reasons": len(reasons),
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 
