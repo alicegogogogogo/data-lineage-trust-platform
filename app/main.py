@@ -1042,6 +1042,58 @@ def patch_privacy_policy(
     )
 
 
+def _privacy_policy_revision_guard(
+    dataset_name: str, version: int, policy_id: int
+) -> Iterator[None]:
+    # Declared before the database dependency so the lock is taken before the
+    # request connection is opened, and — dependencies tearing down in
+    # reverse order — released only after the transaction commits. A
+    # concurrent revision of the same policy therefore meets a held lock
+    # wherever it starts and loses with a 409 instead of waiting.
+    lock = repository.privacy_policy_revision_lock(
+        dataset_name, version, policy_id
+    )
+    if not lock.acquire(blocking=False):
+        raise ConflictError(
+            f"Privacy policy {policy_id} of version {version} of dataset "
+            f"'{dataset_name}' is being revised by another request"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@app.put(
+    "/datasets/{dataset_name}/versions/{version}/privacy-policies/{policy_id}",
+    response_model=PrivacyPolicy,
+)
+def put_privacy_policy(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    policy_id: int,
+    body: bytes = Depends(_read_request_body),
+    _revision_guard: None = Depends(_privacy_policy_revision_guard),
+    conn=Depends(get_db),
+) -> PrivacyPolicy:
+    # Revise classification, masking and allowed roles together. The body is
+    # parsed in the repository (after the path dataset/version/policy
+    # resolves) so a missing/malformed/extra/illegal field stays a 422 while
+    # an unknown dataset, version or policy keeps its 404 precedence;
+    # concurrent revisions of the same policy have a single winner (409).
+    return PrivacyPolicy(
+        **repository.revise_privacy_policy(
+            conn,
+            dataset_name,
+            version,
+            policy_id,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
 @app.post(
     "/datasets/{dataset_name}/versions/{version}/privacy-policies/view",
     response_model=PrivacyViewResponse,

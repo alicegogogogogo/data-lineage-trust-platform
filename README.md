@@ -478,6 +478,34 @@ data. Policies (including their enabled state) are persisted across restarts.
 - `PATCH /datasets/{dataset}/versions/{version}/privacy-policies/{policy_id}` —
   enable or disable a policy. Body: `{"enabled": true}` (boolean only); returns
   the updated policy. Unknown policy/dataset/version → `404`.
+- `PUT /datasets/{dataset}/versions/{version}/privacy-policies/{policy_id}` —
+  revise a policy. Body carries exactly the three adjustable fields:
+  `{"classification": "PII", "masking": "partial", "allowed_roles":
+  ["analyst"]}`, using the same value rules as registration — a non-empty
+  `classification` after trimming, `masking` of `redact` or `partial`, and an
+  `allowed_roles` array of distinct, non-empty-after-trimming role names that
+  may be empty. The three fields are replaced together from one whole
+  submission. The revision never changes the policy id, the field it belongs
+  to, its `enabled` state or its `created_at`; it writes only the policy
+  itself — no policy is created, no identification record is touched and no
+  masking suggestion is registered. Returns `200` with the updated policy in
+  the same shape as the policy read, and the revision survives restarts. The
+  next privacy view read (and every later masked read) judges each value by
+  the revised classification, masking and allowed roles. Already-written
+  masking-hit records, access records and cleanup requests are unaffected —
+  their contents and ordering stay as written; the grouping of the summary,
+  diff and reconciliation responses keeps the same counting rules, while the
+  policy classification and masking reported on trend rows (and the policy
+  entries of the coverage check and compliance export) reflect the current
+  values. Advisory masking suggestions are unaffected. Unknown
+  dataset/version/policy → `404`, judged before every request-shape check;
+  missing or extra fields, a blank `classification`, an illegal `masking`
+  value, duplicate or blank `allowed_roles` entries, an empty or
+  whitespace-only body, malformed JSON, a non-object payload or any query
+  parameter → `422` and nothing is written. Concurrent revisions of the same
+  policy have exactly one winner; the loser receives `409` and changes no
+  field.
+
 - `POST /datasets/{dataset}/versions/{version}/privacy-policies/view` — return a
   role-scoped, order-preserving copy of submitted rows. Body:
   `{"role": "guest", "rows": [{...}, ...]}` with a non-empty `role` and a list
