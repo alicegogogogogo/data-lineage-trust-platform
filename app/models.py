@@ -929,6 +929,17 @@ class SnapshotResponse(SnapshotMetadata):
     rows: list[dict[str, Any]]
 
 
+# Role-masked time-travel read of a snapshot. The response names the selected
+# snapshot (`snapshot_id` and its `created_at`) and carries an order-preserving
+# copy of its rows masked exactly as the row-submission privacy view would.
+class SnapshotMaskedViewResponse(BaseModel):
+    dataset: str
+    version: int
+    snapshot_id: int
+    created_at: str
+    rows: list[dict[str, Any]]
+
+
 class SnapshotDiffEntry(BaseModel):
     row: dict[str, Any]
     count: int

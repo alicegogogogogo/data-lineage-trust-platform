@@ -83,6 +83,7 @@ from app.models import (
     ConfirmedSnapshotDeletionRequest,
     SnapshotDeletionRequestCreate,
     SnapshotDiffResponse,
+    SnapshotMaskedViewResponse,
     SnapshotMetadata,
     SnapshotResponse,
     VersionCompatibilityResponse,
@@ -1572,6 +1573,32 @@ def get_snapshot_at(
 ) -> SnapshotResponse:
     return SnapshotResponse(
         **repository.get_snapshot_at(conn, dataset_name, version, timestamp)
+    )
+
+
+# Role-masked time travel, appended one segment after the bare-row time lookup
+# and accepting POST only. The raw body is validated in the repository so an
+# unknown dataset/version or a missing snapshot stays a 404 checked ahead of
+# every body/query shape check (all 422), mirroring the bare-row lookup.
+@app.post(
+    f"{SNAPSHOTS_PATH}/at/masked-view",
+    response_model=SnapshotMaskedViewResponse,
+)
+def view_snapshot_masked_at(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> SnapshotMaskedViewResponse:
+    return SnapshotMaskedViewResponse(
+        **repository.view_snapshot_masked_at(
+            conn,
+            dataset_name,
+            version,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
     )
 
 
