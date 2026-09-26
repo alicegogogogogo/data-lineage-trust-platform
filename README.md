@@ -718,6 +718,17 @@ time. Snapshots (including their rows) survive restarts.
   rows present more often (or only) in the `to` snapshot and `removed` the
   converse, each entry being `{"row": {...}, "count": <int>}` sorted by the
   canonical (key-sorted) JSON text of `row`.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/quality-rules/evaluate`
+  — evaluate the version's enabled quality rules over the snapshot's persisted
+  rows. The endpoint takes no request body and no query parameters (`422`);
+  unknown dataset/version/snapshot → `404` (checked first), and a snapshot
+  owned by another version → `422`. The response and the rule semantics are
+  exactly those of the row-submission evaluation (`{"dataset", "version",
+  "results"}`), the snapshot and its rows are never modified, and every
+  successful evaluation appends the same immutable history summary (with
+  `row_count` set to the snapshot's actual row count) that also feeds the
+  evaluation diff and anomaly detection. An empty snapshot is recorded with
+  zero violations.
 
 ### Retention policies and lineage-aware snapshot deletion
 

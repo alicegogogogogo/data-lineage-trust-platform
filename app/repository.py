@@ -1852,7 +1852,21 @@ def evaluate_quality_rules(
 ) -> dict:
     dataset = require_dataset(conn, dataset_name)
     version_row = _require_schema_version(conn, dataset, version_number)
+    return _run_quality_rule_evaluation(conn, dataset, version_row, rows)
 
+
+def _run_quality_rule_evaluation(
+    conn: sqlite3.Connection,
+    dataset: dict,
+    version_row: sqlite3.Row,
+    rows: list[dict],
+) -> dict:
+    """Run the enabled rules of one version over ``rows`` and record the summary.
+
+    Shared by the row-submission and the snapshot evaluation entry points so
+    both judge rows with exactly the same semantics and append the same shape
+    of history record.
+    """
     rule_rows = conn.execute(
         "SELECT id, name, kind, params, enabled "
         "FROM quality_rules WHERE version_id = ? AND enabled = 1 ORDER BY id",
@@ -1922,6 +1936,59 @@ def evaluate_quality_rules(
         "version": version_row["version"],
         "results": results,
     }
+
+
+def evaluate_snapshot_quality_rules(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Evaluate the enabled rules of one version over a persisted snapshot.
+
+    The snapshot's stored rows take part exactly as saved (the snapshot itself
+    is never modified), and the same summary as a row-submission evaluation is
+    appended to the version's evaluation history with ``row_count`` set to the
+    snapshot's actual row count — an empty snapshot is recorded with zero
+    violations, like an empty submission.
+
+    The path resolves first: an unknown dataset, version or snapshot is a 404
+    and a snapshot owned by another version is a 422; only then are a
+    non-empty request body or any query parameter rejected (422). Nothing is
+    written when any check fails.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    snapshot_row = conn.execute(
+        "SELECT id, version_id, rows FROM snapshots WHERE id = ?",
+        (snapshot_id,),
+    ).fetchone()
+    if snapshot_row is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    if snapshot_row["version_id"] != version_row["id"]:
+        raise RequestInvalidError(
+            f"Snapshot {snapshot_id} does not belong to version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    if body.strip():
+        raise RequestInvalidError(
+            "The snapshot evaluation endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot evaluation endpoint does not accept query parameters"
+        )
+
+    return _run_quality_rule_evaluation(
+        conn, dataset, version_row, json.loads(snapshot_row["rows"])
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -1463,6 +1463,35 @@ def diff_snapshots(
     )
 
 
+@app.post(
+    f"{SNAPSHOTS_PATH}/{{snapshot_id}}/quality-rules/evaluate",
+    response_model=QualityRuleEvaluateResponse,
+)
+def evaluate_snapshot_quality_rules(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> QualityRuleEvaluateResponse:
+    # The snapshot's persisted rows are evaluated as-is and never modified;
+    # every successful evaluation appends the same history summary as a
+    # row-submission evaluation. The endpoint takes no request body and no
+    # query parameters — both are a 422 validated in the repository once the
+    # path dataset/version/snapshot is known, preserving 404 precedence.
+    return QualityRuleEvaluateResponse(
+        **repository.evaluate_snapshot_quality_rules(
+            conn,
+            dataset_name,
+            version,
+            snapshot_id,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #
