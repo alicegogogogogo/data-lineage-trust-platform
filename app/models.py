@@ -162,6 +162,32 @@ class LineageImpactCacheAuditResponse(BaseModel):
     counts: LineageImpactCacheAuditCounts
 
 
+# One repaired field and the action taken on its impact cache record:
+# ``created`` (no record existed, one was inserted), ``updated`` (a stale
+# record was rewritten to the recomputed result) or ``unchanged`` (the stored
+# record already equalled the recomputation and was left untouched).
+class LineageImpactCacheRepairEntry(BaseModel):
+    field: str
+    action: Literal["created", "updated", "unchanged"]
+
+
+# The three per-action totals, keyed by the action name plus ``_count``.
+class LineageImpactCacheRepairCounts(BaseModel):
+    created_count: int
+    updated_count: int
+    unchanged_count: int
+
+
+# Controlled repair of one version's impact cache: exactly these keys, in
+# this order. Entries are sorted by field name ascending and the document is
+# serialized deterministically (compact JSON, trailing newline).
+class LineageImpactCacheRepairResponse(BaseModel):
+    dataset: str
+    version: int
+    entries: list[LineageImpactCacheRepairEntry]
+    counts: LineageImpactCacheRepairCounts
+
+
 # One impacted field together with the shortest lineage path from the source.
 # ``path`` includes both ends; ``path_length`` is the number of path edges
 # (1 for a direct downstream field).

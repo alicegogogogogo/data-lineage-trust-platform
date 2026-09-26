@@ -23,6 +23,7 @@ from app.models import (
     LineageCreatedResponse,
     LineageDeletedResponse,
     LineageImpactCacheAuditResponse,
+    LineageImpactCacheRepairResponse,
     LineageImpactResponse,
     LineageImpactPathsResponse,
     LineageResponse,
@@ -525,6 +526,46 @@ def get_lineage_impact_cache_audit(
     )
     payload = json.dumps(
         audit.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Controlled repair of the version's impact cache, appended one segment after
+# the read-only cache audit address and accepting POST only. Every field of
+# the version is recomputed against the committed lineage graph: missing
+# records are created, stale records rewritten and consistent records left
+# untouched. The body is serialized directly (rather than through the default
+# JSON response) so the key order is fixed, the whitespace is compact and the
+# document ends with exactly one newline.
+@app.post(
+    "/datasets/{dataset_name}/versions/{version}/lineage/impact/cache-audit/repair",
+    response_model=LineageImpactCacheRepairResponse,
+)
+def repair_lineage_impact_cache(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Parameterless: any body bytes (whitespace-only included) or query
+    # parameters are a 422 validated in the repository once the path
+    # dataset/version is known, preserving the impact query's 404-before-422
+    # precedence. A repair already in flight for the same version makes a
+    # concurrent attempt a 409 that writes nothing.
+    result = LineageImpactCacheRepairResponse(
+        **repository.repair_lineage_impact_cache(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        result.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

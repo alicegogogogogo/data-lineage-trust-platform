@@ -1448,6 +1448,133 @@ def audit_lineage_impact_cache(
 
 
 # --------------------------------------------------------------------------- #
+# Lineage impact cache repair (controlled write)
+# --------------------------------------------------------------------------- #
+
+
+# One in-flight repair per (dataset, version): a second repair attempted
+# while another is running is a 409 and never touches the cache. The locks
+# are keyed by the path identity so an unknown dataset/version is rejected by
+# the same guard before its 404 is even resolved.
+_impact_cache_repair_locks: dict[tuple[str, int], threading.Lock] = {}
+_impact_cache_repair_locks_guard = threading.Lock()
+
+
+def _impact_cache_repair_lock(dataset_name: str, version_number: int) -> threading.Lock:
+    key = (dataset_name, version_number)
+    with _impact_cache_repair_locks_guard:
+        lock = _impact_cache_repair_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _impact_cache_repair_locks[key] = lock
+        return lock
+
+
+def repair_lineage_impact_cache(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Repair one version's impact cache against the committed lineage graph.
+
+    Every field of the version is recomputed with the exact impact-query
+    traversal (``_impacted_from_edges``: downstream fields merged and
+    deduplicated, the start field excluded, cycles terminating). A field
+    without a cache record gets one (``created``); a stored record that
+    differs from the recomputation is rewritten (``updated``); a record that
+    already equals it is left untouched (``unchanged``) — never rewritten and
+    never reordered. The response lists every field with its action, sorted
+    by field name ascending, plus the three per-action counts.
+
+    Only one repair of a version may be in flight: the per-version lock is
+    taken without waiting, so a concurrent attempt fails with 409 and writes
+    nothing, while a later sequential repair proceeds normally. The whole
+    repair — every insert and rewrite — commits as one request transaction
+    (the same write pattern as the impact query's own cache store) and is
+    immediately visible to impact queries and path explanations. The path
+    dataset/version resolves first (404); only afterwards are any request
+    body bytes — whitespace-only included — or any query parameter rejected
+    with 422, preserving the impact query's 404-before-422 precedence. Every
+    rejection happens before any write, so a refused request never modifies
+    the cache.
+    """
+    lock = _impact_cache_repair_lock(dataset_name, version_number)
+    if not lock.acquire(blocking=False):
+        raise ConflictError(
+            f"A lineage impact cache repair for version {version_number} of "
+            f"dataset '{dataset_name}' is already in progress"
+        )
+    try:
+        dataset = require_dataset(conn, dataset_name)
+        version_row = _require_schema_version(conn, dataset, version_number)
+
+        if body:
+            raise RequestInvalidError(
+                "The lineage impact cache repair endpoint does not accept a "
+                "request body"
+            )
+        if query_keys:
+            raise RequestInvalidError(
+                "The lineage impact cache repair endpoint does not accept "
+                "query parameters"
+            )
+
+        field_rows = conn.execute(
+            "SELECT id, name FROM schema_fields "
+            "WHERE version_id = ? ORDER BY name",
+            (version_row["id"],),
+        ).fetchall()
+        cache_rows = conn.execute(
+            "SELECT source_field, impacted FROM lineage_impact_cache "
+            "WHERE source_dataset = ? AND source_version = ?",
+            (dataset["name"], version_number),
+        ).fetchall()
+        cached_by_field = {
+            row["source_field"]: json.loads(row["impacted"]) for row in cache_rows
+        }
+
+        # Build the forward graph once; each field's expected result then
+        # walks it with the exact impact-query traversal (the start id is
+        # seeded visited, so cycles terminate and the start field never
+        # appears).
+        edges = _lineage_forward_edges(conn)
+
+        entries: list[dict] = []
+        counts = {"created_count": 0, "updated_count": 0, "unchanged_count": 0}
+        for field_row in field_rows:
+            field_name = field_row["name"]
+            if field_name not in cached_by_field:
+                recomputed = _impacted_from_edges(edges, field_row["id"])
+                _impact_cache_store(
+                    conn, dataset["name"], version_number, field_name, recomputed
+                )
+                action = "created"
+            else:
+                recomputed = _impacted_from_edges(edges, field_row["id"])
+                if cached_by_field[field_name] == recomputed:
+                    action = "unchanged"
+                else:
+                    _impact_cache_store(
+                        conn, dataset["name"], version_number, field_name, recomputed
+                    )
+                    action = "updated"
+            entries.append({"field": field_name, "action": action})
+            counts[f"{action}_count"] += 1
+
+        return {
+            "dataset": dataset["name"],
+            "version": version_number,
+            "entries": entries,
+            "counts": counts,
+        }
+    finally:
+        lock.release()
+
+
+# --------------------------------------------------------------------------- #
 # Lineage impact shortest-path query (read-only, never cached)
 # --------------------------------------------------------------------------- #
 

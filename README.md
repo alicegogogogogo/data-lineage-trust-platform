@@ -227,6 +227,29 @@ schema version in a different (source) dataset.
   body bytes (whitespace-only included) or query parameter → `422`, and an
   unknown dataset or version → `404`, with `404` taking precedence over
   `422` as in the impact query.
+- `POST /datasets/{dataset}/versions/{version}/lineage/impact/cache-audit/repair` —
+  controlled repair of the version's impact cache, appended one segment after
+  the cache audit address and accepting POST only. Every field of the version
+  is recomputed against the committed lineage graph using exactly the
+  impact-query semantics (downstream fields merged and deduplicated, the
+  start field excluded, cycles terminating): a field without a cache record
+  gets one (`created`), a stored record that differs from the recomputation
+  is rewritten (`updated`) and a record that already equals it is left
+  untouched (`unchanged` — never rewritten, never reordered). The response
+  lists every field as `{"field", "action"}` sorted by field name ascending;
+  the JSON document is deterministic (fixed key order, compact whitespace,
+  exactly one trailing newline) with top-level keys `dataset`, `version`,
+  `entries` and `counts` in that order, where `counts` gives `created_count`,
+  `updated_count` and `unchanged_count`, each equal to the number of entries
+  with that action. Repaired records are committed with the request and are
+  immediately visible to impact queries and path explanations, and they
+  survive a restart; after a repair the read-only audit reports every field
+  of the version as `cached`. Only one repair of a version may be in flight:
+  a concurrent attempt → `409` and writes nothing. The endpoint takes no
+  request body and no query parameters; any body bytes (whitespace-only
+  included) or query parameter → `422`, and an unknown dataset or version →
+  `404`, with `404` taking precedence over `422` as in the impact query.
+  Every rejection writes nothing.
 - `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
   read-only shortest-path explanation of the same impact, computed fresh on
   every read (no caching; nothing is written, and version definitions, lineage
