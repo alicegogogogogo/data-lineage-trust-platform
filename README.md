@@ -854,6 +854,51 @@ time. Snapshots (including their rows) survive restarts.
   parameter or any request body bytes (whitespace-only included) → `422`; a
   side with no snapshot at or before its timestamp → `404` and nothing is
   written.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/at/diff/masked` —
+  role-masked time-travel row diff, appended one segment after the bare-row
+  time diff and accepting POST only. The body contains exactly `role`,
+  `from` and `to`: `{"role": "guest", "from": "<ISO-8601>", "to":
+  "<ISO-8601>"}`; `role` must be non-empty after trimming and each time must
+  be a timezone-aware ISO-8601 date-time (offset or `Z`). Each side
+  independently selects the newest snapshot whose `created_at` is not later
+  than its own timestamp, with exactly the same selection as the bare-row
+  time lookup. Added and removed entries are first judged and counted from
+  the raw, unmasked rows with the bare-row diff's JSON-object multiset
+  semantics (key order irrelevant, array order and value types significant,
+  duplicates counted): a row appearing several times stays one entry with
+  its multiplicity, and masking only rewrites the entry's row data — entries
+  are never merged or split. Entries sort by the canonical (key-sorted) JSON
+  text of the raw row, so the output order is unaffected by masking. Each
+  emitted row is then masked exactly as the row-submission privacy view masks
+  it, applying only the version's currently enabled policies
+  (`redact`/`partial` semantics, `allowed_roles`, nulls and uncovered fields
+  behave identically). The response is the same deterministic document as
+  the bare-row time diff (fixed key order, compact whitespace, exactly one
+  trailing newline) with the same keys in the same order: `from_timestamp`,
+  `to_timestamp`, `from_snapshot_id`, `to_snapshot_id`, `added`, `removed`,
+  `fields_added` and `fields_removed`; the timestamps echo the submitted
+  body values and the field-name sets carry no values, so masking can never
+  change them. Every successful read appends one masking-hit record per
+  value it actually masks, counted per occurrence across both snapshots'
+  diff entries (an entry of count `n` whose covered value is masked yields
+  `n` hit records; added-side entries first, then removed-side, each side in
+  canonical row order), structurally identical to the regular view's hit
+  records and continuing the same per-version sequence run, plus exactly one
+  access record whose `row_count` is the total number of rows expanded from
+  both sides' entries and whose `masked_count` equals the number of hit
+  records the read wrote. The records enter all existing masking-hit/access
+  reads, filters, summaries, diffs, reconciliation, trends and cleanup
+  previews; records of one read share a write timestamp, sequences stay
+  continuous across processes, and a write obstruction never fails the read.
+  The read never modifies snapshots, rows, policies or identification
+  records. Unknown dataset/version → `404`; each side with a usable
+  timestamp is resolved independently, so a side with no snapshot at or
+  before its timestamp is likewise `404` and precedes every shape check
+  (including a missing or invalid timestamp on the other side); a missing or
+  wrong-typed `role`/`from`/`to`, a role blank after trimming, an
+  unparseable or timezone-less time, an extra body field, an empty,
+  whitespace-only or non-JSON body, a non-object body and any query
+  parameter are `422` and write nothing.
 - `POST /datasets/{dataset}/versions/{version}/snapshots/at/masked-view` —
   role-masked time travel, appended one segment after the bare-row time
   lookup and accepting POST only. The body contains exactly `role` and

@@ -1738,6 +1738,58 @@ def diff_snapshots_at(
     return Response(content=payload + "\n", media_type="application/json")
 
 
+# Role-masked time-travel diff, appended one segment after the bare-row time
+# diff and accepting POST only. Added/removed membership, counts and ordering
+# are judged on the raw rows with the bare-row multiset semantics; only the
+# emitted entry rows are rewritten for the role afterwards. Like the at-time
+# masked view, the raw body is validated in the repository so an unknown
+# dataset/version or a side without a snapshot stays a 404 ahead of every
+# body/query shape check. The body is serialized directly (rather than through
+# the default JSON response) so the document keeps the same deterministic
+# shape as the bare-row diff: fixed key order, compact whitespace and exactly
+# one trailing newline.
+@app.post(
+    f"{SNAPSHOTS_PATH}/at/diff/masked",
+    response_model=SnapshotAtDiffResponse,
+)
+def view_masked_snapshot_diff_at(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    diff = SnapshotAtDiffResponse(
+        **repository.view_masked_snapshot_diff_at(
+            conn,
+            dataset_name,
+            version,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# The literal path would otherwise fully match the GET
+# "{snapshot_id}/diff/{other_snapshot_id}" route below (with "at" and
+# "masked" failing the integer parse into a 422); the endpoint accepts POST
+# only, so reject GET explicitly, ahead of the parametric route, with the
+# same 405 a wrong method produces elsewhere.
+@app.get(f"{SNAPSHOTS_PATH}/at/diff/masked", include_in_schema=False)
+def masked_snapshot_diff_at_get_not_allowed() -> JSONResponse:
+    return JSONResponse(
+        {"detail": "Method Not Allowed"},
+        status_code=405,
+        headers={"Allow": "POST"},
+    )
+
+
 @app.get(f"{SNAPSHOTS_PATH}/{{snapshot_id}}", response_model=SnapshotResponse)
 def get_snapshot(
     dataset_name: str,
