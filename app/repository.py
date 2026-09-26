@@ -5332,6 +5332,53 @@ def _snapshot_multiset(
     return counts, examples
 
 
+def _row_multiset_diff(
+    from_rows: list[dict[str, Any]],
+    to_rows: list[dict[str, Any]],
+) -> tuple[list[dict], list[dict]]:
+    """Added/removed row multiset entries between two snapshot row lists.
+
+    Shares the exact comparison semantics of the snapshot-id diff: object key
+    order is irrelevant, array order and value types matter and duplicate rows
+    are counted. Returns the ``added`` (only/more often on the to side) and
+    ``removed`` entries, each ``{"row", "count"}`` sorted by the canonical
+    JSON text of the row.
+    """
+    from_counts, from_examples = _snapshot_multiset(from_rows)
+    to_counts, to_examples = _snapshot_multiset(to_rows)
+
+    added_keys = sorted(key for key in to_counts if to_counts[key] > from_counts[key])
+    removed_keys = sorted(key for key in from_counts if from_counts[key] > to_counts[key])
+
+    added = [
+        {"row": to_examples[key], "count": to_counts[key] - from_counts[key]}
+        for key in added_keys
+    ]
+    removed = [
+        {"row": from_examples[key], "count": from_counts[key] - to_counts[key]}
+        for key in removed_keys
+    ]
+    return added, removed
+
+
+def _snapshot_field_sets(
+    from_rows: list[dict[str, Any]],
+    to_rows: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """Top-level field-name sets of two snapshots.
+
+    A field counts when it appears on at least one row object of the side.
+    Names only on the to side are ``fields_added``; names only on the from
+    side are ``fields_removed``. Both lists sort by field name ascending.
+    """
+    from_fields = {name for row in from_rows for name in row}
+    to_fields = {name for row in to_rows for name in row}
+    return (
+        sorted(to_fields - from_fields),
+        sorted(from_fields - to_fields),
+    )
+
+
 def diff_snapshots(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -5360,23 +5407,123 @@ def diff_snapshots(
 
     from_rows = json.loads(from_row["rows"])
     to_rows = json.loads(to_row["rows"])
-    from_counts, from_examples = _snapshot_multiset(from_rows)
-    to_counts, to_examples = _snapshot_multiset(to_rows)
-
-    added_keys = sorted(key for key in to_counts if to_counts[key] > from_counts[key])
-    removed_keys = sorted(key for key in from_counts if from_counts[key] > to_counts[key])
+    added, removed = _row_multiset_diff(from_rows, to_rows)
 
     return {
         "from_snapshot_id": from_snapshot_id,
         "to_snapshot_id": to_snapshot_id,
-        "added": [
-            {"row": to_examples[key], "count": to_counts[key] - from_counts[key]}
-            for key in added_keys
-        ],
-        "removed": [
-            {"row": from_examples[key], "count": from_counts[key] - to_counts[key]}
-            for key in removed_keys
-        ],
+        "added": added,
+        "removed": removed,
+    }
+
+
+# The only query parameters accepted by the snapshot time diff endpoint.
+_SNAPSHOT_AT_DIFF_PARAMETERS = frozenset({"from", "to"})
+
+
+def _parse_diff_timestamp(raw: str, parameter: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise RequestInvalidError(
+            f"Query parameter '{parameter}' must be an ISO-8601 date-time"
+        ) from exc
+    # A trailing timezone designator (offset or 'Z') is mandatory.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RequestInvalidError(
+            f"Query parameter '{parameter}' must include a timezone"
+        )
+    return parsed
+
+
+def diff_snapshots_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    raw_from: str | None,
+    raw_to: str | None,
+    from_values: tuple[str, ...] = (),
+    to_values: tuple[str, ...] = (),
+    query_keys: tuple[str, ...] = (),
+    body: bytes = b"",
+) -> dict:
+    """Read-only row/field diff between the snapshots selected at two times.
+
+    Each side independently selects the newest snapshot whose ``created_at``
+    is not later than its own timestamp (the same selection as the bare-row
+    time lookup), so the two times may resolve to the same snapshot or the to
+    time may be earlier than the from time. The row sets use the exact
+    comparison semantics of the snapshot-id diff; the field sets compare the
+    top-level field names of the row objects on each side.
+
+    The path dataset/version resolves first (404, ahead of every shape
+    check). Any request body bytes (whitespace-only included), an unknown or
+    repeated query parameter, a missing/blank, unparseable or timezone-less
+    ``from``/``to`` is a 422 checked next. Only afterwards are the snapshots
+    selected; a side without a snapshot at or before its time is a 404. The
+    comparison reads snapshots and rows and never writes anything.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    # Any request body bytes are a shape error, including a body that is only
+    # whitespace (truthiness, not a strip, so pure-whitespace bytes reject too).
+    if body:
+        raise RequestInvalidError(
+            "The snapshot time diff endpoint does not accept a request body"
+        )
+    unknown_keys = sorted(set(query_keys) - _SNAPSHOT_AT_DIFF_PARAMETERS)
+    if unknown_keys:
+        raise RequestInvalidError(
+            "Unknown query parameter(s): " + ", ".join(unknown_keys)
+        )
+    if len(from_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'from' must be provided exactly once"
+        )
+    if len(to_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'to' must be provided exactly once"
+        )
+    if raw_from is None or not raw_from:
+        raise RequestInvalidError(
+            "Query parameter 'from' is required and must be an ISO-8601 date-time"
+        )
+    if raw_to is None or not raw_to:
+        raise RequestInvalidError(
+            "Query parameter 'to' is required and must be an ISO-8601 date-time"
+        )
+    from_target = _parse_diff_timestamp(raw_from, "from")
+    to_target = _parse_diff_timestamp(raw_to, "to")
+
+    from_row = _select_snapshot_at(conn, version_row["id"], from_target)
+    if from_row is None:
+        raise NotFoundError(
+            f"No snapshot of version {version_number} of dataset "
+            f"'{dataset_name}' exists at or before the 'from' timestamp"
+        )
+    to_row = _select_snapshot_at(conn, version_row["id"], to_target)
+    if to_row is None:
+        raise NotFoundError(
+            f"No snapshot of version {version_number} of dataset "
+            f"'{dataset_name}' exists at or before the 'to' timestamp"
+        )
+
+    from_rows = json.loads(from_row["rows"])
+    to_rows = json.loads(to_row["rows"])
+    added, removed = _row_multiset_diff(from_rows, to_rows)
+    fields_added, fields_removed = _snapshot_field_sets(from_rows, to_rows)
+
+    return {
+        "from_timestamp": raw_from,
+        "to_timestamp": raw_to,
+        "from_snapshot_id": from_row["id"],
+        "to_snapshot_id": to_row["id"],
+        "added": added,
+        "removed": removed,
+        "fields_added": fields_added,
+        "fields_removed": fields_removed,
     }
 
 

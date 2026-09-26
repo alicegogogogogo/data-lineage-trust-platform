@@ -785,6 +785,33 @@ time. Snapshots (including their rows) survive restarts.
   ISO-8601 date-time (an offset or trailing `Z`): missing, invalid or
   timezone-less values return `422`; unknown dataset/version → `404`; when no
   snapshot exists at or before the timestamp the response is `404`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/at/diff?from=<ISO-8601>&to=<ISO-8601>`
+  — read-only time-travel row diff, appended one segment after the bare-row
+  time lookup and accepting GET only. Each of `from` (the baseline) and `to`
+  (the target) must be a timezone-aware ISO-8601 date-time; each side
+  independently selects the latest snapshot whose `created_at` is not later
+  than its own timestamp (the same selection as the bare-row lookup), so the
+  two times may resolve to the same snapshot and a `to` earlier than `from` is
+  valid — the two snapshots are simply compared in their named order. The
+  comparison reads snapshots and rows and writes nothing. The JSON document
+  is deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline) with top-level keys `from_timestamp`, `to_timestamp`,
+  `from_snapshot_id`, `to_snapshot_id`, `added`, `removed`, `fields_added`
+  and `fields_removed` in that order; the timestamps echo the submitted query
+  values. `added` and `removed` use the exact comparison semantics of the
+  snapshot-id diff (JSON-object multisets, key order irrelevant, array order
+  and value types significant, duplicates counted; entries
+  `{"row", "count"}` sorted by canonical row text). `fields_added` and
+  `fields_removed` compare the top-level field names appearing on the
+  snapshots' row objects: names only on the target side are added, names only
+  on the baseline side are removed, names on both enter neither set, and each
+  list sorts by field name ascending. When both times select the same
+  snapshot all four collections are empty and the request succeeds. Unknown
+  dataset/version → `404`, checked before every request-shape check; a missing,
+  blank, repeated, unparseable or timezone-less `from`/`to`, an extra query
+  parameter or any request body bytes (whitespace-only included) → `422`; a
+  side with no snapshot at or before its timestamp → `404` and nothing is
+  written.
 - `POST /datasets/{dataset}/versions/{version}/snapshots/at/masked-view` —
   role-masked time travel, appended one segment after the bare-row time
   lookup and accepting POST only. The body contains exactly `role` and

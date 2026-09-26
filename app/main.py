@@ -82,6 +82,7 @@ from app.models import (
     SnapshotDeletionRequest,
     ConfirmedSnapshotDeletionRequest,
     SnapshotDeletionRequestCreate,
+    SnapshotAtDiffResponse,
     SnapshotDiffResponse,
     SnapshotMaskedViewResponse,
     SnapshotMetadata,
@@ -1600,6 +1601,50 @@ def view_snapshot_masked_at(
             query_keys=tuple(request.query_params.keys()),
         )
     )
+
+
+# Read-only time-travel diff, appended one segment after the bare-row time
+# lookup and accepting GET only. Each timestamp independently selects the
+# newest snapshot created not later than it; the two selected snapshots are
+# compared with the same row-multiset semantics as the snapshot-id diff plus
+# top-level field-name sets. The body is serialized directly (rather than
+# through the default JSON response) so the key order is fixed, the whitespace
+# is compact and the document ends with exactly one newline.
+@app.get(f"{SNAPSHOTS_PATH}/at/diff", response_model=SnapshotAtDiffResponse)
+def diff_snapshots_at(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    from_timestamp: str | None = Query(default=None, alias="from"),
+    to_timestamp: str | None = Query(default=None, alias="to"),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset/version resolves first (404); every request-shape
+    # problem — body bytes (whitespace included), unknown or repeated query
+    # parameters, missing/blank, unparseable or timezone-less from/to — is a
+    # 422 validated in the repository next, and only afterwards is each side's
+    # snapshot selected (a missing snapshot is then a 404). The comparison is
+    # fully read-only.
+    diff = SnapshotAtDiffResponse(
+        **repository.diff_snapshots_at(
+            conn,
+            dataset_name,
+            version,
+            raw_from=from_timestamp,
+            raw_to=to_timestamp,
+            from_values=tuple(request.query_params.getlist("from")),
+            to_values=tuple(request.query_params.getlist("to")),
+            query_keys=tuple(request.query_params.keys()),
+            body=body,
+        )
+    )
+    payload = json.dumps(
+        diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 @app.get(f"{SNAPSHOTS_PATH}/{{snapshot_id}}", response_model=SnapshotResponse)

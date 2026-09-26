@@ -524,6 +524,354 @@ def test_diff_unknown_dataset_or_version_is_404(client: TestClient) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Time-travel diff between the snapshots selected at two timestamps
+# --------------------------------------------------------------------------- #
+
+
+AT_DIFF = "/datasets/orders/versions/1/snapshots/at/diff"
+
+
+def _future(iso: str, days: int = 1) -> str:
+    return (datetime.fromisoformat(iso) + timedelta(days=days)).isoformat()
+
+
+def test_at_diff_selects_snapshots_and_compares_rows_and_fields(
+    client: TestClient,
+) -> None:
+    create_dataset_and_version(client)
+    first = make_snapshot(client, [
+        {"id": 1, "label": "a", "old": True},
+        {"id": 2, "label": "b"},
+    ])
+    time.sleep(0.01)
+    second = make_snapshot(client, [
+        {"id": 2, "label": "b"},
+        {"id": 3, "label": "c", "fresh": True},
+    ])
+
+    response = client.get(
+        AT_DIFF,
+        params={"from": first["created_at"], "to": _future(second["created_at"])},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert list(body) == [
+        "from_timestamp",
+        "to_timestamp",
+        "from_snapshot_id",
+        "to_snapshot_id",
+        "added",
+        "removed",
+        "fields_added",
+        "fields_removed",
+    ]
+    assert body["from_timestamp"] == first["created_at"]
+    assert body["to_timestamp"] == _future(second["created_at"])
+    assert body["from_snapshot_id"] == first["id"]
+    assert body["to_snapshot_id"] == second["id"]
+    assert body["added"] == [
+        {"row": {"id": 3, "label": "c", "fresh": True}, "count": 1}
+    ]
+    assert body["removed"] == [
+        {"row": {"id": 1, "label": "a", "old": True}, "count": 1}
+    ]
+    assert body["fields_added"] == ["fresh"]
+    assert body["fields_removed"] == ["old"]
+
+
+def test_at_diff_accepts_a_target_earlier_than_the_baseline(
+    client: TestClient,
+) -> None:
+    create_dataset_and_version(client)
+    first = make_snapshot(client, [{"id": 1, "a": 1}])
+    time.sleep(0.01)
+    second = make_snapshot(client, [{"id": 2, "b": 2}])
+
+    # Each side picks independently; a 'to' before 'from' compares the older
+    # snapshot as the target and succeeds.
+    response = client.get(
+        AT_DIFF,
+        params={"from": _future(second["created_at"]), "to": first["created_at"]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["from_snapshot_id"] == second["id"]
+    assert body["to_snapshot_id"] == first["id"]
+    assert body["added"] == [{"row": {"id": 1, "a": 1}, "count": 1}]
+    assert body["removed"] == [{"row": {"id": 2, "b": 2}, "count": 1}]
+    assert body["fields_added"] == ["a"]
+    assert body["fields_removed"] == ["b"]
+
+
+def test_at_diff_same_snapshot_returns_all_empty_collections(
+    client: TestClient,
+) -> None:
+    create_dataset_and_version(client)
+    first = make_snapshot(client, [{"id": 1, "label": "a"}])
+    time.sleep(0.01)
+    second = make_snapshot(client, [{"id": 2}])
+
+    # Both times fall between the snapshots, so they select the same one.
+    middle = _between(first["created_at"], second["created_at"])
+    response = client.get(AT_DIFF, params={"from": middle, "to": middle})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["from_snapshot_id"] == body["to_snapshot_id"] == first["id"]
+    assert body["added"] == []
+    assert body["removed"] == []
+    assert body["fields_added"] == []
+    assert body["fields_removed"] == []
+
+
+def test_at_diff_field_names_collect_across_rows_and_sort(
+    client: TestClient,
+) -> None:
+    create_dataset_and_version(client)
+    first = make_snapshot(client, [{"id": 1, "zeta": 1, "alpha": 2}])
+    time.sleep(0.01)
+    second = make_snapshot(client, [{"id": 1, "zeta": 1, "mid": 3, "beta": 4}])
+
+    body = client.get(
+        AT_DIFF,
+        params={"from": first["created_at"], "to": _future(second["created_at"])},
+    ).json()
+    # Fields shared across all rows enter neither set; only top-level names
+    # count and the sets sort by name.
+    assert body["fields_added"] == ["beta", "mid"]
+    assert body["fields_removed"] == ["alpha"]
+
+
+def test_at_diff_document_is_compact_with_fixed_key_order_and_newline(
+    client: TestClient,
+) -> None:
+    create_dataset_and_version(client)
+    first = make_snapshot(client, [{"id": 1}])
+    time.sleep(0.01)
+    second = make_snapshot(client, [{"id": 1}, {"id": 2, "name": "x"}])
+
+    to_value = _future(second["created_at"])
+    response = client.get(
+        AT_DIFF, params={"from": first["created_at"], "to": to_value}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    expected = json.dumps(body, separators=(",", ":"), ensure_ascii=False) + "\n"
+    assert response.text == expected
+    assert response.text.endswith("\n")
+    assert not response.text.endswith("\n\n")
+    # Key order is fixed regardless of how the row objects serialize.
+    assert response.text.index("from_timestamp") < response.text.index(
+        "to_timestamp"
+    )
+    assert response.text.index("to_snapshot_id") < response.text.index("added")
+    assert response.text.index("removed") < response.text.index("fields_added")
+    assert response.text.index("fields_added") < response.text.index(
+        "fields_removed"
+    )
+
+
+def test_at_diff_accepts_z_and_numeric_offsets(client: TestClient) -> None:
+    create_dataset_and_version(client)
+    snapshot = make_snapshot(client, [{"id": 1}])
+    stored = datetime.fromisoformat(snapshot["created_at"])
+    future = stored + timedelta(hours=2)
+
+    z_value = future.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    z_response = client.get(
+        AT_DIFF, params={"from": z_value, "to": z_value}
+    )
+    assert z_response.status_code == 200, z_response.text
+    assert z_response.json()["from_snapshot_id"] == snapshot["id"]
+    # The submitted value is echoed verbatim.
+    assert z_response.json()["from_timestamp"] == z_value
+
+    offset_value = future.astimezone(
+        timezone(timedelta(hours=5, minutes=30))
+    ).isoformat()
+    offset_response = client.get(
+        AT_DIFF, params={"from": offset_value, "to": offset_value}
+    )
+    assert offset_response.status_code == 200, offset_response.text
+    assert offset_response.json()["to_snapshot_id"] == snapshot["id"]
+
+
+def test_at_diff_no_snapshot_at_or_before_either_time_is_404(
+    client: TestClient,
+) -> None:
+    create_dataset_and_version(client)
+    snapshot = make_snapshot(client, [{"id": 1}])
+    before = (
+        datetime.fromisoformat(snapshot["created_at"]) - timedelta(seconds=1)
+    ).isoformat()
+    future = _future(snapshot["created_at"])
+
+    missing_from = client.get(
+        AT_DIFF, params={"from": before, "to": future}
+    )
+    assert missing_from.status_code == 404
+    assert missing_from.json()["error"] == "not_found"
+
+    missing_to = client.get(
+        AT_DIFF, params={"from": future, "to": before}
+    )
+    assert missing_to.status_code == 404
+    assert missing_to.json()["error"] == "not_found"
+
+    # A version with no snapshots at all cannot serve either side.
+    create_dataset_and_version(client, "empty")
+    assert client.get(
+        "/datasets/empty/versions/1/snapshots/at/diff",
+        params={
+            "from": "2030-01-01T00:00:00Z",
+            "to": "2031-01-01T00:00:00Z",
+        },
+    ).status_code == 404
+
+
+def test_at_diff_unknown_dataset_or_version_is_404_before_shape_checks(
+    client: TestClient,
+) -> None:
+    # 404 precedes even missing/invalid parameters and extra query keys.
+    assert client.get(
+        "/datasets/ghost/versions/1/snapshots/at/diff"
+    ).status_code == 404
+    create_dataset_and_version(client)
+    malformed = client.get(
+        "/datasets/ghost/versions/1/snapshots/at/diff",
+        params={"from": "not-a-time", "bogus": "1"},
+    )
+    assert malformed.status_code == 404
+    assert client.get(
+        "/datasets/orders/versions/7/snapshots/at/diff",
+        params={
+            "from": "2030-01-01T00:00:00Z",
+            "to": "2031-01-01T00:00:00Z",
+        },
+    ).status_code == 404
+
+
+def test_at_diff_requires_both_timestamps(client: TestClient) -> None:
+    create_dataset_and_version(client)
+    valid = "2030-01-01T00:00:00Z"
+
+    for params in ({}, {"from": valid}, {"to": valid}):
+        response = client.get(AT_DIFF, params=params)
+        assert response.status_code == 422, params
+        assert response.json()["error"] == "validation_error"
+        assert set(response.json()) == {"error", "detail"}
+
+    # Blank values are missing values.
+    blank = client.get(
+        AT_DIFF, params={"from": "", "to": ""}
+    )
+    assert blank.status_code == 422
+    assert blank.json()["error"] == "validation_error"
+
+
+def test_at_diff_rejects_invalid_naive_or_repeated_parameters(
+    client: TestClient,
+) -> None:
+    create_dataset_and_version(client)
+    valid = "2030-01-01T00:00:00Z"
+
+    for raw in (
+        "not-a-timestamp",
+        "2026-13-99T00:00:00+00:00",
+        "2026-01-01",
+        "2026-01-01T00:00:00",
+        "2026-01-01T00:00:00.000000",
+    ):
+        bad_from = client.get(
+            AT_DIFF, params={"from": raw, "to": valid}
+        )
+        assert bad_from.status_code == 422, raw
+        bad_to = client.get(
+            AT_DIFF, params={"from": valid, "to": raw}
+        )
+        assert bad_to.status_code == 422, raw
+
+    repeated_from = client.get(
+        AT_DIFF,
+        params=[("from", valid), ("from", valid), ("to", valid)],
+    )
+    assert repeated_from.status_code == 422
+    assert repeated_from.json()["error"] == "validation_error"
+
+    repeated_to = client.get(
+        AT_DIFF,
+        params=[("from", valid), ("to", valid), ("to", valid)],
+    )
+    assert repeated_to.status_code == 422
+    assert repeated_to.json()["error"] == "validation_error"
+
+    extra = client.get(
+        AT_DIFF,
+        params={"from": valid, "to": valid, "bogus": "1"},
+    )
+    assert extra.status_code == 422
+    assert "bogus" in extra.json()["detail"]
+
+
+def test_at_diff_rejects_any_request_body(client: TestClient) -> None:
+    create_dataset_and_version(client)
+    valid = "2030-01-01T00:00:00Z"
+    params = {"from": valid, "to": valid}
+
+    whitespace = client.request(
+        "GET", AT_DIFF, params=params, content=b"   \n\t "
+    )
+    assert whitespace.status_code == 422
+    assert whitespace.json()["error"] == "validation_error"
+
+    json_body = client.request(
+        "GET",
+        AT_DIFF,
+        params=params,
+        content=b"{}",
+        headers={"Content-Type": "application/json"},
+    )
+    assert json_body.status_code == 422
+    assert json_body.json()["error"] == "validation_error"
+
+
+def test_at_diff_accepts_only_get(client: TestClient) -> None:
+    create_dataset_and_version(client)
+    valid = "2030-01-01T00:00:00Z"
+    params = {"from": valid, "to": valid}
+    for method in ("post", "put", "patch", "delete"):
+        response = getattr(client, method)(AT_DIFF, params=params)
+        assert response.status_code == 405, method
+
+
+def test_at_diff_is_read_only(client: TestClient) -> None:
+    create_dataset_and_version(client)
+    first = make_snapshot(client, [{"id": 1, "a": 1}])
+    time.sleep(0.01)
+    second = make_snapshot(client, [{"id": 2, "b": 2}])
+
+    response = client.get(
+        AT_DIFF,
+        params={"from": first["created_at"], "to": _future(second["created_at"])},
+    )
+    assert response.status_code == 200
+
+    # Snapshots, their rows and the listing are unchanged.
+    listed = client.get("/datasets/orders/versions/1/snapshots").json()
+    assert [s["id"] for s in listed] == [first["id"], second["id"]]
+    assert client.get(
+        f"/datasets/orders/versions/1/snapshots/{first['id']}"
+    ).json()["rows"] == [{"id": 1, "a": 1}]
+    assert client.get(
+        f"/datasets/orders/versions/1/snapshots/{second['id']}"
+    ).json()["rows"] == [{"id": 2, "b": 2}]
+    # A read-only diff writes no privacy-view access or masking-hit records.
+    access = client.get(
+        "/datasets/orders/versions/1/privacy-policies/view/access-records"
+    ).json()
+    assert access == []
+
+
+# --------------------------------------------------------------------------- #
 # Persistence across restarts
 # --------------------------------------------------------------------------- #
 
