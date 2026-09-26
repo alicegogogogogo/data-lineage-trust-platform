@@ -967,6 +967,35 @@ class SnapshotAtDiffResponse(BaseModel):
     fields_removed: list[str]
 
 
+# Cross-version snapshot diff: the two snapshots belong to two different
+# schema versions of one dataset. Field-definition changes reuse the
+# compatibility/trajectory vocabulary; rows are projected onto the field names
+# both versions define before the same multiset comparison as the
+# same-version snapshot diff runs.
+class CrossVersionSnapshotFieldChange(BaseModel):
+    field: str
+    kind: Literal[
+        "added",
+        "removed",
+        "type_changed",
+        "nullable_tightened",
+        "nullable_loosened",
+    ]
+    # Null on the side where the field does not exist; never omitted.
+    before: FieldChangeDefinition | None
+    after: FieldChangeDefinition | None
+
+
+class CrossVersionSnapshotDiffResponse(BaseModel):
+    base_snapshot_id: int
+    base_version: int
+    target_snapshot_id: int
+    target_version: int
+    field_changes: list[CrossVersionSnapshotFieldChange]
+    added: list[SnapshotDiffEntry]
+    removed: list[SnapshotDiffEntry]
+
+
 # --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #

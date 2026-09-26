@@ -866,6 +866,35 @@ time. Snapshots (including their rows) survive restarts.
   rows present more often (or only) in the `to` snapshot and `removed` the
   converse, each entry being `{"row": {...}, "count": <int>}` sorted by the
   canonical (key-sorted) JSON text of `row`.
+- `GET /datasets/{dataset}/snapshots/{base_snapshot_id}/diff/{target_snapshot_id}` —
+  read-only comparison of two snapshots belonging to two **different** schema
+  versions of the path dataset; the baseline snapshot is named first and the
+  target second, and either version order is allowed. It takes no request
+  body and no query parameters (`422`). Unknown dataset or snapshot → `404`,
+  checked ahead of every request-shape check; a snapshot owned by another
+  dataset, or two snapshots of the same schema version (same-version
+  comparisons still go through the snapshot-id diff endpoint) → `422`. The
+  JSON document is deterministic (fixed key order, compact whitespace,
+  exactly one trailing newline) with top-level keys `base_snapshot_id`,
+  `base_version`, `target_snapshot_id`, `target_version`, `field_changes`,
+  `added` and `removed` in that order. `field_changes` lists only additions,
+  removals, type changes and nullability changes of the two versions' field
+  definitions, reusing the compatibility/trajectory literals (`added`,
+  `removed`, `type_changed`, `nullable_tightened`, `nullable_loosened`);
+  several changes of one field collapse into a single entry (a type change
+  wins over a nullability change), entries sort by field name and each entry
+  has `field`, `kind`, `before` and `after`, with the missing side `null`
+  (never omitted). Rows are projected onto exactly the field names defined
+  in both versions — other stored keys and fields absent from a row do not
+  participate — and the projections are compared with the same-version
+  snapshot diff's multiset semantics (object key order irrelevant, array
+  order and value types significant, duplicates counted). `added` lists
+  rows present more often or only on the target side, `removed` the
+  converse, each entry `{"row", "count"}` sorted by the canonical
+  (key-sorted) JSON text of the projected row. The comparison is fully
+  read-only: snapshots, rows, field definitions, the lineage impact cache
+  and every privacy trail are never touched, and the result is identical
+  across process restarts.
 - `POST /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/quality-rules/evaluate`
   — evaluate the version's enabled quality rules over the snapshot's persisted
   rows. The endpoint takes no request body and no query parameters (`422`);

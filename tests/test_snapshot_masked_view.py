@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -19,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+
+from app import repository
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -716,6 +719,130 @@ def test_get_is_not_accepted(client: TestClient) -> None:
     make_dataset_with_version(client)
     response = client.get(MASKED_VIEW_PATH)
     assert response.status_code == 405
+
+
+# --------------------------------------------------------------------------- #
+# Trail-write tolerance: an obstructed audit write never fails the read
+# --------------------------------------------------------------------------- #
+
+
+def _prepare_masked_view_for_obstruction(client: TestClient) -> str:
+    make_dataset_with_version(client)
+    create_policy(
+        client,
+        {"field": "email", "classification": "PII", "masking": "partial",
+         "allowed_roles": []},
+    )
+    create_policy(
+        client,
+        {"field": "ssn", "classification": "secret", "masking": "redact",
+         "allowed_roles": []},
+    )
+    snapshot = make_snapshot(client, [
+        {"id": 1, "email": "alice@example.com", "ssn": "111-22-3333"},
+        {"id": 2, "email": "bob@example.com", "ssn": "222-33-4444"},
+    ])
+    return (
+        datetime.fromisoformat(snapshot["created_at"]) + timedelta(days=1)
+    ).isoformat()
+
+
+def test_read_succeeds_when_the_whole_trail_write_is_obstructed(
+    client: TestClient, monkeypatch
+) -> None:
+    timestamp = _prepare_masked_view_for_obstruction(client)
+
+    # Every trail write fails: the optimistic append on the request
+    # connection loses every bounded retry with a cross-process collision,
+    # and the serialized fallback then fails with a database error. The read
+    # must still return 200 with its masked rows; the trail obstruction is
+    # swallowed rather than surfaced. A flag (rather than monkeypatch.undo,
+    # which would also revert the isolated database) lifts the obstruction.
+    obstructed = {"on": True}
+    real_trail = repository._append_privacy_view_trail
+    real_serialized = repository._record_privacy_view_trail_serialized
+
+    def colliding_trail(conn, version_id, role, row_count, hits):
+        if obstructed["on"]:
+            raise sqlite3.IntegrityError("simulated cross-process collision")
+        return real_trail(conn, version_id, role, row_count, hits)
+
+    def obstructed_serialized(version_id, role, row_count, hits):
+        if obstructed["on"]:
+            raise sqlite3.OperationalError("simulated write obstruction")
+        return real_serialized(version_id, role, row_count, hits)
+
+    monkeypatch.setattr(
+        repository, "_append_privacy_view_trail", colliding_trail
+    )
+    monkeypatch.setattr(
+        repository, "_record_privacy_view_trail_serialized", obstructed_serialized
+    )
+
+    response = masked_view(client, "guest", timestamp)
+    assert response.status_code == 200, response.text
+    assert response.json()["rows"] == [
+        {"id": 1, "email": "aom", "ssn": "***"},
+        {"id": 2, "email": "bom", "ssn": "***"},
+    ]
+
+    # Nothing of the obstructed trail survived: neither the hit records nor
+    # the access record (every failed attempt rolled back, never leaving half
+    # a batch behind).
+    assert client.get(AUDIT_PATH).json() == []
+    assert client.get(ACCESS_PATH).json() == []
+
+    # After the obstruction is lifted, a later read writes its complete trail
+    # with fresh, continuous sequences and one shared write time.
+    obstructed["on"] = False
+    again = masked_view(client, "guest", timestamp)
+    assert again.status_code == 200
+    hits = client.get(AUDIT_PATH).json()
+    assert [hit["sequence"] for hit in hits] == [1, 2, 3, 4]
+    access = client.get(ACCESS_PATH).json()
+    assert len(access) == 1
+    assert access[0]["masked_count"] == 4
+    assert len({hit["created_at"] for hit in hits} | {access[0]["created_at"]}) == 1
+
+
+def test_failed_append_never_keeps_a_partial_trail(
+    client: TestClient, monkeypatch
+) -> None:
+    timestamp = _prepare_masked_view_for_obstruction(client)
+
+    obstructed = {"on": True}
+    real_batch = repository._append_privacy_view_audit_batch
+    real_trail = repository._append_privacy_view_trail
+
+    def batch_then_block(conn, version_id, role, row_count, hits):
+        if not obstructed["on"]:
+            return real_trail(conn, version_id, role, row_count, hits)
+        # The hit batch lands inside the same transaction, then the rest of
+        # the same read fails with a non-collision database error (not
+        # retried): the best-effort wrapper rolls the whole transaction back.
+        created_at = repository.utc_now_iso()
+        real_batch(conn, version_id, role, hits, created_at)
+        raise sqlite3.OperationalError("simulated access-record obstruction")
+
+    monkeypatch.setattr(
+        repository, "_append_privacy_view_trail", batch_then_block
+    )
+
+    response = masked_view(client, "guest", timestamp)
+    assert response.status_code == 200, response.text
+    assert client.get(AUDIT_PATH).json() == []
+    assert client.get(ACCESS_PATH).json() == []
+
+    # A read after recovery continues both runs from sequence 1: the rolled
+    # back attempt consumed no sequence numbers.
+    obstructed["on"] = False
+    recovered = masked_view(client, "guest", timestamp)
+    assert recovered.status_code == 200
+    hits = client.get(AUDIT_PATH).json()
+    assert [hit["sequence"] for hit in hits] == [1, 2, 3, 4]
+    access = client.get(ACCESS_PATH).json()
+    assert [record["sequence"] for record in access] == [1]
+    assert access[0]["masked_count"] == 4
 
 
 # --------------------------------------------------------------------------- #

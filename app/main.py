@@ -83,6 +83,7 @@ from app.models import (
     ConfirmedSnapshotDeletionRequest,
     SnapshotDeletionRequestCreate,
     SnapshotAtDiffResponse,
+    CrossVersionSnapshotDiffResponse,
     SnapshotDiffResponse,
     SnapshotMaskedViewResponse,
     SnapshotMetadata,
@@ -1712,6 +1713,48 @@ def diff_snapshots(
             conn, dataset_name, version, snapshot_id, other_snapshot_id
         )
     )
+
+
+# Read-only cross-version snapshot comparison mounted directly under the
+# dataset (the two snapshots name two different schema versions, so no
+# version appears in the path). The body is serialized directly (rather than
+# through the default JSON response) so the key order is fixed, the
+# whitespace is compact and the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/snapshots/{base_snapshot_id}"
+    "/diff/{target_snapshot_id}",
+    response_model=CrossVersionSnapshotDiffResponse,
+)
+def diff_cross_version_snapshots(
+    request: Request,
+    dataset_name: str,
+    base_snapshot_id: int,
+    target_snapshot_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The comparison takes no input beyond the two snapshot ids in the path:
+    # any body bytes (whitespace-only included) or query parameters are a 422
+    # validated in the repository once the path dataset and both snapshots
+    # are known, so unknown resources stay 404 and snapshots from another
+    # dataset or the same schema version stay 422. The comparison is fully
+    # read-only.
+    diff = CrossVersionSnapshotDiffResponse(
+        **repository.diff_cross_version_snapshots(
+            conn,
+            dataset_name,
+            base_snapshot_id,
+            target_snapshot_id,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 @app.post(

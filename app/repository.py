@@ -3381,6 +3381,30 @@ def _record_privacy_view_trail(
         _record_privacy_view_trail_serialized(version_id, role, row_count, hits)
 
 
+def _record_privacy_view_trail_best_effort(
+    conn: sqlite3.Connection,
+    version_id: int,
+    role: str,
+    row_count: int,
+    hits: list[tuple[str, int, str]],
+) -> None:
+    """Append one masked read's trail, never failing the read.
+
+    Used by the at-time masked read: a read already returns its masked rows
+    when the trail is appended, so a write obstruction (a lost lock, a
+    database-level I/O problem after the bounded retries and the serialized
+    fallback have both been tried) must not turn the read into an error. The
+    masked result is returned unchanged without the trail. Any half-written
+    trail on the request connection is rolled back, so a failed append never
+    leaves part of the hit batch or the access record behind; the serialized
+    fallback rides its own connection/transaction and rolls back the same way.
+    """
+    try:
+        _record_privacy_view_trail(conn, version_id, role, row_count, hits)
+    except sqlite3.Error:
+        conn.rollback()
+
+
 def _privacy_view_audit_row_to_dict(row: sqlite3.Row) -> dict:
     return {
         "sequence": row["sequence"],
@@ -5371,8 +5395,12 @@ def view_snapshot_masked_at(
     # hit records plus one access record whose row count is the snapshot's row
     # count and whose masked count equals the number of hit records. An empty
     # snapshot, an allowed role, all-null values or a version without policies
-    # leaves only the access record. The append never makes the read fail.
-    _record_privacy_view_trail(
+    # leaves only the access record. Unlike the row-submission view, the
+    # at-time read must still return its masked result when the trail append
+    # is obstructed: the append is best-effort (collisions retry, then a
+    # serialized fallback runs, then the obstruction is swallowed) and a
+    # failed append rolls back so no half trail remains.
+    _record_privacy_view_trail_best_effort(
         conn,
         version_row["id"],
         clean_role,
@@ -5616,6 +5644,147 @@ def diff_snapshots_at(
         "removed": removed,
         "fields_added": fields_added,
         "fields_removed": fields_removed,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version snapshot comparison
+# --------------------------------------------------------------------------- #
+
+
+def _cross_version_field_changes(
+    base_fields: dict[str, dict],
+    target_fields: dict[str, dict],
+) -> list[dict]:
+    """Field-definition changes between two different schema versions.
+
+    Only additions, removals, type changes and nullability changes are
+    listed; an unchanged field (same type and nullability) never appears.
+    The status literals and the collapsing rule (several changes of one
+    field become one entry, a type change winning over a nullability change)
+    are exactly those of :func:`_field_status_change`, shared with the
+    breaking check and the field trajectory. Entries are sorted by field
+    name and each carries ``before``/``after`` definitions, null — never
+    omitted — on the side where the field does not exist.
+    """
+    changes: list[dict] = []
+    for name in sorted(set(base_fields) | set(target_fields)):
+        before = base_fields.get(name)
+        after = target_fields.get(name)
+        kind = _field_status_change(before, after)
+        if kind == "unchanged":
+            continue
+        changes.append(
+            {"field": name, "kind": kind, "before": before, "after": after}
+        )
+    return changes
+
+
+def _project_rows_to_fields(
+    rows: list[dict[str, Any]], common_fields: set[str]
+) -> list[dict[str, Any]]:
+    """Project rows onto fields defined on both versions.
+
+    Only the named fields participate: every other stored key is dropped,
+    and a field missing from a row is omitted (it never participates as a
+    null). Each projected row keeps the stored object's key order among the
+    retained fields, so — like the same-version diff — the emitted rows echo
+    the stored representation while equality still ignores key order (the
+    canonical multiset text sorts the keys).
+    """
+    return [
+        {name: value for name, value in row.items() if name in common_fields}
+        for row in rows
+    ]
+
+
+def diff_cross_version_snapshots(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    base_snapshot_id: int,
+    target_snapshot_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only comparison of two snapshots of different schema versions.
+
+    The baseline snapshot is named first and the target second; either
+    version order is allowed. The response first gives the two versions'
+    field-definition changes (see
+    :func:`_cross_version_field_changes`) and then the row multisets after
+    projection onto the field names both versions define (see
+    :func:`_project_rows_to_fields`), compared with the exact multiset
+    semantics of the same-version snapshot diff: object key order is
+    irrelevant, array order and value types matter and duplicate rows count.
+
+    Unknown dataset or snapshot is a 404 checked ahead of every request-shape
+    check; a snapshot owned by another dataset, or two snapshots of the same
+    schema version (the same-version id diff stays the entry for that case),
+    is a 422; any request body bytes (whitespace-only included) or any query
+    parameter is likewise a 422. The comparison only reads: no snapshot, row,
+    field definition, lineage cache or privacy trail is ever written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    base_row = _find_snapshot_globally(conn, base_snapshot_id)
+    if base_row is None:
+        raise NotFoundError(f"Snapshot {base_snapshot_id} does not exist")
+    target_row = _find_snapshot_globally(conn, target_snapshot_id)
+    if target_row is None:
+        raise NotFoundError(f"Snapshot {target_snapshot_id} does not exist")
+
+    for row, snapshot_id in (
+        (base_row, base_snapshot_id),
+        (target_row, target_snapshot_id),
+    ):
+        if row["dataset_name"] != dataset["name"]:
+            raise RequestInvalidError(
+                f"Snapshot {snapshot_id} does not belong to dataset "
+                f"'{dataset_name}'; cross-version snapshot comparisons only "
+                "cover snapshots owned by the path dataset"
+            )
+
+    if base_row["version_id"] == target_row["version_id"]:
+        raise RequestInvalidError(
+            "Both snapshots belong to the same schema version; compare "
+            "same-version snapshots through the snapshot-id diff endpoint"
+        )
+
+    # Any request body bytes are a shape error, including a body that is only
+    # whitespace (truthiness, not a strip, so pure-whitespace bytes reject too).
+    if body:
+        raise RequestInvalidError(
+            "The cross-version snapshot comparison endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The cross-version snapshot comparison endpoint does not accept "
+            "query parameters"
+        )
+
+    base_fields = _version_field_definitions(conn, base_row["version_id"])
+    target_fields = _version_field_definitions(conn, target_row["version_id"])
+    field_changes = _cross_version_field_changes(base_fields, target_fields)
+
+    common_fields = set(base_fields) & set(target_fields)
+    base_rows = _project_rows_to_fields(
+        json.loads(base_row["rows"]), common_fields
+    )
+    target_rows = _project_rows_to_fields(
+        json.loads(target_row["rows"]), common_fields
+    )
+    added, removed = _row_multiset_diff(base_rows, target_rows)
+
+    return {
+        "base_snapshot_id": base_row["id"],
+        "base_version": base_row["version_number"],
+        "target_snapshot_id": target_row["id"],
+        "target_version": target_row["version_number"],
+        "field_changes": field_changes,
+        "added": added,
+        "removed": removed,
     }
 
 
