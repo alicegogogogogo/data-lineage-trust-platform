@@ -404,6 +404,8 @@ def test_successful_masked_view_writes_hit_and_access_records(
     assert access[0]["role"] == "guest"
     assert access[0]["row_count"] == 3
     assert access[0]["masked_count"] == 3
+    # The hit batch and the access record of one read share one write time.
+    assert access[0]["created_at"] == hits[0]["created_at"]
 
     # Reading again appends a second, independent trail and the hit run
     # continues without reusing sequences.

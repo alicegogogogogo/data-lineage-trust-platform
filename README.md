@@ -442,6 +442,20 @@ recorded for rules since disabled still count).
     bytes — including whitespace-only ones — or any query parameter are a
     `422`, checked after the path dataset/version resolves (`404` first).
     Nothing is written on any rejection.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/gate/at?timestamp=...`
+  — the same verdict as it stood at a requested instant. `timestamp` must be
+  a timezone-bearing ISO-8601 date-time; only evaluations and anomaly records
+  written at or before it count, and the latest evaluation of that window is
+  the one with the highest sequence inside it. The response is the same
+  deterministic document as the bare gate (`dataset`, `version`, `verdict`,
+  `reasons`, `counts`, one trailing newline), with the counts covering only
+  the records inside the window. A window without any evaluation is
+  `undetermined` with an empty reason list — a normal response, never an
+  error. The endpoint accepts GET only and is strictly read-only. The path
+  dataset/version resolves first (`404`); afterwards any request body bytes
+  (whitespace-only included), a missing, repeated, unparseable or
+  timezone-less `timestamp`, or any other query parameter are a `422` that
+  writes nothing.
 
 ### Privacy policies
 

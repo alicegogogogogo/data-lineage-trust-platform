@@ -504,12 +504,12 @@ def test_view_succeeds_when_optimistic_append_retries_are_exhausted(
     real_batch = repository._append_privacy_view_audit_batch
     calls = 0
 
-    def colliding_batch(conn, version_id, role, hits):
+    def colliding_batch(conn, version_id, role, hits, created_at):
         nonlocal calls
         calls += 1
         if calls <= repository._PRIVACY_VIEW_AUDIT_MAX_ATTEMPTS:
             raise sqlite3.IntegrityError("simulated cross-process collision")
-        return real_batch(conn, version_id, role, hits)
+        return real_batch(conn, version_id, role, hits, created_at)
 
     monkeypatch.setattr(
         repository, "_append_privacy_view_audit_batch", colliding_batch

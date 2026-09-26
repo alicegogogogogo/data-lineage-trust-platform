@@ -2761,63 +2761,32 @@ def list_quality_anomalies(
 # --------------------------------------------------------------------------- #
 
 
-def get_quality_gate(
-    conn: sqlite3.Connection,
-    dataset_name: str,
-    version_number: int,
-    *,
-    body: bytes = b"",
-    query_keys: tuple[str, ...] = (),
+def _quality_gate_result(
+    dataset: dict,
+    version_row: sqlite3.Row,
+    evaluation_rows: list[sqlite3.Row],
+    anomaly_rows: list[sqlite3.Row],
 ) -> dict:
-    """Release-readiness verdict of one version, computed fresh on every read.
+    """Verdict document over one window of persisted records.
 
-    Only the persisted records are consulted — the evaluation history and the
-    anomaly records — never the rule definitions, and nothing is re-run,
-    cached or written. The verdict is one of:
+    ``evaluation_rows`` must be in sequence order and ``anomaly_rows`` in id
+    order. The verdict is one of:
 
-    - ``undetermined`` — no evaluation was ever recorded; the reason list is
+    - ``undetermined`` — the window holds no evaluation; the reason list is
       empty and the read succeeds (never an error).
-    - ``fail`` — the latest recorded evaluation still has violating rows, or
-      the version carries any anomaly record.
-    - ``pass`` — the latest recorded evaluation passed every rule and no
-      anomaly record exists; a zero-violation evaluation left by an empty row
-      submission is a valid basis.
+    - ``fail`` — the window's latest (highest-sequence) evaluation still has
+      violating rows, or the window holds any anomaly record.
+    - ``pass`` — the latest evaluation in the window passed every rule and the
+      window holds no anomaly record; a zero-violation evaluation left by an
+      empty row submission is a valid basis.
 
     Each rule with violations in the latest evaluation contributes one
     ``violation`` reason (its violation row count in that evaluation), and
-    every persisted anomaly record contributes one reason of its own kind;
+    every anomaly record in the window contributes one reason of its own kind;
     the two are never merged or deduplicated, and violations of rules since
     disabled still count. Reasons sort by kind, history sequence and rule id
     (null ids first), all ascending, independent of database order.
-
-    The path dataset/version resolves first (404); any request body bytes —
-    including whitespace-only ones — or any query parameter are a 422 checked
-    afterwards (unlike the other read-only endpoints, which tolerate
-    whitespace-only bodies).
     """
-    dataset = require_dataset(conn, dataset_name)
-    version_row = _require_schema_version(conn, dataset, version_number)
-    if body:
-        raise RequestInvalidError(
-            "The quality gate endpoint does not accept a request body"
-        )
-    if query_keys:
-        raise RequestInvalidError(
-            "The quality gate endpoint does not accept query parameters"
-        )
-    version_id = version_row["id"]
-
-    evaluation_rows = conn.execute(
-        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
-        "ORDER BY sequence ASC",
-        (version_id,),
-    ).fetchall()
-    anomaly_rows = conn.execute(
-        "SELECT * FROM quality_anomaly_records WHERE version_id = ? "
-        "ORDER BY id ASC",
-        (version_id,),
-    ).fetchall()
-
     reasons: list[dict] = []
     if evaluation_rows:
         latest = evaluation_rows[-1]
@@ -2868,6 +2837,123 @@ def get_quality_gate(
             "reasons": len(reasons),
         },
     }
+
+
+def _quality_gate_records(
+    conn: sqlite3.Connection, version_id: int
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    """The version's evaluation history and anomaly records, explicitly
+    ordered (sequence ascending, id ascending) — never the database's natural
+    order."""
+    evaluation_rows = conn.execute(
+        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_id,),
+    ).fetchall()
+    anomaly_rows = conn.execute(
+        "SELECT * FROM quality_anomaly_records WHERE version_id = ? "
+        "ORDER BY id ASC",
+        (version_id,),
+    ).fetchall()
+    return evaluation_rows, anomaly_rows
+
+
+def get_quality_gate(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Release-readiness verdict of one version, computed fresh on every read.
+
+    Only the persisted records are consulted — the evaluation history and the
+    anomaly records — never the rule definitions, and nothing is re-run,
+    cached or written. The verdict over the full history follows
+    ``_quality_gate_result``.
+
+    The path dataset/version resolves first (404); any request body bytes —
+    including whitespace-only ones — or any query parameter are a 422 checked
+    afterwards (unlike the other read-only endpoints, which tolerate
+    whitespace-only bodies).
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body:
+        raise RequestInvalidError(
+            "The quality gate endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The quality gate endpoint does not accept query parameters"
+        )
+    evaluation_rows, anomaly_rows = _quality_gate_records(conn, version_row["id"])
+    return _quality_gate_result(dataset, version_row, evaluation_rows, anomaly_rows)
+
+
+def get_quality_gate_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_params: tuple[tuple[str, str], ...] = (),
+) -> dict:
+    """Release-readiness verdict as it stood at a requested instant.
+
+    Same computation and literal output as ``get_quality_gate``, but over the
+    window of records written at or before the ``timestamp`` query parameter
+    (a timezone-bearing ISO-8601 date-time): only those evaluations and
+    anomaly records count, and the latest evaluation of the window is the one
+    with the highest sequence inside it. A window without any evaluation is
+    ``undetermined`` with an empty reason list — a normal response, never an
+    error. The read is strictly read-only: nothing is written or changed, so
+    repeated calls and restarts return identical documents.
+
+    The path dataset/version resolves first (404). Afterwards every shape
+    problem is a 422 that writes nothing: any request body bytes (including
+    whitespace-only ones), a missing, repeated, unparseable or timezone-less
+    ``timestamp``, or any other query parameter.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body:
+        raise RequestInvalidError(
+            "The quality gate endpoint does not accept a request body"
+        )
+    extra_keys = sorted({key for key, _ in query_params} - {"timestamp"})
+    if extra_keys:
+        raise RequestInvalidError(
+            "The quality gate endpoint does not accept query parameter(s): "
+            + ", ".join(extra_keys)
+        )
+    timestamps = [value for key, value in query_params if key == "timestamp"]
+    if not timestamps:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' is required and must be an ISO-8601 "
+            "date-time"
+        )
+    if len(timestamps) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must appear exactly once"
+        )
+    target = _parse_at_timestamp(timestamps[0])
+
+    evaluation_rows, anomaly_rows = _quality_gate_records(conn, version_row["id"])
+    evaluations_in_window = [
+        row
+        for row in evaluation_rows
+        if datetime.fromisoformat(row["created_at"]) <= target
+    ]
+    anomalies_in_window = [
+        row
+        for row in anomaly_rows
+        if datetime.fromisoformat(row["created_at"]) <= target
+    ]
+    return _quality_gate_result(
+        dataset, version_row, evaluations_in_window, anomalies_in_window
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -3134,10 +3220,12 @@ def _append_privacy_view_audit_batch(
     version_id: int,
     role: str,
     hits: list[tuple[str, int, str]],
+    created_at: str,
 ) -> None:
     """Insert all hit records of one view as the next sequences of the version.
 
-    All records of one view request share a single write timestamp.
+    The caller passes the view's single write timestamp, shared by every hit
+    record and the access record of the same view.
 
     Sequences come from the version's high-water counter rather than
     ``MAX(sequence)``: confirmed cleanup requests delete records (so the max
@@ -3163,8 +3251,6 @@ def _append_privacy_view_audit_batch(
         (version_id,),
     ).fetchone()
     sequence = tail["next_sequence"]
-    # All records of one view request share a single write timestamp.
-    created_at = utc_now_iso()
     for field, policy_id, masking in hits:
         conn.execute(
             "INSERT INTO privacy_view_audit_records ("
@@ -3195,6 +3281,7 @@ def _append_privacy_view_access_record(
     role: str,
     row_count: int,
     masked_count: int,
+    created_at: str,
 ) -> None:
     """Insert the single access record of one view as the next sequence."""
     tail = conn.execute(
@@ -3207,7 +3294,7 @@ def _append_privacy_view_access_record(
         "INSERT INTO privacy_view_access_records ("
         "version_id, sequence, role, row_count, masked_count, created_at"
         ") VALUES (?, ?, ?, ?, ?, ?)",
-        (version_id, sequence, role, row_count, masked_count, utc_now_iso()),
+        (version_id, sequence, role, row_count, masked_count, created_at),
     )
 
 
@@ -3221,14 +3308,19 @@ def _append_privacy_view_trail(
     """Append one view's whole trail: its hit batch plus its access record.
 
     The access record's ``masked_count`` is the number of hit records the same
-    view writes, so the two logs always cross-check. Both appends ride the
-    same transaction, so a collision rolls both back together and a retry
+    view writes, so the two logs always cross-check, and the hit batch and the
+    access record share a single write timestamp. Both appends ride the same
+    transaction, so a collision rolls both back together and a retry
     re-appends both — the trail is never half-written.
     """
+    # All records of one view request share a single write timestamp.
+    created_at = utc_now_iso()
     if hits:
-        _append_privacy_view_audit_batch(conn, version_id, role, hits)
+        _append_privacy_view_audit_batch(
+            conn, version_id, role, hits, created_at
+        )
     _append_privacy_view_access_record(
-        conn, version_id, role, row_count, len(hits)
+        conn, version_id, role, row_count, len(hits), created_at
     )
 
 
