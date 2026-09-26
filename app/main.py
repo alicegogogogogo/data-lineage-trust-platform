@@ -424,6 +424,33 @@ def create_lineage(
     return LineageCreatedResponse(**created)
 
 
+# Deletion shares the registration entry point: a DELETE submits the same
+# complete mapping (same six locating fields) instead of creating it. The
+# body is parsed in the repository after every referenced resource resolves,
+# so an unknown dataset/version/field keeps its 404 precedence over
+# body-level 422s and a mapping that does not exist is a 404 even when every
+# resource it references does.
+@app.delete(
+    "/datasets/{dataset_name}/versions/{version}/lineage",
+    response_model=LineageCreatedResponse,
+)
+def delete_lineage(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> LineageCreatedResponse:
+    deleted = repository.delete_lineage_link(
+        conn,
+        dataset_name,
+        version,
+        body,
+        query_keys=tuple(request.query_params.keys()),
+    )
+    return LineageCreatedResponse(**deleted)
+
+
 @app.get(
     "/datasets/{dataset_name}/versions/{version}/lineage",
     response_model=LineageResponse,
@@ -441,11 +468,16 @@ def get_lineage(
     response_model=LineageImpactResponse,
 )
 def get_lineage_impact(
+    request: Request,
     dataset_name: str,
     version: int,
-    field: str | None = Query(default=None),
     conn=Depends(get_db),
 ) -> LineageImpactResponse:
+    # Use the first occurrence for the resource lookup so a repeated 'field'
+    # whose second value names a missing field cannot turn the request into a
+    # 404; the repetition itself is a 422 judged after resources resolve.
+    field_values = request.query_params.getlist("field")
+    field = field_values[0] if field_values else None
     if field is None or not field.strip():
         raise RequestInvalidError(
             "Query parameter 'field' is required and must be a non-empty "
@@ -453,7 +485,11 @@ def get_lineage_impact(
         )
     return LineageImpactResponse(
         **repository.get_lineage_impact(
-            conn, dataset_name, version, field.strip()
+            conn,
+            dataset_name,
+            version,
+            field.strip(),
+            field_values=tuple(field_values),
         )
     )
 
@@ -472,7 +508,6 @@ def get_lineage_impact_paths(
     dataset_name: str,
     version: int,
     body: bytes = Depends(_read_request_body),
-    field: str | None = Query(default=None),
     conn=Depends(get_db),
 ) -> Response:
     # Read-only: the paths are recomputed from the committed lineage graph on
@@ -480,6 +515,10 @@ def get_lineage_impact_paths(
     # blank or repeated 'field' parameter, any other query parameter or any
     # request body is a 422 validated in the repository once the path
     # dataset/version and the field have resolved, preserving 404 precedence.
+    # The first occurrence names the resource so a second, unresolvable value
+    # can never turn the repetition's 422 into a 404.
+    field_values = request.query_params.getlist("field")
+    field = field_values[0] if field_values else None
     result = LineageImpactPathsResponse(
         **repository.get_lineage_impact_paths(
             conn,
@@ -488,7 +527,7 @@ def get_lineage_impact_paths(
             field,
             body=body,
             query_keys=tuple(request.query_params.keys()),
-            field_values=tuple(request.query_params.getlist("field")),
+            field_values=tuple(field_values),
         )
     )
     payload = json.dumps(
@@ -513,7 +552,6 @@ def get_lineage_source_paths(
     dataset_name: str,
     version: int,
     body: bytes = Depends(_read_request_body),
-    field: str | None = Query(default=None),
     conn=Depends(get_db),
 ) -> Response:
     # Read-only: the paths are recomputed from the committed lineage graph on
@@ -521,7 +559,11 @@ def get_lineage_source_paths(
     # blank or repeated 'field' parameter, any other query parameter or any
     # request body is a 422 validated in the repository once the path
     # dataset/version and the field have resolved, preserving 404 precedence
-    # (mirrors the downstream impact paths endpoint).
+    # (mirrors the downstream impact paths endpoint). The first occurrence
+    # names the resource (matched literally, never trimmed) so a second value
+    # can never win the field lookup.
+    field_values = request.query_params.getlist("field")
+    field = field_values[0] if field_values else None
     result = LineageSourcePathsResponse(
         **repository.get_lineage_source_paths(
             conn,
@@ -530,7 +572,7 @@ def get_lineage_source_paths(
             field,
             body=body,
             query_keys=tuple(request.query_params.keys()),
-            field_values=tuple(request.query_params.getlist("field")),
+            field_values=tuple(field_values),
         )
     )
     payload = json.dumps(

@@ -859,6 +859,310 @@ def create_lineage_link(
     }
 
 
+# Six locating fields of a complete lineage mapping; a deletion body carries
+# exactly these, in the same shape as a registration body.
+_LINEAGE_LINK_FIELDS: frozenset[str] = frozenset(
+    {
+        "target_dataset",
+        "target_version",
+        "target_field",
+        "source_dataset",
+        "source_version",
+        "source_field",
+    }
+)
+
+
+def _parse_lineage_link_body(body: bytes) -> dict:
+    """Validate and parse a raw lineage mapping body (registration shape).
+
+    The body must be a JSON object carrying exactly the six locating fields:
+    four non-empty strings (the two dataset and field names) and two integers
+    (the versions). Booleans are not accepted as numbers. Every structural
+    problem — empty or whitespace-only bytes, malformed JSON, a non-object
+    document, a missing/extra/ill-typed field or a blank name — is a 422.
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    extra_keys = sorted(set(payload) - _LINEAGE_LINK_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra_keys))
+    missing_keys = sorted(_LINEAGE_LINK_FIELDS - set(payload))
+    if missing_keys:
+        raise RequestInvalidError("Missing field(s): " + ", ".join(missing_keys))
+
+    for key in ("target_dataset", "target_field", "source_dataset", "source_field"):
+        value = payload[key]
+        # bool is a subclass of int, not str, so only genuine strings qualify;
+        # a whitespace-only name is rejected like an empty one.
+        if not isinstance(value, str) or not value.strip():
+            raise RequestInvalidError(f"'{key}' must be a non-empty string")
+    for key in ("target_version", "source_version"):
+        value = payload[key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RequestInvalidError(f"'{key}' must be an integer version number")
+
+    return {key: payload[key] for key in _LINEAGE_LINK_FIELDS}
+
+
+def _lineage_link_row_by_fields(
+    conn: sqlite3.Connection, target_field_id: int, source_field_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT  ll.id,
+                td.name  AS target_dataset,
+                tv.version AS target_version,
+                tf.name  AS target_field,
+                sd.name  AS source_dataset,
+                sv.version AS source_version,
+                sf.name  AS source_field,
+                ll.source_field_id AS source_field_id
+        FROM    lineage_links ll
+        JOIN    datasets td ON td.id = ll.target_dataset_id
+        JOIN    schema_versions tv ON tv.id = ll.target_version_id
+        JOIN    schema_fields tf ON tf.id = ll.target_field_id
+        JOIN    datasets sd ON sd.id = ll.source_dataset_id
+        JOIN    schema_versions sv ON sv.id = ll.source_version_id
+        JOIN    schema_fields sf ON sf.id = ll.source_field_id
+        WHERE   ll.target_field_id = ? AND ll.source_field_id = ?
+        """,
+        (target_field_id, source_field_id),
+    ).fetchone()
+
+
+def _lineage_link_response(row: sqlite3.Row) -> dict:
+    return {
+        "target_dataset": row["target_dataset"],
+        "target_version": row["target_version"],
+        "target_field": row["target_field"],
+        "source": {
+            "dataset": row["source_dataset"],
+            "version": row["source_version"],
+            "field": row["source_field"],
+        },
+    }
+
+
+def _optional_int(value: Any) -> int | None:
+    """Read an integer locating value, rejecting booleans; ``None`` if unreadable."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _optional_str(value: Any) -> str | None:
+    """Read a non-blank string locating value; otherwise ``None``.
+
+    A whitespace-only name cannot locate a resource (it is a shape error
+    judged later), mirroring how the lineage read endpoints treat a blank
+    ``field`` parameter; such a value resolves no resource here rather than
+    being looked up and reported missing.
+    """
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _resolve_optional_field(
+    conn: sqlite3.Connection,
+    dataset: dict,
+    version_number: int | None,
+    field_name: str | None,
+    *,
+    role: str,
+) -> tuple[int | None, int | None]:
+    """Resolve a version/field pair for the 404-first deletion flow.
+
+    Only locating values readable from the request are checked. A readable
+    version number must exist (404 otherwise); a readable field name is
+    checked within that version once the version resolves. Unreadable
+    values resolve to ``None`` and are left for the later shape check.
+    """
+    version_id: int | None = None
+    field_id: int | None = None
+    if version_number is not None:
+        version_row = conn.execute(
+            "SELECT id FROM schema_versions WHERE dataset_id = ? AND version = ?",
+            (dataset["id"], version_number),
+        ).fetchone()
+        if version_row is None:
+            raise NotFoundError(
+                f"{role} schema version {version_number} of dataset "
+                f"'{dataset['name']}' does not exist"
+            )
+        version_id = version_row["id"]
+        if field_name is not None:
+            field_row = conn.execute(
+                "SELECT id FROM schema_fields WHERE version_id = ? AND name = ?",
+                (version_id, field_name),
+            ).fetchone()
+            if field_row is None:
+                raise NotFoundError(
+                    f"{role} field '{field_name}' does not exist in version "
+                    f"{version_number} of dataset '{dataset['name']}'"
+                )
+            field_id = field_row["id"]
+    return version_id, field_id
+
+
+def delete_lineage_link(
+    conn: sqlite3.Connection,
+    path_dataset: str,
+    path_version: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Atomically delete one complete lineage mapping named by the body.
+
+    The request shape matches registration exactly. Resolution order is
+    deliberate: every resource named by locating values readable from the
+    request — the path target dataset, the body-named source dataset, both
+    versions and both fields — must exist before the request shape is
+    examined, so any missing resource is a 404 even when the body is also
+    malformed. Once the resources resolve, the body must be a JSON object
+    naming exactly the six fields with valid types, must not carry query
+    parameters, its source and target datasets must differ and its target
+    must agree with the path; any of those is a 422. Only then is the
+    mapping itself required to exist — a missing mapping is a 404 even
+    though every resource it references exists.
+
+    On success the mapping is deleted in this transaction (atomic with the
+    response) and the impact cache entries of the deleted edge's source
+    field and of every field that can reach it are invalidated, matching
+    registration's invalidation rule.
+    """
+    # The body may be unreadable at this stage; extract only the locating
+    # values that can be read and defer every shape judgment until every
+    # named resource has been confirmed to exist.
+    try:
+        candidate = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        candidate = None
+    payload = candidate if isinstance(candidate, dict) else None
+
+    # The path entry point names the target dataset and version; these are
+    # themselves locating values, so they must exist (a missing path dataset
+    # or version is a 404 ahead of every shape error). A readable body target
+    # pair is then resolved in its own right as well: on a valid request the
+    # two agree, and a disagreement where every named resource exists is left
+    # for the shape check below, while a disagreement onto a missing resource
+    # stays a 404.
+    path_target = require_dataset(conn, path_dataset, role="Target dataset")
+    path_version_row = conn.execute(
+        "SELECT id FROM schema_versions WHERE dataset_id = ? AND version = ?",
+        (path_target["id"], path_version),
+    ).fetchone()
+    if path_version_row is None:
+        raise NotFoundError(
+            f"Target schema version {path_version} of dataset "
+            f"'{path_target['name']}' does not exist"
+        )
+
+    body_target_dataset = (
+        _optional_str(payload.get("target_dataset")) if payload is not None else None
+    )
+    target = path_target
+    if body_target_dataset is not None:
+        target = require_dataset(conn, body_target_dataset, role="Target dataset")
+
+    body_target_version = (
+        _optional_int(payload.get("target_version")) if payload is not None else None
+    )
+    target_version_number = (
+        body_target_version if body_target_version is not None else path_version
+    )
+    target_field_name = (
+        _optional_str(payload.get("target_field")) if payload is not None else None
+    )
+    _, target_field_id = _resolve_optional_field(
+        conn,
+        target,
+        target_version_number,
+        target_field_name,
+        role="Target",
+    )
+
+    source_dataset_name = (
+        _optional_str(payload.get("source_dataset")) if payload is not None else None
+    )
+    source_field_id = None
+    if source_dataset_name is not None:
+        source = require_dataset(
+            conn, source_dataset_name, role="Source dataset"
+        )
+        _, source_field_id = _resolve_optional_field(
+            conn,
+            source,
+            (
+                _optional_int(payload.get("source_version"))
+                if payload is not None
+                else None
+            ),
+            (
+                _optional_str(payload.get("source_field"))
+                if payload is not None
+                else None
+            ),
+            role="Source",
+        )
+
+    # Every readable locating value resolved; only now judge request shape.
+    parsed = _parse_lineage_link_body(body)
+    if query_keys:
+        raise RequestInvalidError(
+            "The lineage mapping endpoint does not accept query parameters"
+        )
+    if parsed["source_dataset"] == parsed["target_dataset"]:
+        raise RequestInvalidError("Source and target datasets must be different")
+    if (
+        parsed["target_dataset"] != path_dataset
+        or parsed["target_version"] != path_version
+    ):
+        raise RequestInvalidError(
+            "Target dataset and version in the body must match the request path"
+        )
+
+    link_row = _lineage_link_row_by_fields(
+        conn, target_field_id, source_field_id
+    )
+    if link_row is None:
+        raise NotFoundError(
+            "This field mapping is not registered: "
+            f"'{parsed['source_dataset']}' v{parsed['source_version']}."
+            f"{parsed['source_field']} -> "
+            f"'{parsed['target_dataset']}' v{parsed['target_version']}."
+            f"{parsed['target_field']}"
+        )
+
+    # Atomic delete; a concurrent deletion commits first, so the second
+    # transaction's DELETE matches no row and surfaces as the same 404 a
+    # later sequential request would get.
+    cursor = conn.execute("DELETE FROM lineage_links WHERE id = ?", (link_row["id"],))
+    if cursor.rowcount == 0:
+        raise NotFoundError("This field mapping is not registered")
+
+    # The removed edge could only contribute to impacts of fields that
+    # reached its source; deleting an outgoing edge does not change which
+    # fields can reach that source, so the post-delete reverse walk covers
+    # exactly the entries registration would invalidate.
+    _invalidate_impact_cache_for_upstream(
+        conn,
+        link_row["source_dataset"],
+        link_row["source_version"],
+        link_row["source_field"],
+        link_row["source_field_id"],
+    )
+
+    return _lineage_link_response(link_row)
+
+
 def get_lineage(
     conn: sqlite3.Connection, dataset_name: str, version: int
 ) -> dict:
@@ -1073,10 +1377,24 @@ def _invalidate_impact_cache_for_upstream(
 
 
 def get_lineage_impact(
-    conn: sqlite3.Connection, dataset_name: str, version: int, field: str
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version: int,
+    field: str,
+    *,
+    field_values: tuple[str, ...] = (),
 ) -> dict:
     dataset = require_dataset(conn, dataset_name)
     _, field_id = _require_field(conn, dataset, version, field, role="Source")
+
+    # A repeated 'field' parameter is a shape error, but it is only judged
+    # after the dataset, version and the first field value resolve so a
+    # missing resource keeps its 404 precedence and the second value never
+    # gets to win the field lookup.
+    if len(field_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'field' must be provided exactly once"
+        )
 
     impacted = _impact_cache_lookup(conn, dataset["name"], version, field)
     if impacted is None:

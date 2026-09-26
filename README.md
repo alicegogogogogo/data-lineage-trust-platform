@@ -172,6 +172,29 @@ schema version in a different (source) dataset.
   Target must match the path. Source and target datasets must differ and every
   referenced dataset/version/field must exist (`404` / `422` otherwise).
   Submitting the same complete mapping twice returns `409`.
+- `DELETE /datasets/{dataset}/versions/{version}/lineage` — delete one
+  complete mapping. The deletion entry point is the registration entry
+  point: the request submits the same body shape as registration, with all
+  six locating fields present, and the target dataset and version must match
+  the path. Locating values are read first and every referenced
+  dataset/version/field must exist; any missing resource returns `404` and
+  takes precedence over every request-shape error. Only once all resources
+  resolve is the request shape judged: a missing or extra field, a
+  wrong-typed value, a blank name, a source and target naming the same
+  dataset, a target that disagrees with the path, an empty or
+  whitespace-only body, malformed JSON or any query parameter returns `422`
+  and writes nothing. When the resources all exist but the mapping does
+  not, the response is `404` even though every locating value resolves
+  individually. On success the mapping is deleted atomically and the
+  response is `200` with the complete mapping that was just removed (the
+  same body a registration of it would return). Concurrent deletions of the
+  same mapping have exactly one winner; the loser receives `404` and changes
+  nothing, and a deletion racing a registration leaves a graph containing
+  exactly the mappings that survived. A deletion invalidates the same
+  impact-cache entries as a registration — the source field and every field
+  that can reach it — leaves version definitions, quality rules and
+  policies, snapshots and processing tasks untouched, and stays in effect
+  across process restarts.
 - `GET /datasets/{dataset}/versions/{version}/lineage` — return every target
   field (including fields without sources) together with its source references.
   Results are sorted by target field name, then source dataset name, source
@@ -184,7 +207,9 @@ schema version in a different (source) dataset.
   entry being `{"dataset", "version", "field"}`. Results are deduplicated,
   never contain the source itself (cycles terminate) and are sorted by dataset,
   version and field ascending. Unknown dataset/version/field → `404`; a
-  missing, blank or invalid `field` parameter → `422`.
+  missing, blank, invalid or repeated `field` parameter → `422`, with `404`
+  taking precedence (the first `field` value names the resource, so a
+  second, unresolvable value can never turn the repetition into a `404`).
 - `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
   read-only shortest-path explanation of the same impact, computed fresh on
   every read (no caching; nothing is written, and version definitions, lineage
@@ -240,9 +265,9 @@ schema version in a different (source) dataset.
   Impact results are cached persistently (they survive restarts) and every
   read reflects the currently committed lineage graph: creating a schema
   version invalidates the cache entries related to that dataset, and creating
-  a lineage mapping invalidates the cached impacts of the mapping's source
-  field and of every field that can reach it. Unrelated cache entries are
-  preserved.
+  or deleting a lineage mapping invalidates the cached impacts of that
+  mapping's source field and of every field that can reach it. Unrelated
+  cache entries are preserved.
 
 ### Quality rules
 
