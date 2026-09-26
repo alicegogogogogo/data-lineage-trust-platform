@@ -6450,21 +6450,179 @@ def confirm_snapshot_deletion_request(
         conn, version_row, snapshot_id, dataset_name, version_number
     )
 
+    # Take the write lock before the state transition so a concurrent recheck
+    # or another confirmation cannot interleave: the loser meets the held
+    # lock without waiting and receives a 409, leaving the request and the
+    # snapshot untouched. Only validation reads have run so far (they start no
+    # write transaction), so the fail-fast begin is safe here. The usual
+    # timeout is restored immediately so this confirmation's own commit can
+    # still wait out a transient reader.
+    conn.execute("PRAGMA busy_timeout = 0")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        raise ConflictError(
+            f"Snapshot deletion request {request_id} is already being "
+            f"modified by another request"
+        ) from exc
+    finally:
+        conn.execute("PRAGMA busy_timeout = 30000")
+
+    # Re-read under the write lock: a concurrent recheck may have moved the
+    # request back to 'blocked' after the earlier read, in which case the
+    # confirmation must fail without deleting anything.
+    locked_row = conn.execute(
+        "SELECT status FROM snapshot_deletion_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()
+    if locked_row["status"] != "pending":
+        raise ConflictError(
+            f"Snapshot deletion request {request_id} is "
+            f"'{locked_row['status']}'; only pending requests can be confirmed"
+        )
+
     # Snapshot removal and request confirmation commit together: either both
-    # take effect or neither does.
-    conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+    # take effect or neither does. The status guard is the final backstop for
+    # the rare cross-process race that slips past the lock re-read.
     confirmed_at = utc_now_iso()
-    conn.execute(
+    confirmed_cursor = conn.execute(
         "UPDATE snapshot_deletion_requests "
-        "SET status = 'confirmed', confirmed_at = ? WHERE id = ?",
+        "SET status = 'confirmed', confirmed_at = ? "
+        "WHERE id = ? AND status = 'pending'",
         (confirmed_at, request_id),
     )
+    if confirmed_cursor.rowcount == 0:
+        raise ConflictError(
+            f"Snapshot deletion request {request_id} is not pending; only "
+            f"pending requests can be confirmed"
+        )
+    conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
     updated = conn.execute(
         "SELECT * FROM snapshot_deletion_requests WHERE id = ?", (request_id,)
     ).fetchone()
     result = _deletion_request_row_to_dict(updated)
     result["confirmed_at"] = updated["confirmed_at"]
     return result
+
+
+def recheck_snapshot_deletion_request(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+    request_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Recompute an open deletion request's downstream set against current lineage.
+
+    The baseline impacted set is computed once at creation; this controlled
+    recomputation walks the committed lineage graph again with the exact
+    creation semantics (``_compute_version_field_impacted``: every field of
+    the request's version seeds the walk, direct and indirect downstream
+    fields merged and deduplicated, the version's own fields never appear and
+    cycles terminate), then replaces ``impacted`` and derives ``status``
+    afresh — ``blocked`` when any downstream field exists, ``pending``
+    otherwise. Every other field stays untouched.
+
+    Resolution order mirrors the rest of the API: the path dataset and
+    version resolve first (404), then the request id itself (404 when no
+    request with that id exists); a request that exists but belongs to
+    another snapshot or version is a 422. Only afterwards are request-shape
+    problems judged (422): any body bytes — whitespace-only or malformed
+    JSON included — or any query parameter. A confirmed request can never be
+    rechecked (409), even once its snapshot has been deleted.
+
+    The fail-fast ``BEGIN IMMEDIATE`` makes the recomputation single-winner
+    against a concurrent recheck, confirmation or retention sweep of the same
+    request: the loser meets the held write lock without waiting and receives
+    a 409, writing nothing. The conditional UPDATE additionally covers a
+    confirmation that commits between the lock acquisition and the write.
+    The recheck never deletes a snapshot, creates no request and changes no
+    policy, age rule or lineage mapping.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    # The request, not the snapshot, drives resolution: a confirmed request
+    # stays addressable after its snapshot has been deleted and must still
+    # reach the confirmed-409 below.
+    request_row = conn.execute(
+        "SELECT * FROM snapshot_deletion_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()
+    if request_row is None:
+        raise NotFoundError(
+            f"Snapshot deletion request {request_id} does not exist"
+        )
+    if (
+        request_row["version_id"] != version_row["id"]
+        or request_row["snapshot_id"] != snapshot_id
+    ):
+        raise RequestInvalidError(
+            f"Snapshot deletion request {request_id} does not belong to "
+            f"snapshot {snapshot_id} in version {version_number} of dataset "
+            f"'{dataset_name}'"
+        )
+
+    if body:
+        raise RequestInvalidError(
+            "The snapshot deletion request recheck endpoint does not accept "
+            "a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot deletion request recheck endpoint does not accept "
+            "query parameters"
+        )
+
+    # Take the write lock before recomputing so the graph walk and the
+    # replacement write see one committed state and a concurrent recheck,
+    # confirmation or sweep of the same request loses with a 409 instead of
+    # waiting. The usual timeout is restored immediately so this recheck's
+    # own commit can still wait out a transient reader.
+    conn.execute("PRAGMA busy_timeout = 0")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        raise ConflictError(
+            f"Snapshot deletion request {request_id} is already being "
+            f"modified by another request"
+        ) from exc
+    finally:
+        conn.execute("PRAGMA busy_timeout = 30000")
+
+    locked_row = conn.execute(
+        "SELECT status FROM snapshot_deletion_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()
+    if locked_row["status"] == "confirmed":
+        raise ConflictError(
+            f"Snapshot deletion request {request_id} is 'confirmed'; "
+            f"confirmed requests cannot be rechecked"
+        )
+
+    impacted = _compute_version_field_impacted(conn, version_row["id"])
+    status = "blocked" if impacted else "pending"
+    cursor = conn.execute(
+        "UPDATE snapshot_deletion_requests "
+        "SET impacted = ?, status = ? "
+        "WHERE id = ? AND status IN ('pending', 'blocked')",
+        (json.dumps(impacted), status, request_id),
+    )
+    if cursor.rowcount == 0:
+        # A concurrent confirmation committed between the lock read and the
+        # write; roll the recomputation back and report the conflict.
+        raise ConflictError(
+            f"Snapshot deletion request {request_id} is 'confirmed'; "
+            f"confirmed requests cannot be rechecked"
+        )
+
+    updated = conn.execute(
+        "SELECT * FROM snapshot_deletion_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    return _deletion_request_row_to_dict(updated)
 
 
 # --------------------------------------------------------------------------- #

@@ -1010,6 +1010,33 @@ downstream fields. Policies and requests are persisted across restarts.
   the status change to `confirmed`, and the response adds `confirmed_at`. Once
   deleted, the snapshot no longer appears in snapshot read, list, `at` or diff
   responses.
+- `POST .../snapshots/{snapshot_id}/deletion-requests/{request_id}/recheck` —
+  recompute the blocked state of an open request against the current lineage
+  graph, appended one segment after the individual deletion-request resource
+  and accepting POST only. The impacted baseline is computed once at creation
+  time; this recomputes the direct and indirect downstream set of every field
+  of the snapshot's version with the exact creation semantics (deduplicated,
+  cycles terminating, never containing a start field, sorted by dataset,
+  version and field ascending) and, while the request is still open, replaces
+  `impacted` and derives `status` afresh — `blocked` when any downstream field
+  exists, `pending` otherwise. A newly added downstream therefore moves a
+  `pending` request back to `blocked` (a still-depended-on snapshot is not
+  deleted by mistake), and a removed downstream moves a `blocked` request back
+  to `pending` so it can later be confirmed under the existing age rule. The
+  response is the updated request record in the creation-response shape with
+  the recomputed status and impacted set and every other field unchanged. The
+  recomputation never deletes the snapshot, creates a request or changes the
+  retention policy, the age rule or the lineage mappings, and the updated
+  record survives restarts while the request list stays ordered by id. The
+  endpoint takes no request body and no query parameters: any body bytes —
+  whitespace-only or malformed JSON included — or any query parameter are a
+  `422`. Unknown dataset, version or request → `404`, judged ahead of every
+  request-shape check; a request that exists but does not belong to the
+  snapshot named in the path is a `422` and writes nothing. A confirmed
+  request can never be rechecked — even after its snapshot has been deleted
+  the response is `409` and no field changes — and concurrent rechecks, or a
+  recheck racing a confirmation or a batch sweep, have exactly one winner: the
+  loser receives `409` and writes nothing.
 
   Unknown dataset/version/snapshot/policy/request → `404`; other invalid input
   → `422` and nothing is written.

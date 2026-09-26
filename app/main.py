@@ -1922,6 +1922,29 @@ def create_retention_policy(
 DELETION_REQUESTS_PATH = f"{SNAPSHOTS_PATH}/{{snapshot_id}}/deletion-requests"
 
 
+# Process-local exclusion of the write operations that move one version's
+# deletion-request state — a request recheck, a request confirmation and the
+# batch retention sweep. All three share the repository's per-version lock
+# map (see retention_sweep_lock): the guard is declared before the database
+# dependency so the lock is taken before the request connection is opened and
+# — dependencies tearing down in reverse order — released only after the
+# transaction commits. Two concurrent writers of this process therefore meet
+# a held lock wherever they start and the loser gets a 409 instead of waiting;
+# the fail-fast BEGIN IMMEDIATE in the repository covers writers of another
+# process.
+def _version_retention_write_guard(dataset_name: str, version: int) -> Iterator[None]:
+    lock = repository.retention_sweep_lock(dataset_name, version)
+    if not lock.acquire(blocking=False):
+        raise ConflictError(
+            f"Another retention write on version {version} of dataset "
+            f"'{dataset_name}' is already in progress"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 @app.post(
     DELETION_REQUESTS_PATH,
     response_model=SnapshotDeletionRequest,
@@ -1968,11 +1991,50 @@ def confirm_snapshot_deletion_request(
     version: int,
     snapshot_id: int,
     request_id: int,
+    _write: None = Depends(_version_retention_write_guard),
     conn=Depends(get_db),
 ) -> ConfirmedSnapshotDeletionRequest:
     return ConfirmedSnapshotDeletionRequest(
         **repository.confirm_snapshot_deletion_request(
             conn, dataset_name, version, snapshot_id, request_id
+        )
+    )
+
+
+# Controlled recomputation of an open request's downstream set, appended one
+# segment after the individual deletion-request resource and accepting POST
+# only. The baseline is computed once at creation; this walks the current
+# committed lineage graph with the same semantics and replaces impacted and
+# status. It takes no request body and no query parameters.
+@app.post(
+    f"{DELETION_REQUESTS_PATH}/{{request_id}}/recheck",
+    response_model=SnapshotDeletionRequest,
+)
+def recheck_snapshot_deletion_request(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    snapshot_id: int,
+    request_id: int,
+    body: bytes = Depends(_read_request_body),
+    _write: None = Depends(_version_retention_write_guard),
+    conn=Depends(get_db),
+) -> SnapshotDeletionRequest:
+    # The path dataset/version and the request resolve first (404), then a
+    # request owned by another snapshot is a 422, and only afterwards are any
+    # body bytes or query parameters rejected (422), preserving the
+    # 404-before-422 precedence. A confirmed request is a 409 and concurrent
+    # rechecks/recheck-vs-confirm/recheck-vs-sweep have a single winner; the
+    # loser is a 409 and changes nothing.
+    return SnapshotDeletionRequest(
+        **repository.recheck_snapshot_deletion_request(
+            conn,
+            dataset_name,
+            version,
+            snapshot_id,
+            request_id,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
         )
     )
 
