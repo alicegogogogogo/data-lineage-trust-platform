@@ -859,6 +859,239 @@ def create_lineage_link(
     }
 
 
+# The six locating fields of a lineage mapping, in body key order; the
+# deletion request carries exactly these.
+_LINEAGE_MAPPING_FIELDS = (
+    "target_dataset",
+    "target_version",
+    "target_field",
+    "source_dataset",
+    "source_version",
+    "source_field",
+)
+
+
+def delete_lineage_link(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Delete one registered lineage mapping, returning the removed mapping.
+
+    The request body has the same shape as registration: the six locating
+    fields name the complete mapping to delete and the target must agree with
+    the path. Validation runs in two phases. First every locating value
+    readable in the request (path plus whatever the body carries) is resolved,
+    so an unknown dataset, version or field is a 404 ahead of every
+    request-shape error — including when all six values name existing
+    resources but the mapping itself was never registered. Only then is the
+    request shape judged: an empty or whitespace body, invalid JSON, a
+    non-object payload, missing or extra fields, wrong types, blank names and
+    any query parameter are all 422, as are a mapping whose source and target
+    datasets coincide or whose body target disagrees with the path. No
+    rejection writes anything: the lineage graph, the impact cache and every
+    other metadata table are left untouched (the transaction rolls back).
+
+    A registered mapping is deleted atomically: concurrent deletes of the
+    same mapping succeed exactly once, the loser gets a 404 and changes
+    nothing. The impact cache invalidation matches registration — the cached
+    impacts of the mapping's source field and of every field that can reach
+    it are dropped and rebuilt on the next read; unrelated entries are kept.
+    """
+    # Take the write lock before any read so two concurrent deletes of the
+    # same mapping cannot race a read-then-upgrade: the loser blocks here
+    # until the winner commits, then observes the committed delete and
+    # reports 404 without changing anything.
+    conn.execute("BEGIN IMMEDIATE")
+
+    # The path dataset and version resolve first, so an unknown path target
+    # is a 404 ahead of every request-shape error.
+    path_dataset = require_dataset(conn, dataset_name, role="Target dataset")
+    _require_schema_version(conn, path_dataset, version)
+
+    # Best-effort read of the body's locating values: whatever can be read
+    # drives resource lookups before any shape validation. An unreadable
+    # (missing, blank or wrongly typed) value simply skips its lookup and is
+    # reported as a 422 in the second phase.
+    payload: Any = None
+    if body.strip():
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            payload = None
+    values = payload if isinstance(payload, dict) else {}
+
+    def readable_name(key: str) -> str | None:
+        value = values.get(key)
+        return value if isinstance(value, str) and value.strip() else None
+
+    def readable_version(key: str) -> int | None:
+        value = values.get(key)
+        return (
+            value if isinstance(value, int) and not isinstance(value, bool) else None
+        )
+
+    # Target side: the dataset defaults to the path dataset (the body target
+    # must agree with it anyway) so a readable body version is still looked
+    # up when the body does not name the dataset.
+    target_dataset = path_dataset
+    body_target_dataset = readable_name("target_dataset")
+    if body_target_dataset is not None:
+        target_dataset = require_dataset(
+            conn, body_target_dataset, role="Target dataset"
+        )
+    body_target_version = readable_version("target_version")
+    if body_target_version is not None:
+        target_version_row = conn.execute(
+            "SELECT id FROM schema_versions WHERE dataset_id = ? AND version = ?",
+            (target_dataset["id"], body_target_version),
+        ).fetchone()
+        if target_version_row is None:
+            raise NotFoundError(
+                f"Target schema version {body_target_version} of dataset "
+                f"'{target_dataset['name']}' does not exist"
+            )
+        body_target_field = readable_name("target_field")
+        if body_target_field is not None:
+            target_field_row = conn.execute(
+                "SELECT id FROM schema_fields WHERE version_id = ? AND name = ?",
+                (target_version_row["id"], body_target_field),
+            ).fetchone()
+            if target_field_row is None:
+                raise NotFoundError(
+                    f"Target field '{body_target_field}' does not exist in "
+                    f"version {body_target_version} of dataset "
+                    f"'{target_dataset['name']}'"
+                )
+
+    # Source side: each lookup needs the parent resource, so the chain only
+    # advances while the locating values stay readable.
+    body_source_dataset = readable_name("source_dataset")
+    if body_source_dataset is not None:
+        source_dataset = require_dataset(
+            conn, body_source_dataset, role="Source dataset"
+        )
+        body_source_version = readable_version("source_version")
+        if body_source_version is not None:
+            source_version_row = conn.execute(
+                "SELECT id FROM schema_versions "
+                "WHERE dataset_id = ? AND version = ?",
+                (source_dataset["id"], body_source_version),
+            ).fetchone()
+            if source_version_row is None:
+                raise NotFoundError(
+                    f"Source schema version {body_source_version} of dataset "
+                    f"'{source_dataset['name']}' does not exist"
+                )
+            body_source_field = readable_name("source_field")
+            if body_source_field is not None:
+                source_field_row = conn.execute(
+                    "SELECT id FROM schema_fields "
+                    "WHERE version_id = ? AND name = ?",
+                    (source_version_row["id"], body_source_field),
+                ).fetchone()
+                if source_field_row is None:
+                    raise NotFoundError(
+                        f"Source field '{body_source_field}' does not exist in "
+                        f"version {body_source_version} of dataset "
+                        f"'{source_dataset['name']}'"
+                    )
+
+    # Every resource named by a readable locating value exists; only now is
+    # the request shape judged.
+    if query_keys:
+        raise RequestInvalidError(
+            "The lineage deletion endpoint does not accept query parameters"
+        )
+    if not body.strip():
+        raise RequestInvalidError("Request body must not be empty")
+    if payload is None:
+        raise RequestInvalidError("Request body is not valid JSON")
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+    missing = [key for key in _LINEAGE_MAPPING_FIELDS if key not in payload]
+    if missing:
+        raise RequestInvalidError(
+            "Request body is incomplete: missing field(s) " + ", ".join(missing)
+        )
+    unknown = sorted(key for key in payload if key not in _LINEAGE_MAPPING_FIELDS)
+    if unknown:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(unknown))
+    for key in ("target_dataset", "target_field", "source_dataset", "source_field"):
+        value = payload[key]
+        if not isinstance(value, str):
+            raise RequestInvalidError(f"Field '{key}' must be a string")
+        if not value.strip():
+            raise RequestInvalidError(f"Field '{key}' must be a non-empty name")
+    for key in ("target_version", "source_version"):
+        value = payload[key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RequestInvalidError(f"Field '{key}' must be an integer")
+
+    if payload["source_dataset"] == payload["target_dataset"]:
+        raise RequestInvalidError("Source and target datasets must be different")
+    if payload["target_dataset"] != dataset_name or payload["target_version"] != version:
+        raise RequestInvalidError(
+            "Target dataset and version in the body must match the request path"
+        )
+
+    # The shape is fully valid, so every locating value was resolved in the
+    # first phase and these lookups cannot fail.
+    target_dataset = require_dataset(conn, payload["target_dataset"], role="Target dataset")
+    source_dataset = require_dataset(conn, payload["source_dataset"], role="Source dataset")
+    _, target_field_id = _require_field(
+        conn, target_dataset, payload["target_version"], payload["target_field"],
+        role="Target",
+    )
+    _, source_field_id = _require_field(
+        conn, source_dataset, payload["source_version"], payload["source_field"],
+        role="Source",
+    )
+
+    # Dropping the edge shrinks the impact of exactly the fields that can
+    # reach its source, so the invalidation set matches registration: the
+    # source field and everything upstream of it. The reverse walk runs
+    # before the delete, while the edge still exists.
+    _invalidate_impact_cache_for_upstream(
+        conn,
+        source_dataset["name"],
+        payload["source_version"],
+        payload["source_field"],
+        source_field_id,
+    )
+
+    deleted = conn.execute(
+        "DELETE FROM lineage_links "
+        "WHERE target_field_id = ? AND source_field_id = ?",
+        (target_field_id, source_field_id),
+    )
+    if deleted.rowcount == 0:
+        # The mapping was never registered — or a concurrent delete committed
+        # first. The rollback undoes the cache invalidation above, so the
+        # rejection changes nothing.
+        raise NotFoundError(
+            "This field mapping is not registered: "
+            f"'{payload['source_dataset']}' "
+            f"v{payload['source_version']}.{payload['source_field']} -> "
+            f"'{payload['target_dataset']}' "
+            f"v{payload['target_version']}.{payload['target_field']}"
+        )
+
+    return {
+        "target_dataset": target_dataset["name"],
+        "target_version": payload["target_version"],
+        "target_field": payload["target_field"],
+        "source": {
+            "dataset": source_dataset["name"],
+            "version": payload["source_version"],
+            "field": payload["source_field"],
+        },
+    }
+
+
 def get_lineage(
     conn: sqlite3.Connection, dataset_name: str, version: int
 ) -> dict:
@@ -1073,10 +1306,42 @@ def _invalidate_impact_cache_for_upstream(
 
 
 def get_lineage_impact(
-    conn: sqlite3.Connection, dataset_name: str, version: int, field: str
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version: int,
+    field: str,
+    *,
+    field_values: tuple[str, ...] = (),
 ) -> dict:
     dataset = require_dataset(conn, dataset_name)
-    _, field_id = _require_field(conn, dataset, version, field, role="Source")
+    version_row = conn.execute(
+        "SELECT id FROM schema_versions WHERE dataset_id = ? AND version = ?",
+        (dataset["id"], version),
+    ).fetchone()
+    if version_row is None:
+        raise NotFoundError(
+            f"Source schema version {version} of dataset "
+            f"'{dataset['name']}' does not exist"
+        )
+
+    # A repeated 'field' parameter is a 422 and is judged before the field
+    # lookup, so the second value's field resolution can never preempt it
+    # with a 404.
+    if len(field_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'field' must be provided exactly once"
+        )
+
+    field_row = conn.execute(
+        "SELECT id FROM schema_fields WHERE version_id = ? AND name = ?",
+        (version_row["id"], field),
+    ).fetchone()
+    if field_row is None:
+        raise NotFoundError(
+            f"Source field '{field}' does not exist in version "
+            f"{version} of dataset '{dataset['name']}'"
+        )
+    field_id = field_row["id"]
 
     impacted = _impact_cache_lookup(conn, dataset["name"], version, field)
     if impacted is None:
@@ -1235,13 +1500,15 @@ def get_lineage_impact_paths(
     """Read-only shortest-path explanation of one source field's impact.
 
     The path dataset and version resolve first (404); a missing or blank
-    ``field`` parameter cannot name a resource and is a 422, after which the
-    field itself must exist (404). Only then are request-body bytes, query
-    parameters other than ``field`` and a repeated ``field`` parameter
-    rejected with 422, so an unknown dataset, version or field always keeps
-    its 404 precedence over request-shape errors (mirroring the other
-    read-only lineage reads). Computed fresh on every read: nothing is
-    written and the impact cache is never read or written.
+    ``field`` parameter cannot name a resource and is a 422, as is a repeated
+    ``field`` parameter — judged before the field lookup so the second
+    value's field resolution can never preempt it with a 404. The field
+    itself must then exist (404). Only then are request-body bytes and query
+    parameters other than ``field`` rejected with 422, so an unknown dataset,
+    version or field always keeps its 404 precedence over request-shape
+    errors (mirroring the other read-only lineage reads). Computed fresh on
+    every read: nothing is written and the impact cache is never read or
+    written.
     """
     dataset = require_dataset(conn, dataset_name)
     version_row = _require_schema_version(conn, dataset, version)
@@ -1252,6 +1519,10 @@ def get_lineage_impact_paths(
             "field name"
         )
     field = field.strip()
+    if len(field_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'field' must be provided exactly once"
+        )
 
     field_row = conn.execute(
         "SELECT id FROM schema_fields WHERE version_id = ? AND name = ?",
@@ -1271,10 +1542,6 @@ def get_lineage_impact_paths(
     if unknown_keys:
         raise RequestInvalidError(
             "Unknown query parameter(s): " + ", ".join(unknown_keys)
-        )
-    if len(field_values) > 1:
-        raise RequestInvalidError(
-            "Query parameter 'field' must be provided exactly once"
         )
 
     impacts = _compute_impact_paths(conn, field_row["id"])
@@ -1305,14 +1572,16 @@ def get_lineage_source_paths(
 
     Validation mirrors the downstream impact paths query: the path dataset
     and version resolve first (404); a missing or blank ``field`` parameter
-    cannot name a resource and is a 422, after which the field itself must
-    exist (404). Only then are request-body bytes, query parameters other
-    than ``field`` and a repeated ``field`` parameter rejected with 422, so
-    an unknown dataset, version or field always keeps its 404 precedence
-    over request-shape errors. Unlike the downstream query the field value
-    is matched literally (never trimmed), so a whitespace-padded name that
-    matches no stored field is a 404. Computed fresh on every read: nothing
-    is written and the impact cache is never read or written.
+    cannot name a resource and is a 422, as is a repeated ``field``
+    parameter — judged before the field lookup so the second value's field
+    resolution can never preempt it with a 404. The field itself must then
+    exist (404). Only then are request-body bytes and query parameters other
+    than ``field`` rejected with 422, so an unknown dataset, version or field
+    always keeps its 404 precedence over request-shape errors. Unlike the
+    downstream query the field value is matched literally (never trimmed), so
+    a whitespace-padded name that matches no stored field is a 404. Computed
+    fresh on every read: nothing is written and the impact cache is never
+    read or written.
     """
     dataset = require_dataset(conn, dataset_name)
     version_row = _require_schema_version(conn, dataset, version)
@@ -1321,6 +1590,10 @@ def get_lineage_source_paths(
         raise RequestInvalidError(
             "Query parameter 'field' is required and must be a non-empty "
             "field name"
+        )
+    if len(field_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'field' must be provided exactly once"
         )
 
     field_row = conn.execute(
@@ -1341,10 +1614,6 @@ def get_lineage_source_paths(
     if unknown_keys:
         raise RequestInvalidError(
             "Unknown query parameter(s): " + ", ".join(unknown_keys)
-        )
-    if len(field_values) > 1:
-        raise RequestInvalidError(
-            "Query parameter 'field' must be provided exactly once"
         )
 
     origins = _compute_origin_paths(conn, field_row["id"])

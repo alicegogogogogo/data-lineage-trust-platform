@@ -21,6 +21,7 @@ from app.models import (
     FieldTrajectoryResponse,
     LineageCreate,
     LineageCreatedResponse,
+    LineageDeletedResponse,
     LineageImpactResponse,
     LineageImpactPathsResponse,
     LineageResponse,
@@ -424,6 +425,31 @@ def create_lineage(
     return LineageCreatedResponse(**created)
 
 
+# Deletion lives at the same address as registration, submitted as DELETE
+# with the same body shape: the six locating fields name the complete mapping
+# to remove. The body is read raw so the repository can resolve every
+# readable locating value (404) before judging the request shape (422).
+@app.delete(
+    "/datasets/{dataset_name}/versions/{version}/lineage",
+    response_model=LineageDeletedResponse,
+)
+def delete_lineage(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> LineageDeletedResponse:
+    deleted = repository.delete_lineage_link(
+        conn,
+        dataset_name,
+        version,
+        body=body,
+        query_keys=tuple(request.query_params.keys()),
+    )
+    return LineageDeletedResponse(**deleted)
+
+
 @app.get(
     "/datasets/{dataset_name}/versions/{version}/lineage",
     response_model=LineageResponse,
@@ -441,6 +467,7 @@ def get_lineage(
     response_model=LineageImpactResponse,
 )
 def get_lineage_impact(
+    request: Request,
     dataset_name: str,
     version: int,
     field: str | None = Query(default=None),
@@ -453,7 +480,11 @@ def get_lineage_impact(
         )
     return LineageImpactResponse(
         **repository.get_lineage_impact(
-            conn, dataset_name, version, field.strip()
+            conn,
+            dataset_name,
+            version,
+            field.strip(),
+            field_values=tuple(request.query_params.getlist("field")),
         )
     )
 

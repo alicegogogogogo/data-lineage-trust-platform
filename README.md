@@ -172,6 +172,24 @@ schema version in a different (source) dataset.
   Target must match the path. Source and target datasets must differ and every
   referenced dataset/version/field must exist (`404` / `422` otherwise).
   Submitting the same complete mapping twice returns `409`.
+- `DELETE /datasets/{dataset}/versions/{version}/lineage` — remove one
+  registered mapping. Same address and same body shape as registration: the
+  six locating fields name the complete mapping to delete and the body target
+  must match the path. Every locating value readable in the request is
+  resolved first, so an unknown dataset, version or field is a `404` ahead of
+  every request-shape error; when all six values name existing resources but
+  the mapping itself was never registered, the delete is likewise a `404`.
+  An empty or whitespace body, invalid JSON, a non-object payload, missing or
+  extra fields, wrongly typed values, blank names, any query parameter, a
+  mapping whose source and target datasets coincide or whose body target
+  disagrees with the path are all `422`. No rejection changes the lineage
+  graph, the impact cache or any other metadata. A registered mapping is
+  deleted atomically and returns `200` with the removed mapping in the
+  registration response shape; concurrent deletes of the same mapping succeed
+  exactly once (the loser gets `404` and changes nothing). The deletion is
+  visible to every lineage read immediately and survives restarts; the cached
+  impacts of the mapping's source field and of every field that can reach it
+  are invalidated exactly as on registration, unrelated entries are kept.
 - `GET /datasets/{dataset}/versions/{version}/lineage` — return every target
   field (including fields without sources) together with its source references.
   Results are sorted by target field name, then source dataset name, source
@@ -184,7 +202,9 @@ schema version in a different (source) dataset.
   entry being `{"dataset", "version", "field"}`. Results are deduplicated,
   never contain the source itself (cycles terminate) and are sorted by dataset,
   version and field ascending. Unknown dataset/version/field → `404`; a
-  missing, blank or invalid `field` parameter → `422`.
+  missing, blank, invalid or repeated `field` parameter → `422` (a repeated
+  `field` is judged before the field lookup, so it is always a `422`, never a
+  field `404`).
 - `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
   read-only shortest-path explanation of the same impact, computed fresh on
   every read (no caching; nothing is written, and version definitions, lineage
@@ -207,7 +227,8 @@ schema version in a different (source) dataset.
   `impacts` array and both counts zero, never an error. The endpoint takes no
   request body and no query parameter other than `field` (a missing, blank or
   repeated `field` is likewise a `422`); unknown dataset/version/field →
-  `404`, with `404` taking precedence over every `422`.
+  `404`, with `404` taking precedence over every `422` except that a repeated
+  `field` is judged before the field lookup and is therefore always a `422`.
 - `GET /datasets/{dataset}/versions/{version}/lineage/impact/source-paths?field=<field>` —
   read-only upstream companion of the lineage impact query, computed fresh on
   every read (no caching; nothing is written, and version definitions, lineage
@@ -235,14 +256,15 @@ schema version in a different (source) dataset.
   all counts zero, never an error. The endpoint takes no request body and no
   query parameter other than `field` (a missing, blank or repeated `field` is
   likewise a `422`); unknown dataset/version/field → `404`, with `404`
-  taking precedence over every `422`.
+  taking precedence over every `422` except that a repeated `field` is judged
+  before the field lookup and is therefore always a `422`.
 
   Impact results are cached persistently (they survive restarts) and every
   read reflects the currently committed lineage graph: creating a schema
   version invalidates the cache entries related to that dataset, and creating
-  a lineage mapping invalidates the cached impacts of the mapping's source
-  field and of every field that can reach it. Unrelated cache entries are
-  preserved.
+  or deleting a lineage mapping invalidates the cached impacts of the
+  mapping's source field and of every field that can reach it. Unrelated
+  cache entries are preserved.
 
 ### Quality rules
 

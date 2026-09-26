@@ -117,6 +117,15 @@ class LineageCreatedResponse(BaseModel):
     source: LineageSourceRef
 
 
+# The deletion response carries the complete mapping that was just removed,
+# in the same shape as the registration response.
+class LineageDeletedResponse(BaseModel):
+    target_dataset: str
+    target_version: int
+    target_field: str
+    source: LineageSourceRef
+
+
 class LineageResponse(BaseModel):
     target_dataset: str
     target_version: int
