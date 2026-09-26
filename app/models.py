@@ -137,6 +137,31 @@ class LineageImpactResponse(BaseModel):
     impacted: list[LineageSourceRef]
 
 
+# One audited field and the status of its current impact cache record:
+# ``cached`` (the record matches a fresh recomputation), ``missing`` (the
+# field was never cached) or ``mismatch`` (the record is stale or corrupt).
+class LineageImpactCacheAuditEntry(BaseModel):
+    field: str
+    status: Literal["cached", "missing", "mismatch"]
+
+
+# The three per-status totals, keyed by the status name plus ``_count``.
+class LineageImpactCacheAuditCounts(BaseModel):
+    cached_count: int
+    missing_count: int
+    mismatch_count: int
+
+
+# Read-only consistency audit of one version's impact cache: exactly these
+# keys, in this order. Entries are sorted by field name ascending and the
+# document is serialized deterministically (compact JSON, trailing newline).
+class LineageImpactCacheAuditResponse(BaseModel):
+    dataset: str
+    version: int
+    entries: list[LineageImpactCacheAuditEntry]
+    counts: LineageImpactCacheAuditCounts
+
+
 # One impacted field together with the shortest lineage path from the source.
 # ``path`` includes both ends; ``path_length`` is the number of path edges
 # (1 for a direct downstream field).

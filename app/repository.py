@@ -1182,13 +1182,14 @@ def _lineage_forward_edges(
     return edges
 
 
-def _compute_impacted(conn: sqlite3.Connection, source_field_id: int) -> list[dict]:
+def _impacted_from_edges(
+    edges: dict[int, list[tuple[int, dict]]], source_field_id: int
+) -> list[dict]:
     """All fields reachable downstream of the source, deduplicated and sorted.
 
     The source field id is seeded into the visited set, so cycles terminate
     and the source itself never appears in the result.
     """
-    edges = _lineage_forward_edges(conn)
     visited = {source_field_id}
     impacted: dict[tuple[str, int, str], dict] = {}
     queue = [source_field_id]
@@ -1201,6 +1202,11 @@ def _compute_impacted(conn: sqlite3.Connection, source_field_id: int) -> list[di
             impacted[(ref["dataset"], ref["version"], ref["field"])] = ref
             queue.append(target_field_id)
     return [impacted[key] for key in sorted(impacted)]
+
+
+def _compute_impacted(conn: sqlite3.Connection, source_field_id: int) -> list[dict]:
+    """All fields reachable downstream of the source over the current graph."""
+    return _impacted_from_edges(_lineage_forward_edges(conn), source_field_id)
 
 
 def _impact_cache_lookup(
@@ -1351,6 +1357,93 @@ def get_lineage_impact(
     return {
         "source": {"dataset": dataset["name"], "version": version, "field": field},
         "impacted": impacted,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Lineage impact cache consistency audit (read-only)
+# --------------------------------------------------------------------------- #
+
+
+def audit_lineage_impact_cache(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only per-field consistency audit of one version's impact cache.
+
+    Every field of the version is audited in name order. A field without a
+    cache record is ``missing`` — a normal state for a field whose impact was
+    never queried, not an error. A cached field is recomputed with the exact
+    impact-query traversal (``_compute_impacted``: downstream fields merged
+    and deduplicated, the start field excluded, cycles terminating) and is
+    ``cached`` only when the stored record equals the recomputed result;
+    otherwise it is ``mismatch``.
+
+    The audit computes on every read and never writes: no cache record is
+    inserted, invalidated or repaired, so impact queries, path explanations
+    and source-path reads behave exactly as before under the same lineage
+    data. The path dataset/version resolves first (404); only afterwards are
+    any request body bytes — whitespace-only included — or any query
+    parameter rejected with 422, preserving the impact query's 404-before-422
+    precedence.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body:
+        raise RequestInvalidError(
+            "The lineage impact cache audit endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The lineage impact cache audit endpoint does not accept query "
+            "parameters"
+        )
+
+    field_rows = conn.execute(
+        "SELECT id, name FROM schema_fields WHERE version_id = ? ORDER BY name",
+        (version_row["id"],),
+    ).fetchall()
+    cache_rows = conn.execute(
+        "SELECT source_field, impacted FROM lineage_impact_cache "
+        "WHERE source_dataset = ? AND source_version = ?",
+        (dataset["name"], version_number),
+    ).fetchall()
+    cached_by_field = {
+        row["source_field"]: json.loads(row["impacted"]) for row in cache_rows
+    }
+
+    # Build the forward graph once; each cached field's expected result then
+    # walks it with the exact impact-query traversal (the start id is seeded
+    # visited, so cycles terminate and the start field never appears).
+    edges = _lineage_forward_edges(conn)
+
+    entries: list[dict] = []
+    counts = {"cached_count": 0, "missing_count": 0, "mismatch_count": 0}
+    for field_row in field_rows:
+        field_name = field_row["name"]
+        if field_name not in cached_by_field:
+            status = "missing"
+        else:
+            recomputed = _impacted_from_edges(edges, field_row["id"])
+            status = (
+                "cached"
+                if cached_by_field[field_name] == recomputed
+                else "mismatch"
+            )
+        entries.append({"field": field_name, "status": status})
+        counts[f"{status}_count"] += 1
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_number,
+        "entries": entries,
+        "counts": counts,
     }
 
 

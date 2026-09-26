@@ -22,6 +22,7 @@ from app.models import (
     LineageCreate,
     LineageCreatedResponse,
     LineageDeletedResponse,
+    LineageImpactCacheAuditResponse,
     LineageImpactResponse,
     LineageImpactPathsResponse,
     LineageResponse,
@@ -488,6 +489,46 @@ def get_lineage_impact(
             field_values=tuple(request.query_params.getlist("field")),
         )
     )
+
+
+# Read-only consistency audit of the version's impact cache, appended one
+# segment after the lineage impact query address. Every field of the version
+# is audited against a fresh recomputation; nothing is read for repair and
+# the cache is never written, invalidated or repaired. The body is serialized
+# directly (rather than through the default JSON response) so the key order
+# is fixed, the whitespace is compact and the document ends with exactly one
+# newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/lineage/impact/cache-audit",
+    response_model=LineageImpactCacheAuditResponse,
+)
+def get_lineage_impact_cache_audit(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset/version is known, preserving the impact query's 404-before-422
+    # precedence. The audit recomputes on every read and never writes, so the
+    # impact query, path explanations and source-path reads are unaffected.
+    audit = LineageImpactCacheAuditResponse(
+        **repository.audit_lineage_impact_cache(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        audit.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # Read-only shortest-path companion of the lineage impact query, appended one

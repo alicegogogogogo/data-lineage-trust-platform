@@ -205,6 +205,28 @@ schema version in a different (source) dataset.
   missing, blank, invalid or repeated `field` parameter → `422` (a repeated
   `field` is judged before the field lookup, so it is always a `422`, never a
   field `404`).
+- `GET /datasets/{dataset}/versions/{version}/lineage/impact/cache-audit` —
+  read-only consistency audit of the version's impact cache, appended one
+  segment after the impact query address. The path dataset and version name
+  the audit scope; every field of that version is checked against its current
+  cache record and recomputed fresh from the committed lineage graph using
+  exactly the impact-query semantics (downstream fields merged and
+  deduplicated, the start field excluded, cycles terminating). Each entry is
+  `{"field", "status"}` with `cached` (the stored record equals the
+  recomputed result), `missing` (no cache record because the field's impact
+  was never queried — a normal state, not an error) or `mismatch` (the stored
+  record differs). Entries are sorted by field name ascending and the sort
+  does not depend on database order. The JSON document is deterministic
+  (fixed key order, compact whitespace, exactly one trailing newline) with
+  top-level keys `dataset`, `version`, `entries` and `counts` in that order;
+  `counts` gives `cached_count`, `missing_count` and `mismatch_count`, each
+  equal to the number of entries with that status. The audit is computed on
+  every read and never writes: no cache record is inserted, invalidated or
+  repaired, so impact queries, impact paths and source paths behave exactly
+  as before. The endpoint takes no request body and no query parameters; any
+  body bytes (whitespace-only included) or query parameter → `422`, and an
+  unknown dataset or version → `404`, with `404` taking precedence over
+  `422` as in the impact query.
 - `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
   read-only shortest-path explanation of the same impact, computed fresh on
   every read (no caching; nothing is written, and version definitions, lineage
