@@ -815,6 +815,37 @@ time. Snapshots (including their rows) survive restarts.
   unparseable or timezone-less timestamp, an extra body field, an empty,
   whitespace-only or non-JSON body, a non-object body and any query
   parameter are `422` and write nothing.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/at/diff?from=<ISO-8601>&to=<ISO-8601>` —
+  read-only time-travel row diff, appended one segment after the bare-row time
+  lookup address and accepting GET only. Each of `from` (the base instant)
+  and `to` (the target instant) must be a timezone-aware ISO-8601 date-time
+  (an offset or trailing `Z`); per side the service independently selects
+  the latest snapshot whose `created_at` is not later than that timestamp
+  (the same selection as the bare-row lookup), so `to` earlier than `from`
+  is legal and simply reverses the comparison. The JSON document is
+  deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline) with top-level keys `from_timestamp`, `to_timestamp`,
+  `from_snapshot_id`, `to_snapshot_id`, `added`, `removed`,
+  `fields_added` and `fields_removed` in that order; the timestamps are
+  echoed exactly as submitted. `added` and `removed` are the two snapshots'
+  row multisets compared with exactly the same semantics as the by-id diff
+  (each entry `{"row": {...}, "count": <int>}`, sorted by canonical JSON
+  text) — no separate comparison is introduced. `fields_added` and
+  `fields_removed` compare the top-level field names of the two snapshots'
+  row objects: a name appearing only on the target side is added, one only
+  on the base side is removed, a name on both sides is in neither, and
+  each set is sorted by field name ascending. When both timestamps select
+  the same snapshot all four sets are empty and the response is a normal
+  `200`. The read is strictly read-only: no snapshot or row is written or
+  modified and, unlike the masked time-travel read, no masking-hit record,
+  access record, policy or identification record is written either.
+  Unknown dataset/version → `404`, resolved before every parameter and
+  request-shape check; a missing, repeated, unparseable or timezone-less
+  `from`/`to`, any other query parameter and any request body (pure
+  whitespace bytes included) → `422`; when either side has no snapshot at
+  or before its timestamp the response is `404`, checked after the request
+  shape has validated, and nothing is written. Error payloads use the
+  stable `error`/`detail` shape and never expose SQL or stack traces.
 - `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/diff/{other_snapshot_id}` —
   compare two snapshots as JSON-object multisets. Object key order does not
   affect equality, while array order and JSON value types do (e.g. `1`, `1.0`,

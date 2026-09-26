@@ -84,6 +84,7 @@ from app.models import (
     SnapshotDeletionRequestCreate,
     SnapshotDiffResponse,
     SnapshotMaskedViewResponse,
+    SnapshotAtDiffResponse,
     SnapshotMetadata,
     SnapshotResponse,
     VersionCompatibilityResponse,
@@ -1600,6 +1601,47 @@ def view_snapshot_masked_at(
             query_keys=tuple(request.query_params.keys()),
         )
     )
+
+
+# Read-only time-travel row diff, appended one segment after the bare-row time
+# lookup (and its masked-view companion) and accepting GET only. The two
+# timestamps name the snapshots independently; the body is serialized
+# directly (rather than through the default JSON response) so the key order is
+# fixed, the whitespace is compact and the document ends with exactly one
+# newline.
+@app.get(f"{SNAPSHOTS_PATH}/at/diff", response_model=SnapshotAtDiffResponse)
+def diff_snapshots_at(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only: each side selects the latest snapshot created at or before its
+    # timezone-bearing ISO-8601 timestamp exactly like the bare-row /at lookup,
+    # then the two snapshots are compared with the same row multiset semantics
+    # as the by-id diff. Unknown dataset/version is a 404 resolved before every
+    # parameter/body shape check (all 422); a missing snapshot on either side
+    # is a 404 checked only after the request shape has validated, and nothing
+    # is written — snapshots and their rows, masking-hit and access records,
+    # policies and identification records are all left untouched.
+    result = SnapshotAtDiffResponse(
+        **repository.diff_snapshots_at(
+            conn,
+            dataset_name,
+            version,
+            from_values=tuple(request.query_params.getlist("from")),
+            to_values=tuple(request.query_params.getlist("to")),
+            query_keys=tuple(request.query_params.keys()),
+            body=body,
+        )
+    )
+    payload = json.dumps(
+        result.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 @app.get(f"{SNAPSHOTS_PATH}/{{snapshot_id}}", response_model=SnapshotResponse)

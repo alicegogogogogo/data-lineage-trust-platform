@@ -952,6 +952,21 @@ class SnapshotDiffResponse(BaseModel):
     removed: list[SnapshotDiffEntry]
 
 
+# Time-travel row diff between two snapshots, each selected as the newest one
+# created at or before the corresponding timestamp. Carries the same added /
+# removed row multisets as the by-id diff, plus added / removed sets of the
+# rows' top-level field names.
+class SnapshotAtDiffResponse(BaseModel):
+    from_timestamp: str
+    to_timestamp: str
+    from_snapshot_id: int
+    to_snapshot_id: int
+    added: list[SnapshotDiffEntry]
+    removed: list[SnapshotDiffEntry]
+    fields_added: list[str]
+    fields_removed: list[str]
+
+
 # --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #
