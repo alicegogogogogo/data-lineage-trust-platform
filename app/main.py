@@ -74,6 +74,7 @@ from app.models import (
     RetentionPolicyCreate,
     RetentionException,
     RetentionExceptionCreate,
+    RetentionSweepPreviewResponse,
     RetentionSweepResponse,
     SensitiveIdentification,
     SensitiveIdentificationCreate,
@@ -2092,6 +2093,45 @@ def sweep_snapshot_retention(
     )
     payload = json.dumps(
         sweep.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only preview of the batch retention sweep, appended one more segment
+# after the sweep address and accepting GET only. Every snapshot of the
+# version is classified exactly as the sweep would classify it — would_create,
+# skipped or not_due — without opening any request; the body is serialized
+# directly (rather than through the default JSON response) so the key order
+# is fixed, the whitespace is compact and the document ends with exactly one
+# newline.
+@app.get(
+    f"{SNAPSHOTS_PATH}/retention-sweep/preview",
+    response_model=RetentionSweepPreviewResponse,
+)
+def preview_snapshot_retention_sweep(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless: the path dataset/version and the version's
+    # retention policy resolve first (404), then any body bytes — whitespace-
+    # only included — or query parameters are a 422 validated in the
+    # repository, preserving 404 precedence. Nothing is written.
+    preview = RetentionSweepPreviewResponse(
+        **repository.preview_snapshot_retention_sweep(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        preview.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

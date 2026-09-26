@@ -1071,6 +1071,31 @@ downstream fields. Policies and requests are persisted across restarts.
   missing, non-string or blank `reason`, an extra body field, an empty or
   whitespace-only body, malformed JSON, a non-object body or any query
   parameter → `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/retention-sweep/preview` —
+  read-only preview of the batch retention sweep, appended one more segment
+  after the sweep address and accepting GET only. Every snapshot of the
+  version is classified with the exact sweep semantics — the same age
+  judgment as the deletion-request confirmation and the same status judgment
+  as the single-snapshot entry (the downstream set recomputed from the
+  current lineage graph, deduplicated, cycles terminating, never containing
+  a start field) — and nothing is written: no request is opened, no state
+  changes. An expired snapshot without an open (`pending`/`blocked`) request
+  lands in `would_create` with exactly `snapshot_id` and the `status` the
+  sweep would store; a snapshot with an open request — due or not — lands in
+  `skipped` echoing exactly `snapshot_id`, `request_id` and `status` of that
+  request; every remaining snapshot lands in `not_due` carrying only
+  `snapshot_id`. Each snapshot appears in exactly one collection and the
+  classification and statuses are exactly what a subsequent real sweep of
+  the same state would create. The response is a deterministic JSON document
+  (fixed key order, compact whitespace, exactly one trailing newline) with
+  top-level keys `dataset`, `version`, `would_create`, `skipped`, `not_due`
+  and `counts` in that order; the three collections are sorted by snapshot
+  id ascending and `counts` gives `would_create_count`, `skipped_count` and
+  `not_due_count`, summing to the version's snapshot total. Unknown
+  dataset/version → `404` and a version without a registered retention
+  policy → `404`, both judged before every request-shape check; any request
+  body — whitespace-only included — or any query parameter → `422` and
+  nothing is written.
 
 ### Processing tasks
 

@@ -6832,6 +6832,125 @@ def sweep_snapshot_retention(
     }
 
 
+def preview_snapshot_retention_sweep(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only preview of the batch retention sweep of one version.
+
+    Every snapshot of the version is classified with the exact sweep
+    semantics — a snapshot whose age has reached the version's retention
+    days (the same age judgment as the deletion-request confirmation) and
+    that carries no open (``pending``/``blocked``) deletion request lands in
+    ``would_create`` with the status the sweep would store (``blocked`` when
+    the version feeds downstream fields, ``pending`` otherwise — the same
+    status judgment as the single-snapshot entry, computed from the current
+    lineage graph, deduplicated, cycles terminating, the version's own
+    fields never included); a snapshot with an open request lands in
+    ``skipped`` echoing that request's id and status (a not-due snapshot
+    with an open request is skipped, exactly as the sweep classifies it);
+    every remaining snapshot lands in ``not_due`` carrying only its id.
+    Each snapshot appears in exactly one collection, every collection is
+    sorted by snapshot id ascending and the three counts sum to the version's
+    snapshot total. The classification and statuses are exactly what a
+    subsequent real sweep of the same state would create. Nothing is
+    written: the preview opens no request, takes no lock and changes no
+    state.
+
+    The path dataset/version resolves first (404), then the version's
+    retention policy (404 when none is registered, mirroring the sweep);
+    only afterwards is the request shape judged (422): any body bytes —
+    whitespace-only included — or any query parameter.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    policy_row = conn.execute(
+        "SELECT id, retention_days FROM retention_policies WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchone()
+    if policy_row is None:
+        raise NotFoundError(
+            f"No retention policy exists for version {version_number} of "
+            f"dataset '{dataset_name}'"
+        )
+
+    if body:
+        raise RequestInvalidError(
+            "The snapshot retention sweep preview endpoint does not accept "
+            "a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot retention sweep preview endpoint does not accept "
+            "query parameters"
+        )
+
+    snapshot_rows = conn.execute(
+        "SELECT id, created_at FROM snapshots WHERE version_id = ? "
+        "ORDER BY id ASC",
+        (version_row["id"],),
+    ).fetchall()
+    open_rows = conn.execute(
+        "SELECT snapshot_id, id, status FROM snapshot_deletion_requests "
+        "WHERE version_id = ? AND status IN ('pending', 'blocked')",
+        (version_row["id"],),
+    ).fetchall()
+    open_by_snapshot = {row["snapshot_id"]: row for row in open_rows}
+
+    # The downstream judgment is a property of the version, shared by every
+    # snapshot of the preview (mirrors the sweep and the single-snapshot
+    # entry).
+    impacted = _compute_version_field_impacted(conn, version_row["id"])
+    status = "blocked" if impacted else "pending"
+    now = datetime.now(timezone.utc)
+    retention_delta = timedelta(days=policy_row["retention_days"])
+
+    would_create: list[dict] = []
+    skipped: list[dict] = []
+    not_due: list[dict] = []
+    for snapshot_row in snapshot_rows:
+        snapshot_id = snapshot_row["id"]
+        open_request = open_by_snapshot.get(snapshot_id)
+        if open_request is not None:
+            skipped.append(
+                {
+                    "snapshot_id": snapshot_id,
+                    "request_id": open_request["id"],
+                    "status": open_request["status"],
+                }
+            )
+            continue
+        age = now - datetime.fromisoformat(snapshot_row["created_at"])
+        if age < retention_delta:
+            not_due.append({"snapshot_id": snapshot_id})
+            continue
+        would_create.append({"snapshot_id": snapshot_id, "status": status})
+
+    # Explicit ordering: no collection relies on the database's natural
+    # order.
+    would_create.sort(key=lambda entry: entry["snapshot_id"])
+    skipped.sort(key=lambda entry: entry["snapshot_id"])
+    not_due.sort(key=lambda entry: entry["snapshot_id"])
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_number,
+        "would_create": would_create,
+        "skipped": skipped,
+        "not_due": not_due,
+        "counts": {
+            "would_create_count": len(would_create),
+            "skipped_count": len(skipped),
+            "not_due_count": len(not_due),
+        },
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Retention exceptions (compliance holds blocking snapshot deletion)
 # --------------------------------------------------------------------------- #
