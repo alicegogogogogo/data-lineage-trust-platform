@@ -1448,8 +1448,138 @@ def audit_lineage_impact_cache(
 
 
 # --------------------------------------------------------------------------- #
-# Lineage impact shortest-path query (read-only, never cached)
+# Lineage impact cache repair (controlled write entry point)
 # --------------------------------------------------------------------------- #
+
+
+# Process-local exclusion of concurrent repairs of one version's cache. The
+# lock is taken by the endpoint's repair guard before the request connection
+# is opened and released after the transaction commits, so a concurrent
+# repair meets a held lock wherever it starts and is rejected with a 409
+# instead of waiting (mirrors the per-version registration/evaluation locks;
+# FastAPI runs this synchronous endpoint in one process's threadpool).
+_impact_cache_repair_locks: dict[tuple[str, int], threading.Lock] = {}
+_impact_cache_repair_locks_guard = threading.Lock()
+
+
+def impact_cache_repair_lock(dataset_name: str, version_number: int) -> threading.Lock:
+    """Process-local exclusion lock of one version's impact cache repair."""
+    key = (dataset_name, version_number)
+    with _impact_cache_repair_locks_guard:
+        lock = _impact_cache_repair_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _impact_cache_repair_locks[key] = lock
+        return lock
+
+
+def repair_lineage_impact_cache(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Repair one version's impact cache against the committed lineage graph.
+
+    Every field of the version is recomputed with the exact impact-query
+    traversal (``_impacted_from_edges``: downstream fields merged and
+    deduplicated, the start field excluded, cycles terminating). A field
+    without a cache record gets one (``created``); a stored record that
+    disagrees with the recomputation is rewritten (``updated``); a record
+    that already matches is left untouched — never rewritten, never
+    reordered (``unchanged``). The response lists one entry per field, sorted
+    by field name ascending, with per-action counts keyed by the action name
+    plus ``_count``. Written records are ordinary cache rows, so they are
+    immediately visible to impact queries and survive restarts, and a
+    subsequent audit reports every field as ``cached``.
+
+    The path dataset/version resolves first (404); only afterwards are any
+    request body bytes — whitespace-only included — or any query parameter
+    rejected with 422, preserving the impact query's 404-before-422
+    precedence. Concurrent repairs of the same version have a single winner:
+    repairs of this process are serialized by the endpoint's repair guard
+    (the loser gets a 409 before any database work), and the fail-fast
+    ``BEGIN IMMEDIATE`` below turns a concurrent repair of another process
+    into the same 409. Every rejection writes nothing (the transaction rolls
+    back). Lineage registrations and deletions, impact queries, path
+    explanations, source-path reads and the read-only audit are unaffected.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body:
+        raise RequestInvalidError(
+            "The lineage impact cache repair endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The lineage impact cache repair endpoint does not accept query "
+            "parameters"
+        )
+
+    # Take the database write lock before any repair read so the
+    # recomputation and the cache writes see one committed graph. The lock is
+    # taken without waiting: a concurrent repair of another process already
+    # holds it, so this request is the loser — 409 and no cache change. The
+    # usual timeout is restored immediately so the repair's own commit can
+    # still wait out a transient reader.
+    conn.execute("PRAGMA busy_timeout = 0")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        raise ConflictError(
+            f"Another repair of the impact cache of version {version_number} "
+            f"of dataset '{dataset['name']}' is already in progress"
+        ) from exc
+    finally:
+        conn.execute("PRAGMA busy_timeout = 30000")
+
+    field_rows = conn.execute(
+        "SELECT id, name FROM schema_fields WHERE version_id = ? ORDER BY name",
+        (version_row["id"],),
+    ).fetchall()
+    cache_rows = conn.execute(
+        "SELECT source_field, impacted FROM lineage_impact_cache "
+        "WHERE source_dataset = ? AND source_version = ?",
+        (dataset["name"], version_number),
+    ).fetchall()
+    cached_by_field = {
+        row["source_field"]: json.loads(row["impacted"]) for row in cache_rows
+    }
+
+    # Build the forward graph once; each field's expected result then walks
+    # it with the exact impact-query traversal (the start id is seeded
+    # visited, so cycles terminate and the start field never appears).
+    edges = _lineage_forward_edges(conn)
+
+    entries: list[dict] = []
+    counts = {"created_count": 0, "updated_count": 0, "unchanged_count": 0}
+    for field_row in field_rows:
+        field_name = field_row["name"]
+        recomputed = _impacted_from_edges(edges, field_row["id"])
+        cached = cached_by_field.get(field_name)
+        if cached is None:
+            action = "created"
+        elif cached != recomputed:
+            action = "updated"
+        else:
+            action = "unchanged"
+        if action != "unchanged":
+            _impact_cache_store(
+                conn, dataset["name"], version_number, field_name, recomputed
+            )
+        entries.append({"field": field_name, "action": action})
+        counts[f"{action}_count"] += 1
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_number,
+        "entries": entries,
+        "counts": counts,
+    }
 
 
 def _lineage_field_refs(conn: sqlite3.Connection) -> dict[int, dict]:

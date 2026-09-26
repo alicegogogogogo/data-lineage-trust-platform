@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -11,7 +12,7 @@ from fastapi.responses import JSONResponse
 
 from app import repository
 from app.db import get_db
-from app.errors import APIError, RequestInvalidError
+from app.errors import APIError, ConflictError, RequestInvalidError
 from app.models import (
     AuditChainVerifyResponse,
     AuditRecord,
@@ -23,6 +24,7 @@ from app.models import (
     LineageCreatedResponse,
     LineageDeletedResponse,
     LineageImpactCacheAuditResponse,
+    LineageImpactCacheRepairResponse,
     LineageImpactResponse,
     LineageImpactPathsResponse,
     LineageResponse,
@@ -525,6 +527,67 @@ def get_lineage_impact_cache_audit(
     )
     payload = json.dumps(
         audit.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Controlled repair of the version's impact cache, appended one segment
+# after the read-only cache audit address and accepting POST only. Every
+# field of the version is recomputed against the committed lineage graph:
+# missing records are created, stale records rewritten and matching records
+# left untouched. The body is serialized directly (rather than through the
+# default JSON response) so the key order is fixed, the whitespace is compact
+# and the document ends with exactly one newline.
+def _repair_guard(dataset_name: str, version: int) -> Iterator[None]:
+    # Declared before the database dependency so the lock is taken before the
+    # request connection is opened, and — dependencies tearing down in
+    # reverse order — released only after the transaction commits. A
+    # concurrent repair of the same version therefore meets a held lock
+    # wherever it starts and loses with a 409 instead of waiting.
+    lock = repository.impact_cache_repair_lock(dataset_name, version)
+    if not lock.acquire(blocking=False):
+        raise ConflictError(
+            f"Another repair of the impact cache of version {version} of "
+            f"dataset '{dataset_name}' is already in progress"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@app.post(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/lineage/impact/cache-audit/repair",
+    response_model=LineageImpactCacheRepairResponse,
+)
+def repair_lineage_impact_cache(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    _repair: None = Depends(_repair_guard),
+    conn=Depends(get_db),
+) -> Response:
+    # The endpoint takes no input beyond the path; any body bytes
+    # (whitespace-only included) or query parameters are a 422 validated in
+    # the repository once the path dataset/version is known, preserving the
+    # impact query's 404-before-422 precedence. Concurrent repairs of the
+    # same version have a single winner; the loser is a 409 and changes
+    # nothing. Every other rejection writes nothing either.
+    repair = LineageImpactCacheRepairResponse(
+        **repository.repair_lineage_impact_cache(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        repair.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )
