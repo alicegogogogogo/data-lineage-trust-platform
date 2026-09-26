@@ -2094,17 +2094,21 @@ def _require_evaluation_path(
     body: bytes,
     query_keys: tuple[str, ...],
     endpoint: str,
+    strict_body: bool = False,
 ) -> tuple[dict, sqlite3.Row]:
     """Resolve the path (404) before rejecting body bytes/query params (422).
 
     These read-only/parameterless endpoints share one rule: the shape checks
     run only once the dataset and version are known, so an unknown
     dataset/version stays a 404 (mirroring the parameterless audit-report
-    endpoint).
+    endpoint). By default a whitespace-only body is ignored, matching the
+    other parameterless reads; the release gate is stricter — with
+    ``strict_body`` every non-empty body (including a single space) is a
+    shape error.
     """
     dataset = require_dataset(conn, dataset_name)
     version_row = _require_schema_version(conn, dataset, version_number)
-    if body.strip():
+    if (body if strict_body else body.strip()):
         raise RequestInvalidError(
             f"The {endpoint} endpoint does not accept a request body"
         )
@@ -2531,6 +2535,137 @@ def list_quality_anomalies(
         (version_row["id"],),
     ).fetchall()
     return [_anomaly_row_to_dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Pre-release quality gate verdict (read-only, computed on every read)
+# --------------------------------------------------------------------------- #
+
+
+# Reason type of a rule still violating in the latest recorded evaluation.
+# Anomaly reasons reuse the persisted anomaly record kinds ("row_limit",
+# "rule_limit", "trend") verbatim.
+QUALITY_GATE_EVALUATION_REASON = "evaluation"
+
+
+def get_version_quality_gate(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only release gate verdict for one schema version.
+
+    The verdict is computed fresh from the persisted records on every read —
+    nothing is cached and nothing is written, and the rules themselves are
+    never re-run. With no recorded evaluation the verdict is ``undetermined``
+    with an empty reason list. Otherwise the latest recorded evaluation keeps
+    violating rows, or any anomaly record is persisted, the verdict is
+    ``failed``; a latest evaluation with no violations (including the one
+    recorded for an empty row set) together with no anomaly records is
+    ``passed``. A rule disabled after it violated still contributes its
+    historical result: only the persisted records are judged.
+
+    The path resolves first, so an unknown dataset/version stays a 404 ahead
+    of the body/query-parameter 422, exactly as on the evaluation history
+    endpoint.
+    """
+    dataset, version_row = _require_evaluation_path(
+        conn,
+        dataset_name,
+        version_number,
+        body=body,
+        query_keys=query_keys,
+        endpoint="quality gate",
+        strict_body=True,
+    )
+    version_id = version_row["id"]
+
+    evaluation_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM quality_rule_evaluations "
+        "WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()["count"]
+
+    latest_row = conn.execute(
+        "SELECT sequence, results FROM quality_rule_evaluations "
+        "WHERE version_id = ? ORDER BY sequence DESC LIMIT 1",
+        (version_id,),
+    ).fetchone()
+
+    anomaly_rows = conn.execute(
+        "SELECT kind, sequence, rule_id, violation_count "
+        "FROM quality_anomaly_records WHERE version_id = ?",
+        (version_id,),
+    ).fetchall()
+
+    reasons: list[dict] = []
+    latest_has_violations = False
+    if latest_row is not None:
+        # One reason per rule that still violates in the latest evaluation;
+        # only enabled-at-evaluation-time rules have persisted results, so a
+        # rule since disabled is judged exactly as history recorded it.
+        for result in sorted(
+            json.loads(latest_row["results"]), key=lambda item: item["rule_id"]
+        ):
+            violation_count = len(result["violations"])
+            if violation_count:
+                latest_has_violations = True
+                reasons.append(
+                    {
+                        "type": QUALITY_GATE_EVALUATION_REASON,
+                        "sequence": latest_row["sequence"],
+                        "rule_id": result["rule_id"],
+                        "violation_count": violation_count,
+                    }
+                )
+
+    # One reason per persisted anomaly record (any kind), kept separate from
+    # the evaluation reasons: the same rule violating in the latest
+    # evaluation and carrying an anomaly record yields both reasons, never
+    # merged or deduplicated.
+    for anomaly in anomaly_rows:
+        reasons.append(
+            {
+                "type": anomaly["kind"],
+                "sequence": anomaly["sequence"],
+                "rule_id": anomaly["rule_id"],
+                "violation_count": anomaly["violation_count"],
+            }
+        )
+
+    # Deterministic order independent of database natural order: reason type,
+    # then history sequence, then rule id ascending (a null rule id sorts
+    # ahead of every real id, as in SQL ASC ordering).
+    reasons.sort(
+        key=lambda reason: (
+            reason["type"],
+            reason["sequence"],
+            reason["rule_id"] is not None,
+            reason["rule_id"] if reason["rule_id"] is not None else 0,
+        )
+    )
+
+    if latest_row is None:
+        verdict = "undetermined"
+    elif latest_has_violations or anomaly_rows:
+        verdict = "failed"
+    else:
+        verdict = "passed"
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "verdict": verdict,
+        "reasons": reasons,
+        "checks": {
+            "evaluation_count": evaluation_count,
+            "anomaly_count": len(anomaly_rows),
+            "reason_count": len(reasons),
+        },
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -411,6 +411,45 @@ class QualityAnomalyRecord(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Pre-release quality gate verdict over the persisted evaluation/anomaly state
+# --------------------------------------------------------------------------- #
+
+
+# The three gate verdicts: releasable, no recorded evaluation yet, or quality
+# problems recorded.
+QualityGateVerdict = Literal["passed", "undetermined", "failed"]
+
+
+class QualityGateReason(BaseModel):
+    # 'evaluation' for a rule still violating in the latest recorded
+    # evaluation, or the anomaly record's kind ('row_limit', 'rule_limit',
+    # 'trend').
+    type: str
+    # History sequence the reason points at: the latest evaluation sequence
+    # for evaluation reasons, the anomaly record's sequence otherwise.
+    sequence: int
+    # Rule id for evaluation and 'rule_limit' reasons; null for row-limit and
+    # trend reasons. The key is never omitted.
+    rule_id: int | None
+    # Number of violating rows the reason reports.
+    violation_count: int
+
+
+class QualityGateChecks(BaseModel):
+    evaluation_count: int
+    anomaly_count: int
+    reason_count: int
+
+
+class QualityGateResponse(BaseModel):
+    dataset: str
+    version: int
+    verdict: QualityGateVerdict
+    reasons: list[QualityGateReason]
+    checks: QualityGateChecks
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 

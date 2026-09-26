@@ -321,6 +321,41 @@ and persisted (including their enabled state) across restarts.
   evaluations the response is an explicit empty result (null sequences,
   empty lists), not an error. Same `404`/`422` rules as the history
   endpoint; nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/gate` —
+  read-only pre-release quality gate verdict, computed fresh from the
+  persisted evaluation history and anomaly records on every read (no
+  caching; nothing is written, and rules are never re-run or rewritten).
+  The endpoint takes no request body and no query parameters (a pure
+  whitespace or single-space body is a shape error too → `422`); unknown
+  dataset/version → `404`, with the same 404-before-422 precedence as the
+  evaluation history endpoint. The JSON document is deterministic (fixed
+  key order, compact whitespace, exactly one trailing newline) with
+  top-level keys `dataset`, `version`, `verdict`, `reasons` and `checks`
+  in that order. `verdict` is one of `passed` (the latest recorded
+  evaluation has no violations and no anomaly record exists; a zero-row
+  submission recorded with zero violations is a valid basis),
+  `undetermined` (no evaluation has ever been recorded; `reasons` is an
+  empty array and the response is `200`, never an error) or `failed` (the
+  latest recorded evaluation still has violating rows, or any anomaly
+  record is persisted for the version). `reasons` lists every factor
+  lowering the verdict, sorted by reason type, then history sequence, then
+  rule id ascending (a null rule id sorts ahead of real ids); each reason
+  has exactly `type`, `sequence`, `rule_id` and `violation_count` in that
+  order, with the missing side written as `null` and the key never
+  omitted. The latest evaluation yields one reason per rule with
+  violations (`type` is `evaluation`, `sequence` is that evaluation's
+  history sequence, `rule_id` the rule's id and `violation_count` the
+  rule's number of violating rows in that evaluation); every persisted
+  anomaly record yields one additional reason whose `type` is its existing
+  kind literal (`row_limit`, `rule_limit` or `trend`). A rule violating in
+  both places yields both reasons separately — reasons are never merged or
+  deduplicated — and a rule disabled after it violated still counts from
+  history: only persisted records are judged. `checks` has exactly
+  `evaluation_count` (recorded evaluations checked), `anomaly_count`
+  (persisted anomaly records) and `reason_count` (the number of returned
+  reasons), each agreeing item-for-item with the returned details. The
+  verdict is advisory for release decisions only and changes no stored
+  state.
 
 ### Quality anomaly detection
 

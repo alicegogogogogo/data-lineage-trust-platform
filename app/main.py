@@ -59,6 +59,7 @@ from app.models import (
     QualityAnomalyDetectionConfig,
     QualityAnomalyDetectionConfigCreate,
     QualityAnomalyRecord,
+    QualityGateResponse,
     QualityRule,
     QualityRuleCreate,
     QualityRuleEnabledUpdate,
@@ -800,6 +801,44 @@ def list_quality_anomalies(
             query_keys=tuple(request.query_params.keys()),
         )
     ]
+
+
+# Read-only pre-release quality gate verdict appended after the quality-rules
+# resource. The verdict is recomputed from the persisted evaluation history
+# and anomaly records on every read (no caching; nothing is written). The
+# body is serialized directly (rather than through the default JSON
+# response) so the key order is fixed, the whitespace is compact and the
+# document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}/quality-rules/gate",
+    response_model=QualityGateResponse,
+)
+def get_version_quality_gate(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (including whitespace) or
+    # query parameters are a 422 validated in the repository once the path
+    # dataset/version is known, preserving the same 404 precedence as the
+    # evaluation history endpoint.
+    gate = QualityGateResponse(
+        **repository.get_version_quality_gate(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        gate.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #
