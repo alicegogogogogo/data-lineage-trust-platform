@@ -1042,6 +1042,61 @@ def patch_privacy_policy(
     )
 
 
+# Revision of one policy's classification, masking and allowed roles, at the
+# same address as the enable/disable toggle but accepting PUT only. The raw
+# body is parsed in the repository so an unknown dataset, version or policy
+# stays a 404 checked ahead of every body/query shape check (all 422).
+def _privacy_policy_revision_guard(
+    dataset_name: str, version: int, policy_id: int
+) -> Iterator[None]:
+    # Declared before the database dependency so the lock is taken before the
+    # request connection is opened, and — dependencies tearing down in
+    # reverse order — released only after the transaction commits. A
+    # concurrent revision of the same policy therefore meets a held lock
+    # wherever it starts and loses with a 409 instead of waiting (mirrors the
+    # impact cache repair guard).
+    lock = repository.privacy_policy_revision_lock(dataset_name, version, policy_id)
+    if not lock.acquire(blocking=False):
+        raise ConflictError(
+            f"Another revision of privacy policy {policy_id} of version "
+            f"{version} of dataset '{dataset_name}' is already in progress"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@app.put(
+    "/datasets/{dataset_name}/versions/{version}/privacy-policies/{policy_id}",
+    response_model=PrivacyPolicy,
+)
+def revise_privacy_policy(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    policy_id: int,
+    body: bytes = Depends(_read_request_body),
+    _revision: None = Depends(_privacy_policy_revision_guard),
+    conn=Depends(get_db),
+) -> PrivacyPolicy:
+    # The body carries exactly classification, masking and allowed_roles
+    # (validated in the repository with the registration's value rules); the
+    # policy id, field, enabled state and created_at never change. Concurrent
+    # revisions of the same policy have a single winner; the loser is a 409
+    # and changes nothing. Every rejection writes nothing.
+    return PrivacyPolicy(
+        **repository.revise_privacy_policy(
+            conn,
+            dataset_name,
+            version,
+            policy_id,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
 @app.post(
     "/datasets/{dataset_name}/versions/{version}/privacy-policies/view",
     response_model=PrivacyViewResponse,

@@ -478,6 +478,21 @@ data. Policies (including their enabled state) are persisted across restarts.
 - `PATCH /datasets/{dataset}/versions/{version}/privacy-policies/{policy_id}` —
   enable or disable a policy. Body: `{"enabled": true}` (boolean only); returns
   the updated policy. Unknown policy/dataset/version → `404`.
+- `PUT /datasets/{dataset}/versions/{version}/privacy-policies/{policy_id}` —
+  revise a policy's classification, masking and allowed roles. Body:
+  `{"classification": "PII", "masking": "redact", "allowed_roles": ["auditor"]}`
+  with exactly these three fields, submitted and validated as a whole under the
+  same value rules as registration (`allowed_roles` may be empty). The policy
+  id, field, enabled state and `created_at` never change; the response is the
+  updated policy. The revision takes effect on the next masked view, and the
+  trend, coverage check and compliance export report the revised values;
+  already persisted masking-hit records, access records and cleanup requests
+  are left unchanged. Unknown dataset/version/policy → `404` (checked before
+  the request shape); a missing/extra field, a blank classification, an
+  unknown masking value, duplicate or blank role names, an empty or malformed
+  body, or any query parameter → `422` and nothing is written. Concurrent
+  revisions of the same policy have a single winner; the loser gets `409` and
+  changes nothing.
 - `POST /datasets/{dataset}/versions/{version}/privacy-policies/view` — return a
   role-scoped, order-preserving copy of submitted rows. Body:
   `{"role": "guest", "rows": [{...}, ...]}` with a non-empty `role` and a list

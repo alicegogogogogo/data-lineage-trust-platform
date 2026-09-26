@@ -3096,6 +3096,160 @@ def set_privacy_policy_enabled(
     return _policy_row_to_dict(updated)
 
 
+# Process-local exclusion of concurrent revisions of one privacy policy. The
+# lock is taken by the endpoint's revision guard before the request connection
+# is opened and released after the transaction commits, so a concurrent
+# revision meets a held lock wherever it starts and is rejected with a 409
+# instead of waiting (mirrors the impact cache repair and retention sweep
+# guards).
+_privacy_policy_revision_locks: dict[tuple[str, int, int], threading.Lock] = {}
+_privacy_policy_revision_locks_guard = threading.Lock()
+
+
+def privacy_policy_revision_lock(
+    dataset_name: str, version_number: int, policy_id: int
+) -> threading.Lock:
+    """Process-local exclusion lock of one privacy policy's revision."""
+    key = (dataset_name, version_number, policy_id)
+    with _privacy_policy_revision_locks_guard:
+        lock = _privacy_policy_revision_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _privacy_policy_revision_locks[key] = lock
+        return lock
+
+
+_PRIVACY_POLICY_REVISION_FIELDS = frozenset(
+    {"classification", "masking", "allowed_roles"}
+)
+_PRIVACY_POLICY_MASKING_VALUES = ("redact", "partial")
+
+
+def _parse_privacy_policy_revision_body(body: bytes) -> tuple[str, str, list[str]]:
+    """Validate and parse a raw privacy-policy revision body.
+
+    The body must be a JSON object carrying exactly ``classification`` (a
+    non-empty string after trimming whitespace), ``masking`` (``redact`` or
+    ``partial``) and ``allowed_roles`` (an array of distinct, non-empty role
+    names, possibly empty) — the same value rules as policy registration.
+    Returns the cleaned triple. Every structural problem is a 422; nothing is
+    written.
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    extra_keys = sorted(set(payload) - _PRIVACY_POLICY_REVISION_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra_keys))
+    missing_keys = sorted(_PRIVACY_POLICY_REVISION_FIELDS - set(payload))
+    if missing_keys:
+        raise RequestInvalidError(
+            "Request body is incomplete: missing field(s) "
+            + ", ".join(missing_keys)
+        )
+
+    classification = payload["classification"]
+    if not isinstance(classification, str) or not classification.strip():
+        raise RequestInvalidError("'classification' must be a non-empty string")
+
+    masking = payload["masking"]
+    if masking not in _PRIVACY_POLICY_MASKING_VALUES:
+        raise RequestInvalidError("'masking' must be 'redact' or 'partial'")
+
+    allowed_roles = payload["allowed_roles"]
+    if not isinstance(allowed_roles, list) or not all(
+        isinstance(role, str) for role in allowed_roles
+    ):
+        raise RequestInvalidError("'allowed_roles' must be an array of role names")
+    roles = _clean_allowed_roles(allowed_roles)
+
+    return classification.strip(), masking, roles
+
+
+def revise_privacy_policy(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    policy_id: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Revise one privacy policy's classification, masking and allowed roles.
+
+    The three values are submitted and validated as a whole with the same
+    rules as registration; the policy id, field, enabled state and
+    ``created_at`` never change. The revision writes only the policy row
+    itself: no policy is created, no identification record is touched and no
+    candidate registration is triggered. Persisted masking-hit records, access
+    records and cleanup requests are left exactly as they are; the next view,
+    trend, coverage check and compliance export read the revised values.
+
+    The path dataset, version and policy resolve first (404); only afterwards
+    are any query parameters or the request body judged (every shape problem
+    is a 422 that writes nothing). Concurrent revisions of the same policy
+    have a single winner: revisions of this process are serialized by the
+    endpoint's revision guard (the loser gets a 409 before any database work),
+    and the fail-fast ``BEGIN IMMEDIATE`` below turns a concurrent revision of
+    another process into the same 409. Every rejection writes nothing (the
+    transaction rolls back).
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    row = conn.execute(
+        "SELECT id, field, classification, masking, allowed_roles, enabled, created_at "
+        "FROM privacy_policies WHERE version_id = ? AND id = ?",
+        (version_row["id"], policy_id),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"Privacy policy {policy_id} does not exist in this version"
+        )
+
+    if query_keys:
+        raise RequestInvalidError(
+            "The privacy policy revision endpoint does not accept query "
+            "parameters"
+        )
+    classification, masking, roles = _parse_privacy_policy_revision_body(body)
+
+    # Take the database write lock before the update so a concurrent revision
+    # of another process meets a held lock. The lock is taken without waiting:
+    # the other revision already holds it, so this request is the loser — 409
+    # and nothing written. The usual timeout is restored immediately so this
+    # revision's own commit can still wait out a transient reader.
+    conn.execute("PRAGMA busy_timeout = 0")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        raise ConflictError(
+            f"Another revision of privacy policy {policy_id} of version "
+            f"{version_number} of dataset '{dataset['name']}' is already in "
+            "progress"
+        ) from exc
+    finally:
+        conn.execute("PRAGMA busy_timeout = 30000")
+
+    conn.execute(
+        "UPDATE privacy_policies SET classification = ?, masking = ?, "
+        "allowed_roles = ? WHERE id = ?",
+        (classification, masking, json.dumps(roles), row["id"]),
+    )
+    updated = conn.execute(
+        "SELECT id, field, classification, masking, allowed_roles, enabled, created_at "
+        "FROM privacy_policies WHERE id = ?",
+        (row["id"],),
+    ).fetchone()
+    return _policy_row_to_dict(updated)
+
+
 def _mask_value(value: Any, masking: str) -> Any:
     if value is None:
         return None
