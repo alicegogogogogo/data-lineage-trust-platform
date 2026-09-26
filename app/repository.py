@@ -6059,6 +6059,213 @@ def confirm_snapshot_deletion_request(
 
 
 # --------------------------------------------------------------------------- #
+# Retention sweep (batch deletion-request creation over one version)
+# --------------------------------------------------------------------------- #
+
+
+# Process-local exclusion of concurrent sweeps of one version's snapshots. The
+# lock is taken by the endpoint's sweep guard before the request connection is
+# opened and released after the transaction commits, so a concurrent sweep
+# meets a held lock wherever it starts and is rejected with a 409 instead of
+# waiting (mirrors the impact cache repair lock; FastAPI runs this synchronous
+# endpoint in one process's threadpool).
+_retention_sweep_locks: dict[tuple[str, int], threading.Lock] = {}
+_retention_sweep_locks_guard = threading.Lock()
+
+
+def retention_sweep_lock(dataset_name: str, version_number: int) -> threading.Lock:
+    """Process-local exclusion lock of one version's retention sweep."""
+    key = (dataset_name, version_number)
+    with _retention_sweep_locks_guard:
+        lock = _retention_sweep_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _retention_sweep_locks[key] = lock
+        return lock
+
+
+_RETENTION_SWEEP_FIELDS = {"reason"}
+
+
+def _parse_retention_sweep_body(body: bytes) -> str:
+    """Validate and parse a raw retention-sweep body.
+
+    The body must be a JSON object carrying exactly ``reason`` (a non-empty
+    string after trimming whitespace). Returns the trimmed reason. Every
+    structural problem is a 422; the sweep writes only afterwards.
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    extra_keys = sorted(set(payload) - _RETENTION_SWEEP_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra_keys))
+
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise RequestInvalidError("'reason' must be a non-empty string")
+    return reason.strip()
+
+
+def sweep_snapshot_retention(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Open a deletion request for every expired snapshot of one version.
+
+    Every snapshot of the version is scanned in snapshot-id order. A snapshot
+    whose age has reached the version's retention days (the same age judgment
+    as the deletion-request confirmation) and that carries no open
+    (pending/blocked) deletion request gets a new request with the submitted
+    reason, ``blocked`` when the version feeds downstream fields and
+    ``pending`` otherwise — the same status judgment as the single-snapshot
+    entry. A snapshot with an open request is skipped (the existing request is
+    echoed, never duplicated or modified); a snapshot younger than the
+    retention age is skipped and only counted. A version without snapshots
+    sweeps successfully with empty collections.
+
+    The path dataset/version resolves first (404), then the version's
+    retention policy (404 when none is registered, mirroring the
+    single-snapshot entry); only afterwards are the body shape and the query
+    parameters judged (422). The whole scan runs in one transaction: either
+    every new request is written or none is. Concurrent sweeps of the same
+    version have a single winner — sweeps of this process are serialized by
+    the endpoint's sweep guard and the fail-fast ``BEGIN IMMEDIATE`` below
+    turns a concurrent writer of another process into the same 409 — and
+    every rejection writes nothing (the transaction rolls back).
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    policy_row = conn.execute(
+        "SELECT id, retention_days FROM retention_policies WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchone()
+    if policy_row is None:
+        raise NotFoundError(
+            f"No retention policy exists for version {version_number} of "
+            f"dataset '{dataset_name}'"
+        )
+
+    clean_reason = _parse_retention_sweep_body(body)
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot retention sweep endpoint does not accept query "
+            "parameters"
+        )
+
+    # Take the database write lock before any sweep read so the scan and the
+    # request inserts see one committed state. The lock is taken without
+    # waiting: a concurrent sweep of another process already holds it, so
+    # this request is the loser — 409 and nothing written. The usual timeout
+    # is restored immediately so the sweep's own commit can still wait out a
+    # transient reader.
+    conn.execute("PRAGMA busy_timeout = 0")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        raise ConflictError(
+            f"Another retention sweep of version {version_number} of dataset "
+            f"'{dataset['name']}' is already in progress"
+        ) from exc
+    finally:
+        conn.execute("PRAGMA busy_timeout = 30000")
+
+    snapshot_rows = conn.execute(
+        "SELECT id, created_at FROM snapshots WHERE version_id = ? "
+        "ORDER BY id ASC",
+        (version_row["id"],),
+    ).fetchall()
+    open_rows = conn.execute(
+        "SELECT snapshot_id, id, status, reason FROM snapshot_deletion_requests "
+        "WHERE version_id = ? AND status IN ('pending', 'blocked')",
+        (version_row["id"],),
+    ).fetchall()
+    open_by_snapshot = {row["snapshot_id"]: row for row in open_rows}
+
+    # The downstream judgment is a property of the version, shared by every
+    # snapshot of the sweep (mirrors the single-snapshot entry).
+    impacted = _compute_version_field_impacted(conn, version_row["id"])
+    status = "blocked" if impacted else "pending"
+    impacted_json = json.dumps(impacted)
+    now = datetime.now(timezone.utc)
+    retention_delta = timedelta(days=policy_row["retention_days"])
+
+    created: list[dict] = []
+    skipped: list[dict] = []
+    not_due_count = 0
+    for snapshot_row in snapshot_rows:
+        snapshot_id = snapshot_row["id"]
+        open_request = open_by_snapshot.get(snapshot_id)
+        if open_request is not None:
+            skipped.append(
+                {
+                    "snapshot_id": snapshot_id,
+                    "request_id": open_request["id"],
+                    "status": open_request["status"],
+                    "reason": open_request["reason"],
+                }
+            )
+            continue
+        age = now - datetime.fromisoformat(snapshot_row["created_at"])
+        if age < retention_delta:
+            not_due_count += 1
+            continue
+        try:
+            cursor = conn.execute(
+                "INSERT INTO snapshot_deletion_requests ("
+                "version_id, snapshot_id, policy_id, reason, status, impacted, "
+                "created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    version_row["id"],
+                    snapshot_id,
+                    policy_row["id"],
+                    clean_reason,
+                    status,
+                    impacted_json,
+                    utc_now_iso(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Lost a race against a concurrent open-request insert; the whole
+            # sweep rolls back, so nothing is half written.
+            raise ConflictError(
+                f"Snapshot {snapshot_id} already has an open deletion request"
+            ) from exc
+        created.append(
+            {
+                "snapshot_id": snapshot_id,
+                "request_id": cursor.lastrowid,
+                "status": status,
+                "reason": clean_reason,
+            }
+        )
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_number,
+        "created": created,
+        "skipped": skipped,
+        "counts": {
+            "created_count": len(created),
+            "skipped_count": len(skipped),
+            "not_due_count": not_due_count,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Retention exceptions (compliance holds blocking snapshot deletion)
 # --------------------------------------------------------------------------- #
 

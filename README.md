@@ -940,6 +940,37 @@ downstream fields. Policies and requests are persisted across restarts.
 
   Unknown dataset/version/snapshot/policy/request → `404`; other invalid input
   → `422` and nothing is written.
+- `POST /datasets/{dataset}/versions/{version}/snapshots/retention-sweep` —
+  batch retention cleanup of the version's snapshots, appended one segment
+  after the version's snapshot collection and accepting POST only. The body
+  contains only a non-empty `reason`: `{"reason": "retention reached"}` (the
+  trimmed reason is stored on every request the sweep opens). Every snapshot
+  of the version is scanned in snapshot-id order: a snapshot whose age has
+  reached the version's retention days (the same age judgment as the
+  deletion-request confirmation) and that carries no open (`pending`/
+  `blocked`) deletion request gets a new request with the submitted reason —
+  `blocked` when the version feeds downstream fields and `pending` otherwise,
+  the same status judgment as the single-snapshot entry. A snapshot with an
+  open request is skipped (never duplicated, never modified) and a snapshot
+  younger than the retention age is skipped and only counted; a version
+  without snapshots sweeps successfully with empty collections. The whole
+  scan runs in a single transaction — either every new request is written or
+  none is — and concurrent sweeps of the same version have a single winner,
+  the loser receiving `409` and changing nothing. The response is a
+  deterministic JSON document (fixed key order, compact whitespace, exactly
+  one trailing newline) with top-level keys `dataset`, `version`, `created`,
+  `skipped` and `counts` in that order. `created` and `skipped` are sorted by
+  snapshot id ascending; each entry has exactly `snapshot_id`, `request_id`,
+  `status` and `reason` (skipped entries echo the existing open request).
+  `counts` gives `created_count`, `skipped_count` and `not_due_count`, each
+  equal to the number of snapshots in that category. The opened requests are
+  ordinary deletion requests: they enter the existing deletion-request list
+  and confirm flow, are deleted atomically on confirmation and persist across
+  restarts. Unknown dataset/version → `404` (judged before every body/query
+  shape check); a version without a registered retention policy → `404`; a
+  missing, non-string or blank `reason`, an extra body field, an empty or
+  whitespace-only body, malformed JSON, a non-object body or any query
+  parameter → `422` and nothing is written.
 
 ### Processing tasks
 

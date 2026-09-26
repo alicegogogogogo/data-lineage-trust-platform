@@ -1037,6 +1037,27 @@ class ConfirmedSnapshotDeletionRequest(SnapshotDeletionRequest):
     confirmed_at: str
 
 
+class RetentionSweepEntry(BaseModel):
+    snapshot_id: int
+    request_id: int
+    status: Literal["pending", "blocked"]
+    reason: str
+
+
+class RetentionSweepCounts(BaseModel):
+    created_count: int
+    skipped_count: int
+    not_due_count: int
+
+
+class RetentionSweepResponse(BaseModel):
+    dataset: str
+    version: int
+    created: list[RetentionSweepEntry]
+    skipped: list[RetentionSweepEntry]
+    counts: RetentionSweepCounts
+
+
 # --------------------------------------------------------------------------- #
 # Retention exceptions (compliance holds blocking snapshot deletion)
 # --------------------------------------------------------------------------- #

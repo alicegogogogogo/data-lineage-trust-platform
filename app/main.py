@@ -74,6 +74,7 @@ from app.models import (
     RetentionPolicyCreate,
     RetentionException,
     RetentionExceptionCreate,
+    RetentionSweepResponse,
     SensitiveIdentification,
     SensitiveIdentificationCreate,
     SchemaVersion,
@@ -1870,6 +1871,65 @@ def confirm_snapshot_deletion_request(
             conn, dataset_name, version, snapshot_id, request_id
         )
     )
+
+
+# Batch retention cleanup of the version's snapshots, appended one segment
+# after the version's snapshot collection and accepting POST only. Every
+# expired snapshot without an open deletion request gets one in a single
+# transaction; the body is serialized directly (rather than through the
+# default JSON response) so the key order is fixed, the whitespace is compact
+# and the document ends with exactly one newline.
+def _retention_sweep_guard(dataset_name: str, version: int) -> Iterator[None]:
+    # Declared before the database dependency so the lock is taken before the
+    # request connection is opened, and — dependencies tearing down in
+    # reverse order — released only after the transaction commits. A
+    # concurrent sweep of the same version therefore meets a held lock
+    # wherever it starts and loses with a 409 instead of waiting (mirrors the
+    # impact cache repair guard).
+    lock = repository.retention_sweep_lock(dataset_name, version)
+    if not lock.acquire(blocking=False):
+        raise ConflictError(
+            f"Another retention sweep of version {version} of dataset "
+            f"'{dataset_name}' is already in progress"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@app.post(
+    f"{SNAPSHOTS_PATH}/retention-sweep",
+    response_model=RetentionSweepResponse,
+)
+def sweep_snapshot_retention(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    _sweep: None = Depends(_retention_sweep_guard),
+    conn=Depends(get_db),
+) -> Response:
+    # The body is parsed in the repository (after the path dataset/version and
+    # the version's retention policy resolve) so an unknown dataset, version
+    # or missing policy stays a 404 ahead of every body/query shape check
+    # (all 422). Concurrent sweeps of the same version have a single winner;
+    # the loser is a 409 and changes nothing. Every rejection writes nothing.
+    sweep = RetentionSweepResponse(
+        **repository.sweep_snapshot_retention(
+            conn,
+            dataset_name,
+            version,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        sweep.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #
