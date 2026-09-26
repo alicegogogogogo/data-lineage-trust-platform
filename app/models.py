@@ -968,6 +968,41 @@ class SnapshotAtDiffResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version snapshot diff
+# --------------------------------------------------------------------------- #
+
+
+# One field-definition change between the two snapshots' schema versions. The
+# kind literals reuse the breaking-check/field-trajectory vocabulary; several
+# changes of one field collapse into a single entry. ``before``/``after`` are
+# null on the side where the field does not exist; the keys are never omitted.
+class SnapshotCrossVersionFieldChange(BaseModel):
+    field: str
+    kind: Literal[
+        "added",
+        "removed",
+        "type_changed",
+        "nullable_tightened",
+        "nullable_loosened",
+    ]
+    before: FieldChangeDefinition | None
+    after: FieldChangeDefinition | None
+
+
+# Deterministic diff of two snapshots of different schema versions of one
+# dataset: exactly these keys, in this order. Rows are compared only through
+# their projection onto the fields both versions define.
+class SnapshotCrossVersionDiffResponse(BaseModel):
+    base_snapshot_id: int
+    base_version: int
+    target_snapshot_id: int
+    target_version: int
+    field_changes: list[SnapshotCrossVersionFieldChange]
+    added: list[SnapshotDiffEntry]
+    removed: list[SnapshotDiffEntry]
+
+
+# --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #
 

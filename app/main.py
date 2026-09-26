@@ -83,6 +83,7 @@ from app.models import (
     ConfirmedSnapshotDeletionRequest,
     SnapshotDeletionRequestCreate,
     SnapshotAtDiffResponse,
+    SnapshotCrossVersionDiffResponse,
     SnapshotDiffResponse,
     SnapshotMaskedViewResponse,
     SnapshotMetadata,
@@ -1712,6 +1713,47 @@ def diff_snapshots(
             conn, dataset_name, version, snapshot_id, other_snapshot_id
         )
     )
+
+
+# Read-only diff of two snapshots of different schema versions of one
+# dataset, mounted directly under the dataset resource and accepting GET
+# only. The body is serialized directly (rather than through the default
+# JSON response) so the key order is fixed, the whitespace is compact and
+# the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/snapshots/{base_snapshot_id}"
+    "/diff/{target_snapshot_id}",
+    response_model=SnapshotCrossVersionDiffResponse,
+)
+def diff_snapshots_across_versions(
+    request: Request,
+    dataset_name: str,
+    base_snapshot_id: int,
+    target_snapshot_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset and both snapshots resolve first (404); a snapshot of
+    # another dataset or two snapshots of the same schema version is a 422
+    # (same-version snapshots keep using the versioned snapshot diff
+    # endpoint); any request body bytes or query parameter is a 422 checked
+    # afterwards. The comparison is fully read-only.
+    diff = SnapshotCrossVersionDiffResponse(
+        **repository.diff_snapshots_across_versions(
+            conn,
+            dataset_name,
+            base_snapshot_id,
+            target_snapshot_id,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 @app.post(

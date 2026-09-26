@@ -866,6 +866,35 @@ time. Snapshots (including their rows) survive restarts.
   rows present more often (or only) in the `to` snapshot and `removed` the
   converse, each entry being `{"row": {...}, "count": <int>}` sorted by the
   canonical (key-sorted) JSON text of `row`.
+- `GET /datasets/{dataset}/snapshots/{base_snapshot_id}/diff/{target_snapshot_id}`
+  — read-only diff of two snapshots of different schema versions of one
+  dataset, mounted directly under the dataset resource and accepting GET
+  only. The two version numbers may run in either order; the base snapshot
+  is the baseline and the target snapshot the target. The JSON document is
+  deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline) with top-level keys `base_snapshot_id`, `base_version`,
+  `target_snapshot_id`, `target_version`, `field_changes`, `added` and
+  `removed` in that order. `field_changes` compares the persisted field
+  definitions of the two snapshots' schema versions and lists only the
+  fields that were added, removed, type-changed or nullability-changed,
+  using the status literals of the compatibility check and the field
+  trajectory (`added`, `removed`, `type_changed`, `nullable_tightened`,
+  `nullable_loosened`); several changes of one field collapse into a single
+  entry (a type change wins over a nullable tightening). Each entry is
+  `{"field", "kind", "before", "after"}` with `before`/`after` null — key
+  retained — on the side where the field does not exist, sorted by field
+  name ascending. The rows of both snapshots are projected onto the field
+  names both versions define before they are compared (every other key and
+  every field a row does not carry stays out of the comparison); the
+  projected rows are then diffed with the exact row-multiset semantics of
+  the same-version snapshot-id diff, and `added`/`removed` list the
+  projected rows as `{"row", "count"}` entries sorted by canonical row
+  text. Unknown dataset/snapshot → `404`, checked before every
+  request-shape check; a snapshot owned by another dataset or two snapshots
+  of the same schema version (use the versioned snapshot diff endpoint for
+  those) → `422`; any request body bytes or query parameter → `422`. The
+  comparison writes nothing: snapshots, rows, field definitions, the
+  lineage cache and every privacy trail are left untouched.
 - `POST /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/quality-rules/evaluate`
   — evaluate the version's enabled quality rules over the snapshot's persisted
   rows. The endpoint takes no request body and no query parameters (`422`);

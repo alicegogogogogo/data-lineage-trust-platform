@@ -5371,14 +5371,24 @@ def view_snapshot_masked_at(
     # hit records plus one access record whose row count is the snapshot's row
     # count and whose masked count equals the number of hit records. An empty
     # snapshot, an allowed role, all-null values or a version without policies
-    # leaves only the access record. The append never makes the read fail.
-    _record_privacy_view_trail(
-        conn,
-        version_row["id"],
-        clean_role,
-        len(snapshot_rows),
-        hits,
-    )
+    # leaves only the access record. All records of the read share a single
+    # write timestamp and ride one transaction, so a failed append leaves no
+    # half-written trail behind; and when the trail cannot be written at all
+    # (cross-process contention is retried and resolved by a serialized
+    # fallback first) the read still returns its masked rows — a write
+    # obstruction never fails the read.
+    try:
+        _record_privacy_view_trail(
+            conn,
+            version_row["id"],
+            clean_role,
+            len(snapshot_rows),
+            hits,
+        )
+    except sqlite3.Error:
+        # Drop any partially appended trail so the request transaction cannot
+        # commit half of it; the masked result is returned regardless.
+        conn.rollback()
 
     return {
         "dataset": dataset["name"],
@@ -5616,6 +5626,136 @@ def diff_snapshots_at(
         "removed": removed,
         "fields_added": fields_added,
         "fields_removed": fields_removed,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version snapshot diff
+# --------------------------------------------------------------------------- #
+
+
+def _project_row(
+    row: dict[str, Any], field_names: set[str]
+) -> dict[str, Any]:
+    """The row reduced to the given field names, key order preserved.
+
+    Keys the projection does not cover are dropped; a projected field the row
+    does not carry simply stays absent (no null is invented).
+    """
+    return {key: value for key, value in row.items() if key in field_names}
+
+
+def diff_snapshots_across_versions(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    base_snapshot_id: int,
+    target_snapshot_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only diff of two snapshots of different versions of one dataset.
+
+    ``base`` is the baseline and ``target`` the target; the two version
+    numbers may run in either order. ``field_changes`` compares the persisted
+    field definitions of the two snapshots' schema versions and lists only
+    the fields that were added, removed, type-changed or nullability-changed,
+    using the status literals of the compatibility check and the field
+    trajectory (several changes of one field collapse into a single entry, a
+    type change winning over a nullable tightening). Each entry carries
+    ``before`` (base side) and ``after`` (target side) definitions, null —
+    key retained — on the side where the field does not exist; entries are
+    sorted by field name ascending.
+
+    The rows of both snapshots are projected onto the field names both
+    versions define before they are compared: every other key and every
+    field a row does not carry stays out of the comparison. The projected
+    rows are then diffed with the exact row-multiset semantics of the
+    same-version snapshot-id diff (object key order irrelevant, array order
+    and value types significant, duplicates counted), and ``added`` /
+    ``removed`` list the projected rows as ``{"row", "count"}`` entries
+    sorted by canonical row text ascending.
+
+    The path dataset resolves first (404), then both snapshots (404). A
+    snapshot owned by another dataset is a 422, as are two snapshots of the
+    same schema version (those are compared through the same-version
+    snapshot diff endpoint); any request body bytes or any query parameter
+    is a 422 checked afterwards. Nothing is written: the snapshots, their
+    rows, the field definitions, the lineage cache and every privacy trail
+    are all left untouched.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    base_row = _find_snapshot_globally(conn, base_snapshot_id)
+    if base_row is None:
+        raise NotFoundError(f"Snapshot {base_snapshot_id} does not exist")
+    target_row = _find_snapshot_globally(conn, target_snapshot_id)
+    if target_row is None:
+        raise NotFoundError(f"Snapshot {target_snapshot_id} does not exist")
+
+    for row, snapshot_id in (
+        (base_row, base_snapshot_id),
+        (target_row, target_snapshot_id),
+    ):
+        if row["dataset_name"] != dataset["name"]:
+            raise RequestInvalidError(
+                f"Snapshot {snapshot_id} does not belong to dataset "
+                f"'{dataset_name}'; only snapshots of the path dataset can "
+                "be compared across schema versions"
+            )
+
+    if base_row["version_id"] == target_row["version_id"]:
+        raise RequestInvalidError(
+            f"Snapshots {base_snapshot_id} and {target_snapshot_id} both "
+            f"belong to version {base_row['version_number']} of dataset "
+            f"'{dataset_name}'; snapshots of the same schema version are "
+            "compared through the snapshot diff endpoint of that version"
+        )
+
+    if body:
+        raise RequestInvalidError(
+            "The cross-version snapshot diff endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The cross-version snapshot diff endpoint does not accept query "
+            "parameters"
+        )
+
+    base_fields = _version_field_definitions(conn, base_row["version_id"])
+    target_fields = _version_field_definitions(conn, target_row["version_id"])
+
+    field_changes: list[dict] = []
+    for name in sorted(set(base_fields) | set(target_fields)):
+        before = base_fields.get(name)
+        after = target_fields.get(name)
+        kind = _field_status_change(before, after)
+        if kind == "unchanged":
+            continue
+        field_changes.append(
+            {"field": name, "kind": kind, "before": before, "after": after}
+        )
+
+    common_fields = set(base_fields) & set(target_fields)
+    base_rows = [
+        _project_row(row, common_fields)
+        for row in json.loads(base_row["rows"])
+    ]
+    target_rows = [
+        _project_row(row, common_fields)
+        for row in json.loads(target_row["rows"])
+    ]
+    added, removed = _row_multiset_diff(base_rows, target_rows)
+
+    return {
+        "base_snapshot_id": base_snapshot_id,
+        "base_version": base_row["version_number"],
+        "target_snapshot_id": target_snapshot_id,
+        "target_version": target_row["version_number"],
+        "field_changes": field_changes,
+        "added": added,
+        "removed": removed,
     }
 
 
