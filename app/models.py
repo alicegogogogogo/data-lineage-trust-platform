@@ -1058,6 +1058,32 @@ class RetentionSweepResponse(BaseModel):
     counts: RetentionSweepCounts
 
 
+class RetentionSweepPreviewWouldCreateEntry(BaseModel):
+    snapshot_id: int
+    status: Literal["pending", "blocked"]
+
+
+class RetentionSweepPreviewSkippedEntry(BaseModel):
+    snapshot_id: int
+    request_id: int
+    status: Literal["pending", "blocked"]
+
+
+class RetentionSweepPreviewCounts(BaseModel):
+    would_create_count: int
+    skipped_count: int
+    not_due_count: int
+
+
+class RetentionSweepPreviewResponse(BaseModel):
+    dataset: str
+    version: int
+    would_create: list[RetentionSweepPreviewWouldCreateEntry]
+    skipped: list[RetentionSweepPreviewSkippedEntry]
+    not_due: list[int]
+    counts: RetentionSweepPreviewCounts
+
+
 # --------------------------------------------------------------------------- #
 # Retention exceptions (compliance holds blocking snapshot deletion)
 # --------------------------------------------------------------------------- #

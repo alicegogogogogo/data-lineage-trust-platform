@@ -75,6 +75,7 @@ from app.models import (
     RetentionException,
     RetentionExceptionCreate,
     RetentionSweepResponse,
+    RetentionSweepPreviewResponse,
     SensitiveIdentification,
     SensitiveIdentificationCreate,
     SchemaVersion,
@@ -2092,6 +2093,45 @@ def sweep_snapshot_retention(
     )
     payload = json.dumps(
         sweep.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only preview of the batch retention sweep, appended one segment after
+# the sweep address and accepting GET only. It scans the version's existing
+# snapshots with exactly the sweep's classification but never opens a request
+# or writes anything. The body is serialized directly (rather than through the
+# default JSON response) so the key order is fixed, the whitespace is compact
+# and the document ends with exactly one newline.
+@app.get(
+    f"{SNAPSHOTS_PATH}/retention-sweep/preview",
+    response_model=RetentionSweepPreviewResponse,
+)
+def preview_snapshot_retention_sweep(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset/version and the version's retention policy resolve
+    # first (404), ahead of every request-shape check; only afterwards are any
+    # body bytes (whitespace-only included) or query parameters rejected
+    # (422). The preview is strictly read-only: its classification and statuses
+    # match the requests a subsequent real sweep would open.
+    preview = RetentionSweepPreviewResponse(
+        **repository.preview_snapshot_retention_sweep(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        preview.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

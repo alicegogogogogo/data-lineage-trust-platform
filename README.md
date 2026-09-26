@@ -1071,6 +1071,33 @@ downstream fields. Policies and requests are persisted across restarts.
   missing, non-string or blank `reason`, an extra body field, an empty or
   whitespace-only body, malformed JSON, a non-object body or any query
   parameter → `422` and nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/retention-sweep/preview` —
+  read-only preview of the batch retention sweep, appended one segment after
+  the sweep address and accepting GET only with no request body and no query
+  parameters. The version's existing snapshots are scanned in snapshot-id
+  order with exactly the sweep's classification and age judgment (a snapshot
+  whose age has reached the version's retention days is due), but nothing is
+  ever written. A due snapshot without an open (`pending`/`blocked`) request is
+  placed in `would_create` with its snapshot id and the status the new request
+  would carry — `blocked` when the version feeds downstream fields, `pending`
+  otherwise — the downstream set being computed from the current committed
+  lineage graph with the single-snapshot semantics (deduplicated, cycles
+  terminating, never containing a start field). A snapshot with an open
+  request is placed in `skipped`, echoing that request's id and status; a
+  snapshot younger than the retention age and without an open request is
+  placed in `not_due` by snapshot id alone (a not-yet-due snapshot that
+  already carries an open request is skipped instead). Each snapshot appears
+  exactly once and every collection is sorted by snapshot id ascending. The response is a deterministic JSON document (fixed key order,
+  compact whitespace, lowercase booleans, exactly one trailing newline) with
+  top-level keys `dataset`, `version`, `would_create`, `skipped`, `not_due`
+  and `counts` in that order; `counts` gives `would_create_count`,
+  `skipped_count` and `not_due_count`, whose sum equals the snapshot total.
+  The preview's classification and statuses match the requests a subsequent
+  real sweep opens on the same committed state. Unknown dataset/version →
+  `404` and a version without a registered retention policy → `404`, both
+  judged before every request-shape check; any request body (whitespace-only
+  bytes included) or any query parameter → `422`, and no rejection writes
+  anything.
 
 ### Processing tasks
 

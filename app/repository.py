@@ -6680,6 +6680,145 @@ def _parse_retention_sweep_body(body: bytes) -> str:
     return reason.strip()
 
 
+def _scan_retention_snapshot_sets(
+    conn: sqlite3.Connection,
+    version_row: sqlite3.Row,
+    policy_row: sqlite3.Row,
+) -> tuple[list[dict], list[dict], list[int], list[dict]]:
+    """Classify every existing snapshot of a version for a retention sweep.
+
+    Purely read-only and shared by the batch sweep and its read-only preview,
+    so the preview's classification is identical to the requests a subsequent
+    sweep of the same committed state opens. Every snapshot is scanned in
+    snapshot-id order. A snapshot with an open (pending/blocked) request is
+    skipped first, so a not-yet-due snapshot carrying one counts as skipped;
+    otherwise a snapshot younger than the retention age is not due; the
+    remainder are due. The downstream status is a property of the version,
+    computed once from the current committed lineage graph with the same
+    semantics as the single-snapshot entry (``_compute_version_field_impacted``:
+    every field seeds the walk, direct and indirect downstream fields merged
+    and deduplicated, the version's own fields never appearing, cycles
+    terminating).
+
+    Returns ``(would_create, skipped, not_due, impacted)``: ``would_create``
+    entries carry ``snapshot_id`` and ``status``, ``skipped`` entries echo the
+    open request's ``snapshot_id``, ``request_id``, ``status`` and ``reason``
+    (the preview drops ``reason``), and ``not_due`` is the ascending list of
+    snapshot ids.
+    """
+    snapshot_rows = conn.execute(
+        "SELECT id, created_at FROM snapshots WHERE version_id = ? "
+        "ORDER BY id ASC",
+        (version_row["id"],),
+    ).fetchall()
+    open_rows = conn.execute(
+        "SELECT snapshot_id, id, status, reason FROM snapshot_deletion_requests "
+        "WHERE version_id = ? AND status IN ('pending', 'blocked')",
+        (version_row["id"],),
+    ).fetchall()
+    open_by_snapshot = {row["snapshot_id"]: row for row in open_rows}
+
+    impacted = _compute_version_field_impacted(conn, version_row["id"])
+    status = "blocked" if impacted else "pending"
+    now = datetime.now(timezone.utc)
+    retention_delta = timedelta(days=policy_row["retention_days"])
+
+    would_create: list[dict] = []
+    skipped: list[dict] = []
+    not_due: list[int] = []
+    for snapshot_row in snapshot_rows:
+        snapshot_id = snapshot_row["id"]
+        open_request = open_by_snapshot.get(snapshot_id)
+        if open_request is not None:
+            skipped.append(
+                {
+                    "snapshot_id": snapshot_id,
+                    "request_id": open_request["id"],
+                    "status": open_request["status"],
+                    "reason": open_request["reason"],
+                }
+            )
+            continue
+        age = now - datetime.fromisoformat(snapshot_row["created_at"])
+        if age < retention_delta:
+            not_due.append(snapshot_id)
+            continue
+        would_create.append({"snapshot_id": snapshot_id, "status": status})
+    return would_create, skipped, not_due, impacted
+
+
+def preview_snapshot_retention_sweep(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only preview of the batch retention sweep of one version.
+
+    Scans every existing snapshot with exactly the classification of
+    ``sweep_snapshot_retention`` but never opens a request or writes anything:
+    expired snapshots without an open request land in ``would_create`` (each
+    with the status the new request would carry, judged from the current
+    lineage graph), snapshots with an open pending/blocked request land in
+    ``skipped`` (echoing that request's id and status) and younger snapshots
+    land in ``not_due`` (snapshot id only). Each snapshot appears exactly once.
+
+    Resolution order mirrors the sweep: the path dataset/version resolves
+    first (404), then the version's retention policy (404 when none is
+    registered); only afterwards is the request shape judged (422) — any body
+    bytes, whitespace-only included, or any query parameter are rejected.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    policy_row = conn.execute(
+        "SELECT id, retention_days FROM retention_policies WHERE version_id = ?",
+        (version_row["id"],),
+    ).fetchone()
+    if policy_row is None:
+        raise NotFoundError(
+            f"No retention policy exists for version {version_number} of "
+            f"dataset '{dataset_name}'"
+        )
+
+    if body:
+        raise RequestInvalidError(
+            "The retention sweep preview endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The retention sweep preview endpoint does not accept query "
+            "parameters"
+        )
+
+    would_create, skipped, not_due, _impacted = _scan_retention_snapshot_sets(
+        conn, version_row, policy_row
+    )
+    # Preview skipped entries echo only the open request's id and status.
+    preview_skipped = [
+        {
+            "snapshot_id": entry["snapshot_id"],
+            "request_id": entry["request_id"],
+            "status": entry["status"],
+        }
+        for entry in skipped
+    ]
+    return {
+        "dataset": dataset["name"],
+        "version": version_number,
+        "would_create": would_create,
+        "skipped": preview_skipped,
+        "not_due": not_due,
+        "counts": {
+            "would_create_count": len(would_create),
+            "skipped_count": len(skipped),
+            "not_due_count": len(not_due),
+        },
+    }
+
+
 def sweep_snapshot_retention(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -6748,46 +6887,17 @@ def sweep_snapshot_retention(
     finally:
         conn.execute("PRAGMA busy_timeout = 30000")
 
-    snapshot_rows = conn.execute(
-        "SELECT id, created_at FROM snapshots WHERE version_id = ? "
-        "ORDER BY id ASC",
-        (version_row["id"],),
-    ).fetchall()
-    open_rows = conn.execute(
-        "SELECT snapshot_id, id, status, reason FROM snapshot_deletion_requests "
-        "WHERE version_id = ? AND status IN ('pending', 'blocked')",
-        (version_row["id"],),
-    ).fetchall()
-    open_by_snapshot = {row["snapshot_id"]: row for row in open_rows}
-
-    # The downstream judgment is a property of the version, shared by every
-    # snapshot of the sweep (mirrors the single-snapshot entry).
-    impacted = _compute_version_field_impacted(conn, version_row["id"])
+    # Classify the snapshots under the write lock with the same read-only
+    # scan the preview uses, then open exactly the would-create requests.
+    would_create, skipped, _not_due, impacted = _scan_retention_snapshot_sets(
+        conn, version_row, policy_row
+    )
     status = "blocked" if impacted else "pending"
     impacted_json = json.dumps(impacted)
-    now = datetime.now(timezone.utc)
-    retention_delta = timedelta(days=policy_row["retention_days"])
 
     created: list[dict] = []
-    skipped: list[dict] = []
-    not_due_count = 0
-    for snapshot_row in snapshot_rows:
-        snapshot_id = snapshot_row["id"]
-        open_request = open_by_snapshot.get(snapshot_id)
-        if open_request is not None:
-            skipped.append(
-                {
-                    "snapshot_id": snapshot_id,
-                    "request_id": open_request["id"],
-                    "status": open_request["status"],
-                    "reason": open_request["reason"],
-                }
-            )
-            continue
-        age = now - datetime.fromisoformat(snapshot_row["created_at"])
-        if age < retention_delta:
-            not_due_count += 1
-            continue
+    for entry in would_create:
+        snapshot_id = entry["snapshot_id"]
         try:
             cursor = conn.execute(
                 "INSERT INTO snapshot_deletion_requests ("
@@ -6827,7 +6937,7 @@ def sweep_snapshot_retention(
         "counts": {
             "created_count": len(created),
             "skipped_count": len(skipped),
-            "not_due_count": not_due_count,
+            "not_due_count": len(_not_due),
         },
     }
 
