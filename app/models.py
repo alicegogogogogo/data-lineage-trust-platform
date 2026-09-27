@@ -518,6 +518,42 @@ class QualityGateResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version quality gate export
+# --------------------------------------------------------------------------- #
+
+
+# One schema version's gate status as counts and a conclusion only; the
+# verdict and reason count use exactly the same criteria as the single-version
+# gate read.
+class QualityGateExportVersion(BaseModel):
+    version: int
+    verdict: QualityGateVerdict
+    # Number of reasons currently lowering the verdict, one per reason in the
+    # single-version gate's ``reasons`` list.
+    reason_count: int
+    # Violation row count of the most recently recorded evaluation; null
+    # (never omitted) when the version has never been evaluated.
+    violation_row_count: int | None
+
+
+# Every counter except ``failed_version_count`` is the sum of the matching
+# per-version values over the whole dataset; null per-version violation counts
+# contribute zero.
+class QualityGateExportTotals(BaseModel):
+    version_count: int
+    failed_version_count: int
+    reason_count: int
+    violation_row_count: int
+
+
+# Deterministic whole-dataset export: exactly these keys, in this order.
+class QualityGateExportResponse(BaseModel):
+    dataset: str
+    versions: list[QualityGateExportVersion]
+    totals: QualityGateExportTotals
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 

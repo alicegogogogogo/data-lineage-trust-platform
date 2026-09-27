@@ -3072,6 +3072,91 @@ def get_quality_gate_at(
     )
 
 
+def export_dataset_quality_gate(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset export of the quality gate status.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry gives only the conclusion and counts, never the
+    per-version gate's reason detail: the version number, the current gate
+    verdict (one of the single-version gate's three literals, judged with
+    exactly its criteria), the number of reasons currently lowering the
+    verdict (one per reason in the single-version gate's ``reasons`` list)
+    and the violation row count of the most recently recorded evaluation —
+    ``None`` (the key is never omitted) when the version has never been
+    evaluated. ``totals`` gives the version count, the number of versions
+    whose verdict is ``fail`` (not itself a sum), the sum of the per-version
+    reason counts and the sum of the per-version latest violation row counts
+    (a null count contributes zero); a dataset without versions yields an
+    empty version list and all-zero totals, never an error.
+
+    The export is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes an evaluation, an anomaly record or a gate
+    conclusion. Like the single-version gate, the dataset resolves first
+    (404); any request body bytes (whitespace-only included) or any query
+    parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the single-version gate.
+    if body:
+        raise RequestInvalidError(
+            "The quality gate export endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The quality gate export endpoint does not accept query parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        # The same ordered records and the same verdict function as the
+        # single-version gate, so the conclusion and reason count cannot
+        # disagree with that read.
+        evaluation_rows, anomaly_rows = _quality_gate_records(
+            conn, version_row["id"]
+        )
+        gate = _quality_gate_result(
+            dataset, version_row, evaluation_rows, anomaly_rows
+        )
+        violation_row_count = (
+            evaluation_rows[-1]["violation_row_count"] if evaluation_rows else None
+        )
+        versions.append(
+            {
+                "version": version_row["version"],
+                "verdict": gate["verdict"],
+                "reason_count": len(gate["reasons"]),
+                "violation_row_count": violation_row_count,
+            }
+        )
+
+    totals = {
+        "version_count": len(versions),
+        "failed_version_count": sum(
+            1 for version in versions if version["verdict"] == "fail"
+        ),
+        "reason_count": sum(version["reason_count"] for version in versions),
+        "violation_row_count": sum(
+            (version["violation_row_count"] or 0) for version in versions
+        ),
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
 # --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
