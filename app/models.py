@@ -1499,3 +1499,39 @@ class ProcessingAuditReportResponse(BaseModel):
     version: int
     summary: ProcessingAuditReportSummary
     tasks: list[AuditReportTask]
+
+
+# Read-only cross-version export of one dataset's processing audit state.
+# Counts and conclusions only: no per-task or per-run details, so the export
+# never duplicates the per-version audit report.
+
+# One schema version's processing audit summary. Exactly these keys, in this
+# order: the version number, the task and run counts, the number of runs
+# whose audit chain failed re-verification, and the terminal-state task
+# distribution (succeeded, failed and — the failed subset whose attempt
+# budget is used up — exhausted).
+class ProcessingAuditExportVersion(BaseModel):
+    version: int
+    task_count: int
+    run_count: int
+    invalid_audit_runs: int
+    succeeded_tasks: int
+    failed_tasks: int
+    exhausted_tasks: int
+
+
+# Whole-dataset totals; every count is the sum of the per-version values.
+class ProcessingAuditExportTotals(BaseModel):
+    task_count: int
+    run_count: int
+    invalid_audit_runs: int
+    succeeded_tasks: int
+    failed_tasks: int
+    exhausted_tasks: int
+
+
+# Deterministic whole-dataset export: exactly these keys, in this order.
+class ProcessingAuditExportResponse(BaseModel):
+    dataset: str
+    versions: list[ProcessingAuditExportVersion]
+    totals: ProcessingAuditExportTotals

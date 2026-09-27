@@ -9365,3 +9365,119 @@ def get_processing_audit_report(
         },
         "tasks": tasks,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version processing audit export
+# --------------------------------------------------------------------------- #
+
+
+def export_dataset_processing_audit(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset export of the processing audit state.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry gives the version number, the task and run counts,
+    the number of runs whose audit chain failed re-verification and the
+    terminal-state task distribution (succeeded, failed and — the failed
+    subset whose attempt budget is used up — exhausted). ``totals`` covers
+    the same counters, each the sum of the per-version values; a dataset
+    without versions yields an empty version list and all-zero totals, never
+    an error. Counts and conclusions only: no per-task or per-run details,
+    so the export never duplicates the per-version audit report.
+
+    Each run's chain is re-verified under exactly the per-version report's
+    criteria (see ``_verify_run_audit_rows``): recomputed evidence hashes,
+    continuous sequences from 1 and correct linkage. The export is
+    recomputed on every read: it caches nothing and never writes, modifies
+    or deletes a task, run or audit record. Like the compliance exports, the
+    dataset resolves first (404); any request body bytes (whitespace-only
+    included) or any query parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the deletion compliance export.
+    if body:
+        raise RequestInvalidError(
+            "The processing audit export endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The processing audit export endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        task_rows = _version_task_rows(conn, version_row["id"])
+        run_count = 0
+        invalid_audit_runs = 0
+        succeeded_tasks = 0
+        failed_tasks = 0
+        exhausted_tasks = 0
+
+        for task_row in task_rows:
+            run_rows = conn.execute(
+                "SELECT id FROM processing_task_runs WHERE task_id = ? "
+                "ORDER BY attempt",
+                (task_row["id"],),
+            ).fetchall()
+            for run_row in run_rows:
+                audit_rows = conn.execute(
+                    "SELECT * FROM processing_task_audit_records "
+                    "WHERE run_id = ? ORDER BY sequence ASC",
+                    (run_row["id"],),
+                ).fetchall()
+                valid, _checked, _last_hash = _verify_run_audit_rows(audit_rows)
+                if not valid:
+                    invalid_audit_runs += 1
+            run_count += len(run_rows)
+
+            if task_row["status"] == "succeeded":
+                succeeded_tasks += 1
+            elif task_row["status"] == "failed":
+                failed_tasks += 1
+                if task_row["attempt_count"] >= task_row["max_attempts"]:
+                    exhausted_tasks += 1
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "task_count": len(task_rows),
+                "run_count": run_count,
+                "invalid_audit_runs": invalid_audit_runs,
+                "succeeded_tasks": succeeded_tasks,
+                "failed_tasks": failed_tasks,
+                "exhausted_tasks": exhausted_tasks,
+            }
+        )
+
+    totals = {
+        "task_count": sum(version["task_count"] for version in versions),
+        "run_count": sum(version["run_count"] for version in versions),
+        "invalid_audit_runs": sum(
+            version["invalid_audit_runs"] for version in versions
+        ),
+        "succeeded_tasks": sum(
+            version["succeeded_tasks"] for version in versions
+        ),
+        "failed_tasks": sum(version["failed_tasks"] for version in versions),
+        "exhausted_tasks": sum(
+            version["exhausted_tasks"] for version in versions
+        ),
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
