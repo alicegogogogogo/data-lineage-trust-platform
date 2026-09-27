@@ -1456,6 +1456,40 @@ run records one attempt. Tasks and runs are persisted across restarts.
   an empty chain — it is still returned when `valid` is `false`, and the run
   details are retained. Summary counters always agree with the returned
   details and the report is deterministic across restarts.
+- `GET /datasets/{dataset}/processing-audit-export` — read-only cross-version
+  export of the dataset's whole processing audit state, computed fresh on
+  every read (no caching; nothing is written, modified or deleted, and no
+  task, run or audit record is touched). The path carries only the dataset
+  name; the request takes no body and no query parameters — any body bytes,
+  including a purely whitespace or single-space body, or any query parameter
+  → `422`; an unknown dataset → `404`, with the same 404-before-422
+  precedence as the compliance exports. A dataset without schema versions
+  returns `200` with an empty `versions` array and all-zero totals, never an
+  error. The JSON document is deterministic (fixed key order, compact
+  whitespace, exactly one trailing newline):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"task_count":3,"run_count":3,"invalid_audit_runs":0,"terminal_tasks":{"succeeded_tasks":1,"failed_tasks":1,"exhausted_tasks":1}}],"totals":{"version_count":1,"task_count":3,"run_count":3,"invalid_audit_runs":0,"succeeded_tasks":1,"failed_tasks":1,"exhausted_tasks":1}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions`, `totals` in that
+  order. `versions` is ordered by version number ascending and each entry has
+  exactly `version`, `task_count`, `run_count`, `invalid_audit_runs` and
+  `terminal_tasks` in that order; only counts and conclusions are exported,
+  never the per-task or per-run details of the per-version audit report.
+  `invalid_audit_runs` counts runs whose audit chain fails re-verification
+  under exactly the same criteria the per-version report and the per-run
+  verify read use (recomputed evidence hashes, continuous sequences from `1`
+  and record-by-record linkage); a tampered or broken chain counts the run as
+  invalid while the task and run details stay readable through the existing
+  endpoints. `terminal_tasks` has exactly `succeeded_tasks`, `failed_tasks`
+  and `exhausted_tasks` — the succeeded and failed task counts plus the
+  subset of failed tasks that have used up `max_attempts` (the report's
+  exhausted criterion); pending and running tasks appear nowhere in the
+  terminal distribution. `totals` has exactly `version_count`,
+  `task_count`, `run_count`, `invalid_audit_runs`, `succeeded_tasks`,
+  `failed_tasks` and `exhausted_tasks`, each the sum of the matching
+  per-version values over the whole dataset.
 
 ### Processing run audit records (append-only proof chain)
 

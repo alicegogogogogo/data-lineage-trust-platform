@@ -61,6 +61,7 @@ from app.models import (
     ProcessingTaskWithRuns,
     ProcessingScheduleResponse,
     ProcessingAuditReportResponse,
+    ProcessingAuditExportResponse,
     QualityAnomalyDetectionConfig,
     QualityAnomalyDetectionConfigCreate,
     QualityAnomalyRecord,
@@ -1582,6 +1583,53 @@ def export_dataset_deletion_compliance(
     # ends with exactly one newline.
     export = DeletionComplianceExportResponse(
         **repository.export_dataset_deletion_compliance(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        export.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version processing audit export
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that returns the processing audit state of every schema
+# version at once as counts and conclusions only; it never repeats the
+# per-version audit report's task and run details. The path carries only the
+# dataset name; there is no request body or query parameter.
+PROCESSING_AUDIT_EXPORT_PATH = (
+    "/datasets/{dataset_name}/processing-audit-export"
+)
+
+
+@app.get(
+    PROCESSING_AUDIT_EXPORT_PATH,
+    response_model=ProcessingAuditExportResponse,
+)
+def export_dataset_processing_audit(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset is known, preserving the same 404 precedence as the deletion
+    # compliance export. Recomputed on every read; no task, run or audit
+    # record is ever written. The body is serialized directly (rather than
+    # through the default JSON response) so the key order is fixed, the
+    # whitespace is compact and the document ends with exactly one newline.
+    export = ProcessingAuditExportResponse(
+        **repository.export_dataset_processing_audit(
             conn,
             dataset_name,
             body=body,
