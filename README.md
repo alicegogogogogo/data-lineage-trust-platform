@@ -1277,6 +1277,42 @@ single-winner, the loser receiving `409` and changing nothing. Existing
 snapshot reads, fingerprint verification, diffs, masked reads, the retention
 sweep and the deletion-request collection are otherwise unchanged.
 
+- `GET /datasets/{dataset}/deletion-compliance-export` — read-only
+  cross-version export of the dataset's whole snapshot deletion compliance
+  state, computed fresh on every read (no caching; nothing is written,
+  modified or deleted, and no deletion request, deletion proof, snapshot or
+  retention policy is touched). The path carries only the dataset name; the
+  request takes no body and no query parameters — any body bytes, including a
+  purely whitespace or single-space body, or any query parameter → `422`; an
+  unknown dataset → `404`, with the same 404-before-422 precedence as the
+  privacy compliance export. A dataset without schema versions returns `200`
+  with an empty `versions` array and all-zero totals, never an error. The JSON
+  document is deterministic (fixed key order, compact whitespace, exactly one
+  trailing newline):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"retention_days":30,"deletion_requests":[...],"proof_chain":{"count":2,"sequence_range":[1,2],"valid":true}}],"totals":{"version_count":1,"deletion_request_count":2,"confirmed_request_count":1,"proof_count":2}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions`, `totals` in that
+  order. `versions` is ordered by version number ascending and each entry has
+  exactly `version`, `retention_days`, `deletion_requests` and `proof_chain`
+  in that order. `retention_days` is the registered retention policy's day
+  count or `null` when no retention policy is registered (the key is never
+  omitted). `deletion_requests` lists every deletion request of the version
+  across all of its snapshots, sorted by request `id` ascending; pending,
+  blocked and confirmed requests are all retained, each with exactly the same
+  fields as the per-snapshot deletion-request read (`id`, `snapshot_id`,
+  `policy_id`, `reason`, `status`, `impacted`, `created_at`; no
+  `confirmed_at`). `proof_chain` has exactly `count`, `sequence_range` and
+  `valid`: `count` is the number of proofs already written, `sequence_range`
+  is `[first, last]` over the stored proof sequences and is `[null, null]`
+  when the chain is empty, and `valid` follows exactly the deletion-proof
+  verification read's criteria (an empty chain is valid). `totals` has
+  exactly `version_count`, `deletion_request_count`,
+  `confirmed_request_count` and `proof_count`, each the sum of the
+  per-version values over the whole dataset.
+
 ### Processing tasks
 
 A processing task is a named unit of work attached to a schema version; each

@@ -1160,6 +1160,53 @@ class SnapshotDeletionProofChainVerifyResponse(BaseModel):
     checked_count: int
 
 
+# Read-only cross-version export of one dataset's snapshot deletion
+# compliance state. The requests keep exactly the per-snapshot
+# deletion-request read's field structure and the chain summary mirrors the
+# deletion-proof list/verify reads.
+
+# One version's deletion request as it appears in the export, sorted by
+# request id ascending; pending, blocked and confirmed requests are all
+# retained. The request keeps exactly the fields of SnapshotDeletionRequest.
+class DeletionComplianceExportRequest(SnapshotDeletionRequest):
+    pass
+
+
+# Summary of one version's deletion-proof chain. ``count`` is the number of
+# proofs already written, ``sequence_range`` is ``[first, last]`` and is
+# ``[null, null]`` when no proof exists. ``valid`` follows the same criteria
+# as the chain verification read (recomputed evidence hashes, continuous
+# sequences from 1 and correct linkage); an empty chain is valid.
+class DeletionComplianceExportProofChain(BaseModel):
+    count: int
+    sequence_range: tuple[int | None, int | None]
+    valid: bool
+
+
+# One schema version's deletion compliance summary. Exactly these keys, in
+# this order. ``retention_days`` reports the registered policy's day count and
+# is ``null`` (key retained) when no retention policy is registered.
+class DeletionComplianceExportVersion(BaseModel):
+    version: int
+    retention_days: int | None
+    deletion_requests: list[DeletionComplianceExportRequest]
+    proof_chain: DeletionComplianceExportProofChain
+
+
+class DeletionComplianceExportTotals(BaseModel):
+    version_count: int
+    deletion_request_count: int
+    confirmed_request_count: int
+    proof_count: int
+
+
+# Deterministic whole-dataset export: exactly these keys, in this order.
+class DeletionComplianceExportResponse(BaseModel):
+    dataset: str
+    versions: list[DeletionComplianceExportVersion]
+    totals: DeletionComplianceExportTotals
+
+
 class RetentionSweepEntry(BaseModel):
     snapshot_id: int
     request_id: int

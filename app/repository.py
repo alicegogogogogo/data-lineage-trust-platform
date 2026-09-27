@@ -7389,6 +7389,32 @@ def list_snapshot_deletion_proofs(
     return [_deletion_proof_row_to_dict(row) for row in rows]
 
 
+def _deletion_proof_rows_valid(rows: list[sqlite3.Row]) -> bool:
+    """Apply the deletion-proof chain criteria to sequence-ordered rows.
+
+    Sequences must run continuously from 1, the first ``previous_hash`` must
+    be null and every later one must equal the preceding proof's
+    ``evidence_hash``, and every stored evidence hash must match a fresh
+    recomputation. An empty sequence is intact. Shared by the per-version
+    verification read and the cross-version deletion compliance export so the
+    two can never disagree.
+    """
+    valid = True
+    expected_sequence = 1
+    previous_hash: str | None = None
+    for row in rows:
+        record = _deletion_proof_row_to_dict(row)
+        if record["sequence"] != expected_sequence:
+            valid = False
+        if record["previous_hash"] != previous_hash:
+            valid = False
+        if _deletion_proof_evidence_hash(record) != record["evidence_hash"]:
+            valid = False
+        previous_hash = record["evidence_hash"]
+        expected_sequence += 1
+    return valid
+
+
 def verify_snapshot_deletion_proofs(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -7427,26 +7453,138 @@ def verify_snapshot_deletion_proofs(
         (version_row["id"],),
     ).fetchall()
 
-    valid = True
-    expected_sequence = 1
-    previous_hash: str | None = None
-    for row in rows:
-        record = _deletion_proof_row_to_dict(row)
-        if record["sequence"] != expected_sequence:
-            valid = False
-        if record["previous_hash"] != previous_hash:
-            valid = False
-        if _deletion_proof_evidence_hash(record) != record["evidence_hash"]:
-            valid = False
-        previous_hash = record["evidence_hash"]
-        expected_sequence += 1
-
     return {
         "dataset": dataset["name"],
         "version": version_row["version"],
-        "valid": valid,
+        "valid": _deletion_proof_rows_valid(rows),
         "checked_count": len(rows),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version deletion compliance export
+# --------------------------------------------------------------------------- #
+
+
+def export_dataset_deletion_compliance(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset export of the snapshot deletion compliance.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry gives the registered retention policy's day count
+    (``None`` when no policy is registered, the key is never omitted), every
+    deletion request of the version across all its snapshots in request id
+    order (pending, blocked and confirmed requests all retained, with exactly
+    the per-snapshot deletion-request read's fields), and a summary of the
+    version's deletion-proof chain: the number of proofs written, the proof
+    sequence range (both ends ``None`` for an empty chain) and whether the
+    chain is intact under exactly the verification read's criteria (an empty
+    chain is intact). ``totals`` covers the version count, the deletion
+    request count, the confirmed request count and the proof count, each the
+    sum of the per-version values; a dataset without versions yields an empty
+    version list and all-zero totals, never an error.
+
+    The export is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a deletion request, deletion proof, snapshot
+    or retention policy. Like the privacy compliance export, the dataset
+    resolves first (404); any request body bytes (whitespace-only included)
+    or any query parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the deletion-proof list/verify reads.
+    if body:
+        raise RequestInvalidError(
+            "The deletion compliance export endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The deletion compliance export endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        retention_row = conn.execute(
+            "SELECT retention_days FROM retention_policies WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        retention_days = (
+            retention_row["retention_days"] if retention_row is not None else None
+        )
+
+        # Every request of the version regardless of snapshot; confirmed
+        # requests remain after their snapshot is gone and must appear here
+        # too. Explicit ordering keeps the list independent of the database's
+        # natural row order.
+        request_rows = conn.execute(
+            "SELECT * FROM snapshot_deletion_requests WHERE version_id = ? "
+            "ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+        deletion_requests = [
+            _deletion_request_row_to_dict(row) for row in request_rows
+        ]
+
+        proof_rows = conn.execute(
+            "SELECT * FROM snapshot_deletion_proofs WHERE version_id = ? "
+            "ORDER BY sequence ASC",
+            (version_id,),
+        ).fetchall()
+        proof_count = len(proof_rows)
+        if proof_count:
+            sequence_range = (
+                proof_rows[0]["sequence"],
+                proof_rows[-1]["sequence"],
+            )
+        else:
+            sequence_range = (None, None)
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "retention_days": retention_days,
+                "deletion_requests": deletion_requests,
+                "proof_chain": {
+                    "count": proof_count,
+                    "sequence_range": sequence_range,
+                    "valid": _deletion_proof_rows_valid(proof_rows),
+                },
+            }
+        )
+
+    totals = {
+        "version_count": len(versions),
+        "deletion_request_count": sum(
+            len(version["deletion_requests"]) for version in versions
+        ),
+        "confirmed_request_count": sum(
+            1
+            for version in versions
+            for request in version["deletion_requests"]
+            if request["status"] == "confirmed"
+        ),
+        "proof_count": sum(
+            version["proof_chain"]["count"] for version in versions
+        ),
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
 
 
 # --------------------------------------------------------------------------- #
