@@ -7389,6 +7389,30 @@ def list_snapshot_deletion_proofs(
     return [_deletion_proof_row_to_dict(row) for row in rows]
 
 
+def _deletion_proof_chain_valid(rows: list[sqlite3.Row]) -> bool:
+    """Re-verify one version's deletion-proof chain, read in sequence order.
+
+    Every stored evidence hash is recomputed and the ``sequence`` run and the
+    per-proof linkage are checked: sequences must be continuous from 1, the
+    first ``previous_hash`` must be null and every later one must equal the
+    preceding proof's ``evidence_hash``. An empty chain is valid.
+    """
+    valid = True
+    expected_sequence = 1
+    previous_hash: str | None = None
+    for row in rows:
+        record = _deletion_proof_row_to_dict(row)
+        if record["sequence"] != expected_sequence:
+            valid = False
+        if record["previous_hash"] != previous_hash:
+            valid = False
+        if _deletion_proof_evidence_hash(record) != record["evidence_hash"]:
+            valid = False
+        previous_hash = record["evidence_hash"]
+        expected_sequence += 1
+    return valid
+
+
 def verify_snapshot_deletion_proofs(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -7427,26 +7451,122 @@ def verify_snapshot_deletion_proofs(
         (version_row["id"],),
     ).fetchall()
 
-    valid = True
-    expected_sequence = 1
-    previous_hash: str | None = None
-    for row in rows:
-        record = _deletion_proof_row_to_dict(row)
-        if record["sequence"] != expected_sequence:
-            valid = False
-        if record["previous_hash"] != previous_hash:
-            valid = False
-        if _deletion_proof_evidence_hash(record) != record["evidence_hash"]:
-            valid = False
-        previous_hash = record["evidence_hash"]
-        expected_sequence += 1
-
     return {
         "dataset": dataset["name"],
         "version": version_row["version"],
-        "valid": valid,
+        "valid": _deletion_proof_chain_valid(rows),
         "checked_count": len(rows),
     }
+
+
+def export_dataset_deletion_compliance(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset export of the deletion compliance state.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry carries the version's registered retention period
+    (null when no retention policy is registered), every deletion request of
+    the version ordered by request id (pending, blocked and confirmed
+    requests are all retained) and a summary of the version's deletion-proof
+    chain: the number of proofs written, the first/last sequence numbers
+    (both null on an empty chain) and whether the chain still verifies under
+    the same rules as the per-version verification read (an empty chain is
+    valid). ``totals`` sums the version, deletion-request, confirmed-request
+    and proof counts over all versions; a dataset without versions yields an
+    empty version list and all-zero totals, never an error.
+
+    The export is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a deletion request, proof, snapshot or
+    retention policy. Like the privacy compliance export, the dataset
+    resolves first (404); any request body — whitespace-only included — or
+    any query parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    if body:
+        raise RequestInvalidError(
+            "The deletion compliance export endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The deletion compliance export endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        policy_row = conn.execute(
+            "SELECT retention_days FROM retention_policies WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+
+        request_rows = conn.execute(
+            "SELECT * FROM snapshot_deletion_requests WHERE version_id = ? "
+            "ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+        deletion_requests = [
+            _deletion_request_row_to_dict(row) for row in request_rows
+        ]
+
+        proof_rows = conn.execute(
+            "SELECT * FROM snapshot_deletion_proofs WHERE version_id = ? "
+            "ORDER BY sequence ASC",
+            (version_id,),
+        ).fetchall()
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "retention_days": (
+                    policy_row["retention_days"]
+                    if policy_row is not None
+                    else None
+                ),
+                "deletion_requests": deletion_requests,
+                "proof_chain": {
+                    "proof_count": len(proof_rows),
+                    "first_sequence": (
+                        proof_rows[0]["sequence"] if proof_rows else None
+                    ),
+                    "last_sequence": (
+                        proof_rows[-1]["sequence"] if proof_rows else None
+                    ),
+                    "valid": _deletion_proof_chain_valid(proof_rows),
+                },
+            }
+        )
+
+    totals = {
+        "version_count": len(versions),
+        "deletion_request_count": sum(
+            len(version["deletion_requests"]) for version in versions
+        ),
+        "confirmed_request_count": sum(
+            1
+            for version in versions
+            for request in version["deletion_requests"]
+            if request["status"] == "confirmed"
+        ),
+        "proof_count": sum(
+            version["proof_chain"]["proof_count"] for version in versions
+        ),
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
 
 
 # --------------------------------------------------------------------------- #

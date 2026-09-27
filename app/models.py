@@ -1160,6 +1160,50 @@ class SnapshotDeletionProofChainVerifyResponse(BaseModel):
     checked_count: int
 
 
+# --------------------------------------------------------------------------- #
+# Read-only cross-version snapshot deletion compliance export
+# --------------------------------------------------------------------------- #
+
+
+# Deletion-proof chain summary of one schema version as it appears in the
+# export. ``proof_count`` is the number of proofs written so far;
+# ``first_sequence``/``last_sequence`` bracket the written sequence numbers
+# and are both null when no proof exists; ``valid`` re-verifies the chain
+# under the same rules as the per-version verification read, so an empty
+# chain is valid.
+class DeletionComplianceExportProofChain(BaseModel):
+    proof_count: int
+    first_sequence: int | None
+    last_sequence: int | None
+    valid: bool
+
+
+# One schema version's deletion compliance summary. Exactly these keys, in this
+# order: the version number, the registered retention period (null when no
+# retention policy is registered; the key is never omitted), the deletion
+# requests sorted by request id ascending (pending, blocked and confirmed
+# requests are all kept) and the proof-chain summary.
+class DeletionComplianceExportVersion(BaseModel):
+    version: int
+    retention_days: int | None
+    deletion_requests: list[SnapshotDeletionRequest]
+    proof_chain: DeletionComplianceExportProofChain
+
+
+class DeletionComplianceExportTotals(BaseModel):
+    version_count: int
+    deletion_request_count: int
+    confirmed_request_count: int
+    proof_count: int
+
+
+# Deterministic whole-dataset export: exactly these keys, in this order.
+class DeletionComplianceExportResponse(BaseModel):
+    dataset: str
+    versions: list[DeletionComplianceExportVersion]
+    totals: DeletionComplianceExportTotals
+
+
 class RetentionSweepEntry(BaseModel):
     snapshot_id: int
     request_id: int

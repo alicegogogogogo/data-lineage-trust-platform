@@ -1277,6 +1277,37 @@ single-winner, the loser receiving `409` and changing nothing. Existing
 snapshot reads, fingerprint verification, diffs, masked reads, the retention
 sweep and the deletion-request collection are otherwise unchanged.
 
+### Cross-version deletion compliance export
+
+- `GET /datasets/{dataset}/deletion-compliance-export` — read-only
+  cross-version export of the dataset's whole snapshot deletion compliance
+  state, recomputed on every read. The response is a deterministic JSON
+  document (fixed key order, compact whitespace, exactly one trailing
+  newline) with exactly `dataset`, `versions` and `totals`. `versions` holds
+  one entry per schema version ordered by version number ascending; each
+  entry has exactly `version`, `retention_days` (the registered retention
+  period, `null` when no retention policy is registered — the key is never
+  omitted), `deletion_requests` and `proof_chain`. The deletion requests are
+  ordered by request id ascending with pending, blocked and confirmed
+  requests all retained, each carrying the same fields as the per-snapshot
+  request read (`id`, `snapshot_id`, `policy_id`, `reason`, `status`,
+  `impacted`, `created_at`). `proof_chain` summarizes the version's
+  deletion-proof chain with exactly `proof_count`, `first_sequence`,
+  `last_sequence` and `valid`: the sequence bounds are both `null` when no
+  proof has been written, and `valid` re-verifies the chain under the same
+  rules as the per-version verify endpoint (an empty chain is valid).
+  `totals` has exactly `version_count`, `deletion_request_count`,
+  `confirmed_request_count` and `proof_count`, each the sum over the version
+  entries. A version without deletion requests or proofs reports an empty
+  list and zero counts, and a dataset without schema versions returns `200`
+  with an empty `versions` array and all-zero totals — never an error. The
+  export writes nothing: it never modifies a deletion request, proof,
+  snapshot or retention policy, and the document is identical across process
+  restarts. The endpoint takes no request body and no query parameters: any
+  body bytes (whitespace-only included) or any query parameter → `422`,
+  checked only after the path dataset resolves, so an unknown dataset is a
+  `404` first; errors keep the stable `{"error", "detail"}` shape.
+
 ### Processing tasks
 
 A processing task is a named unit of work attached to a schema version; each

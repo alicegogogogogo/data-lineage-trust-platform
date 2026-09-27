@@ -19,6 +19,7 @@ from app.models import (
     AuditRecordCreate,
     Dataset,
     DatasetCreate,
+    DeletionComplianceExportResponse,
     FieldTrajectoryResponse,
     LineageCreate,
     LineageCreatedResponse,
@@ -1541,6 +1542,52 @@ def get_privacy_policy_coverage(
     )
     payload = json.dumps(
         coverage.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version snapshot deletion compliance export
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that returns the snapshot deletion compliance state of
+# every schema version at once: the registered retention period, the deletion
+# requests and the deletion-proof chain summary. The path carries only the
+# dataset name; there is no request body or query parameter.
+DELETION_COMPLIANCE_EXPORT_PATH = (
+    "/datasets/{dataset_name}/deletion-compliance-export"
+)
+
+
+@app.get(
+    DELETION_COMPLIANCE_EXPORT_PATH,
+    response_model=DeletionComplianceExportResponse,
+)
+def export_dataset_deletion_compliance(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset is known, preserving the same 404 precedence as the privacy
+    # compliance export. The body is serialized directly (rather than through
+    # the default JSON response) so the key order is fixed, the whitespace is
+    # compact and the document ends with exactly one newline.
+    export = DeletionComplianceExportResponse(
+        **repository.export_dataset_deletion_compliance(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        export.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )
