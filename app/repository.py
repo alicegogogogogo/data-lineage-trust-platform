@@ -845,7 +845,12 @@ def create_lineage_link(
 
     # The new edge can only extend the impact of fields that reach its source.
     _invalidate_impact_cache_for_upstream(
-        conn, source["name"], source_version, source_field, source_field_id
+        conn,
+        source["name"],
+        source_version,
+        source_field,
+        source_field_id,
+        cause="registered",
     )
 
     return {
@@ -1062,6 +1067,7 @@ def delete_lineage_link(
         payload["source_version"],
         payload["source_field"],
         source_field_id,
+        cause="deleted",
     )
 
     deleted = conn.execute(
@@ -1266,6 +1272,8 @@ def _invalidate_impact_cache_for_upstream(
     source_version: int,
     source_field: str,
     source_field_id: int,
+    *,
+    cause: str,
 ) -> None:
     """Invalidate cached impacts of the new link's source and its upstream.
 
@@ -1273,6 +1281,14 @@ def _invalidate_impact_cache_for_upstream(
     fields that can reach ``source`` (``source`` itself included), so exactly
     those cached entries are dropped; unrelated entries are kept. The reverse
     walk runs after the link was inserted so cycles are covered too.
+
+    Every dropped entry also leaves one append-only invalidation record under
+    its own (dataset, version): the trail covers only fields that actually
+    had a cache record, and ``cause`` is ``registered`` or ``deleted`` after
+    the mapping write that triggered the invalidation. The caller already
+    holds the database write lock (the mapping insert/update ran first, or
+    the transaction began IMMEDIATE), so the per-version sequences allocated
+    here stay continuous across concurrent registrations and deletions.
     """
     rows = conn.execute(
         """
@@ -1305,10 +1321,44 @@ def _invalidate_impact_cache_for_upstream(
             )
             queue.append(row["source_field_id"])
 
+    ordered = sorted(upstream)
+
+    # Trail one record per invalidated field that currently has a cache
+    # record, in the same deterministic (dataset, version, field) order as
+    # the delete below; fields without a record leave no trace.
+    cached = {
+        (row["source_dataset"], row["source_version"], row["source_field"])
+        for row in conn.execute(
+            "SELECT source_dataset, source_version, source_field "
+            "FROM lineage_impact_cache"
+        ).fetchall()
+    }
+    invalidated = [key for key in ordered if key in cached]
+    if invalidated:
+        written_at = utc_now_iso()
+        next_sequence: dict[tuple[str, int], int] = {}
+        for dataset, version, field in invalidated:
+            version_key = (dataset, version)
+            if version_key not in next_sequence:
+                next_sequence[version_key] = conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+                    "FROM lineage_impact_cache_invalidations "
+                    "WHERE dataset = ? AND version = ?",
+                    version_key,
+                ).fetchone()["next_sequence"]
+            sequence = next_sequence[version_key]
+            next_sequence[version_key] = sequence + 1
+            conn.execute(
+                "INSERT INTO lineage_impact_cache_invalidations ("
+                "dataset, version, sequence, cause, field, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (dataset, version, sequence, cause, field, written_at),
+            )
+
     conn.executemany(
         "DELETE FROM lineage_impact_cache "
         "WHERE source_dataset = ? AND source_version = ? AND source_field = ?",
-        sorted(upstream),
+        ordered,
     )
 
 
@@ -1580,6 +1630,71 @@ def repair_lineage_impact_cache(
         "version": version_number,
         "entries": entries,
         "counts": counts,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Lineage impact cache invalidation trail (read-only)
+# --------------------------------------------------------------------------- #
+
+
+def list_lineage_impact_cache_invalidations(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only invalidation trail of one version's impact cache.
+
+    Every record persisted for the version is returned in ascending sequence
+    order (sequences number the version's records from 1 in write order, so
+    the sort never depends on database order); a version without records
+    returns an empty entry list, never an error. Each entry carries exactly
+    ``sequence``, ``cause`` (``registered`` or ``deleted``), ``field`` and
+    the timezone-bearing ``created_at`` write time.
+
+    The read only reads: no cache record is inserted, invalidated or repaired
+    and no invalidation record is written, so impact queries, path
+    explanations, source-path reads, the audit and the repair behave exactly
+    as before. The path dataset/version resolves first (404); only afterwards
+    are any request body bytes — whitespace-only included — or any query
+    parameter rejected with 422, preserving the impact query's 404-before-422
+    precedence.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    _require_schema_version(conn, dataset, version_number)
+
+    if body:
+        raise RequestInvalidError(
+            "The lineage impact cache invalidations endpoint does not accept "
+            "a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The lineage impact cache invalidations endpoint does not accept "
+            "query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT sequence, cause, field, created_at "
+        "FROM lineage_impact_cache_invalidations "
+        "WHERE dataset = ? AND version = ? ORDER BY sequence",
+        (dataset["name"], version_number),
+    ).fetchall()
+    return {
+        "dataset": dataset["name"],
+        "version": version_number,
+        "entries": [
+            {
+                "sequence": row["sequence"],
+                "cause": row["cause"],
+                "field": row["field"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ],
     }
 
 

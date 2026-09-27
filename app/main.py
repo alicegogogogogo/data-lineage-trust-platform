@@ -24,6 +24,7 @@ from app.models import (
     LineageCreatedResponse,
     LineageDeletedResponse,
     LineageImpactCacheAuditResponse,
+    LineageImpactCacheInvalidationsResponse,
     LineageImpactCacheRepairResponse,
     LineageImpactResponse,
     LineageImpactPathsResponse,
@@ -597,6 +598,48 @@ def repair_lineage_impact_cache(
     )
     payload = json.dumps(
         repair.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only invalidation trail of the version's impact cache, appended one
+# segment after the lineage impact query address and accepting GET only. One
+# record is persisted per invalidated field that had a cache record when a
+# lineage mapping was registered or deleted; this read only reads them. The
+# body is serialized directly (rather than through the default JSON response)
+# so the key order is fixed, the whitespace is compact and the document ends
+# with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/lineage/impact/cache-invalidations",
+    response_model=LineageImpactCacheInvalidationsResponse,
+)
+def list_lineage_impact_cache_invalidations(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset/version is known, preserving the impact query's 404-before-422
+    # precedence. Nothing is written: no cache record is inserted, invalidated
+    # or repaired and no invalidation record is added, so impact queries, path
+    # explanations, source-path reads, the audit and the repair are unaffected.
+    trail = LineageImpactCacheInvalidationsResponse(
+        **repository.list_lineage_impact_cache_invalidations(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        trail.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

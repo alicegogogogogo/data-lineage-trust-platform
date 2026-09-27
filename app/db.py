@@ -408,6 +408,24 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         dataset  TEXT NOT NULL
     )
     """,
+    # Append-only trail of impact cache invalidations: one record per
+    # invalidated field that actually had a cache record when a lineage
+    # mapping was registered or deleted. ``dataset``/``version``/``field``
+    # name the dropped cache entry's source; ``sequence`` numbers the records
+    # of one version in write order; ``cause`` is 'registered' or 'deleted'.
+    # Cache invalidation triggered by schema version creation leaves no trail.
+    """
+    CREATE TABLE IF NOT EXISTS lineage_impact_cache_invalidations (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset    TEXT NOT NULL,
+        version    INTEGER NOT NULL,
+        sequence   INTEGER NOT NULL CHECK (sequence >= 1),
+        cause      TEXT NOT NULL CHECK (cause IN ('registered', 'deleted')),
+        field      TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (dataset, version, sequence)
+    )
+    """,
     # Audit records are an append-only proof chain: the database itself refuses
     # updates and deletes so the evidence history cannot be rewritten.
     """
@@ -500,6 +518,23 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON snapshot_deletion_proofs
     BEGIN
         SELECT RAISE(ABORT, 'snapshot deletion proofs are immutable');
+    END
+    """,
+    # The impact cache invalidation trail is append-only as well: the database
+    # itself refuses updates and deletes so the invalidation history cannot be
+    # rewritten.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_impact_cache_invalidations_no_update
+    BEFORE UPDATE ON lineage_impact_cache_invalidations
+    BEGIN
+        SELECT RAISE(ABORT, 'impact cache invalidation records are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_impact_cache_invalidations_no_delete
+    BEFORE DELETE ON lineage_impact_cache_invalidations
+    BEGIN
+        SELECT RAISE(ABORT, 'impact cache invalidation records are immutable');
     END
     """,
 )

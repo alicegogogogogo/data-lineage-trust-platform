@@ -248,6 +248,28 @@ schema version in a different (source) dataset.
   loser receiving `409` and changing nothing. Every rejection writes
   nothing; lineage registrations and deletions, impact queries, path
   explanations, source-path reads and the read-only audit are unaffected.
+- `GET /datasets/{dataset}/versions/{version}/lineage/impact/cache-invalidations`
+  — read-only invalidation trail of the version's impact cache, appended one
+  segment after the impact query address and accepting GET only. Whenever a
+  lineage mapping is successfully registered or deleted, every invalidated
+  field that actually had a cache record (the mapping's source field and
+  every field that can reach it) leaves one append-only record under its own
+  dataset and version; cache invalidation triggered by schema version
+  creation leaves no trail. Each entry has exactly `sequence`, `cause`,
+  `field` and `created_at` in that order: `sequence` numbers the version's
+  records from 1 in write order (continuous, never reused, even under
+  concurrent registrations and deletions), `cause` is `registered` or
+  `deleted` after the triggering mapping write and `created_at` is the
+  timezone-bearing write time. Entries are sorted by sequence ascending and
+  a version without records returns an empty `entries` array, never an
+  error. The JSON document is deterministic (fixed key order, compact
+  whitespace, exactly one trailing newline) with top-level keys `dataset`,
+  `version` and `entries` in that order. The trail is append-only and
+  survives restarts; the read only reads persisted records and never writes,
+  invalidates or repairs anything. The endpoint takes no request body and no
+  query parameters; any body bytes (whitespace-only included) or query
+  parameter → `422`, and an unknown dataset or version → `404`, with `404`
+  taking precedence over `422` as in the impact query.
 - `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
   read-only shortest-path explanation of the same impact, computed fresh on
   every read (no caching; nothing is written, and version definitions, lineage

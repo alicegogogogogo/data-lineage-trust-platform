@@ -188,6 +188,26 @@ class LineageImpactCacheRepairResponse(BaseModel):
     counts: LineageImpactCacheRepairCounts
 
 
+# One invalidated field of the version's impact cache trail: ``sequence``
+# numbers the records of the version from 1 in write order, ``cause`` is the
+# trigger (``registered`` for a mapping registration, ``deleted`` for a
+# mapping deletion) and ``created_at`` is the timezone-bearing write time.
+class LineageImpactCacheInvalidationEntry(BaseModel):
+    sequence: int
+    cause: Literal["registered", "deleted"]
+    field: str
+    created_at: str
+
+
+# Read-only invalidation trail of one version's impact cache: exactly these
+# keys, in this order. Entries are sorted by sequence ascending and the
+# document is serialized deterministically (compact JSON, trailing newline).
+class LineageImpactCacheInvalidationsResponse(BaseModel):
+    dataset: str
+    version: int
+    entries: list[LineageImpactCacheInvalidationEntry]
+
+
 # One impacted field together with the shortest lineage path from the source.
 # ``path`` includes both ends; ``path_length`` is the number of path edges
 # (1 for a direct downstream field).
