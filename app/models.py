@@ -1053,6 +1053,35 @@ class ConfirmedSnapshotDeletionRequest(SnapshotDeletionRequest):
     confirmed_at: str
 
 
+# Tamper-evident deletion proof appended in the same transaction as a
+# successful snapshot deletion. Proofs form an independent append-only chain
+# per schema version, numbered from 1; ``previous_hash`` is null on the first
+# proof and otherwise the previous proof's ``evidence_hash``. Exactly these
+# keys are returned, in this order. ``row_count`` and ``stored_hash`` capture
+# the snapshot's on-disk values at deletion time, ``reason`` the reason on the
+# confirmed request and ``confirmed_at`` the deletion commit time.
+class SnapshotDeletionProof(BaseModel):
+    sequence: int
+    snapshot_id: int
+    row_count: int
+    stored_hash: str
+    reason: str
+    confirmed_at: str
+    previous_hash: str | None
+    evidence_hash: str
+
+
+# Read-only verification of one version's whole deletion-proof chain. The
+# hashes are recomputed and the sequence/linkage checked fresh on every read;
+# a tampered or broken chain is a normal 200 with ``valid`` false, never an
+# error, and an empty chain is valid with a zero count.
+class SnapshotDeletionProofChainVerifyResponse(BaseModel):
+    dataset: str
+    version: int
+    valid: bool
+    checked_count: int
+
+
 class RetentionSweepEntry(BaseModel):
     snapshot_id: int
     request_id: int

@@ -1037,8 +1037,10 @@ downstream fields. Policies and requests are persisted across restarts.
   confirm a request (no body). Confirmation succeeds only while the request is
   `pending` and the snapshot is at least `retention_days` old; otherwise `409`
   and nothing is deleted. On success the snapshot is deleted atomically with
-  the status change to `confirmed`, and the response adds `confirmed_at`. Once
-  deleted, the snapshot no longer appears in snapshot read, list, `at` or diff
+  the status change to `confirmed`, and the response adds `confirmed_at`. In
+  the same transaction exactly one immutable deletion proof is appended to the
+  version's proof chain (see "Snapshot deletion proofs" below). Once deleted,
+  the snapshot no longer appears in snapshot read, list, `at` or diff
   responses.
 - `POST .../snapshots/{snapshot_id}/deletion-requests/{request_id}/recheck` —
   recompute the blocked state of an open request against the current lineage
@@ -1128,6 +1130,64 @@ downstream fields. Policies and requests are persisted across restarts.
   judged before every request-shape check; any request body (whitespace-only
   bytes included) or any query parameter → `422`, and no rejection writes
   anything.
+
+### Snapshot deletion proofs (append-only proof chain)
+
+Every schema version carries an independent, tamper-evident chain of deletion
+proofs. Exactly one proof is appended in the same transaction as a successful
+snapshot deletion, so the deletion and its evidence commit together or not at
+all. Proofs are append-only (the database rejects updates and deletes, and
+there are no per-proof HTTP routes), numbered from `1` per version and linked
+through SHA-256 evidence hashes. They persist across restarts and stay
+readable after every snapshot they attest has been deleted. Snapshots deleted
+before this feature existed get no backfilled proof and do not appear in the
+list; snapshot numbers are never reused.
+
+- `GET /datasets/{dataset}/versions/{version}/snapshots/deletion-proofs` —
+  list every proof of the version ordered by `sequence` ascending (empty when
+  none exist, never an error). Each proof has exactly `sequence`,
+  `snapshot_id`, `row_count`, `stored_hash` and `reason`, then `confirmed_at`,
+  `previous_hash` and `evidence_hash`, in that fixed order. `row_count` and
+  `stored_hash` are the deleted snapshot's on-disk row count and content
+  fingerprint captured at the deletion instant (identical to the snapshot
+  verify endpoint's `stored_hash`), `reason` is the reason on the confirmed
+  request and `confirmed_at` is the deletion commit time (the same value the
+  confirmation returns). The first proof's `previous_hash` is `null`; every
+  later one equals the preceding proof's `evidence_hash`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/deletion-proofs/verify`
+  — read-only verification of the whole chain, recomputed fresh on every read.
+  Every `evidence_hash` is recomputed, `sequence` values are checked to run
+  continuously from `1` and each `previous_hash` to equal the preceding
+  proof's `evidence_hash` (the first must be `null`). Returns exactly
+  `dataset`, `version`, `valid` and `checked_count`; an intact chain reports
+  `valid` `true`, a rewritten proof or a broken/gapped chain reports `false`
+  as a normal `200` rather than an error, and an empty chain is valid with a
+  zero count. Nothing is written.
+
+`evidence_hash` uses the same digest convention as the processing-run audit
+chain: the hexadecimal SHA-256 of a canonical JSON document built from every
+stored field except `confirmed_at` and the hash fields — `sequence`,
+`snapshot_id`, `row_count`, `stored_hash`, `reason` and `previous_hash` — with
+keys sorted by Unicode code point, compact whitespace, non-ASCII characters
+unescaped and UTF-8 encoded.
+
+Both endpoints are read-only: they take no request body and no query
+parameters. Any body bytes (whitespace-only included) or any query parameter
+→ `422`, checked only after the path dataset/version resolves, so an unknown
+dataset or version is a `404` first. Both return deterministic JSON documents
+(fixed key order, compact whitespace, lowercase booleans, exactly one trailing
+newline), and errors keep the stable `{"error", "detail"}` shape without
+exposing SQL, stack traces or internal objects.
+
+A failed deletion, a rejected request or a race that loses confirmation
+writes no proof: a too-young or `blocked` confirmation and a repeated
+confirmation are `409` with zero writes. Concurrent confirmations of
+*different* snapshots of one version both succeed — serialized in some order —
+and their proof sequences are continuous, never repeated and never skipped, so
+the chain has no gap; a recheck or a sweep racing a confirmation remains
+single-winner, the loser receiving `409` and changing nothing. Existing
+snapshot reads, fingerprint verification, diffs, masked reads, the retention
+sweep and the deletion-request collection are otherwise unchanged.
 
 ### Processing tasks
 

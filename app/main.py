@@ -81,6 +81,8 @@ from app.models import (
     SchemaVersion,
     SchemaVersionCreate,
     SnapshotCreate,
+    SnapshotDeletionProof,
+    SnapshotDeletionProofChainVerifyResponse,
     SnapshotDeletionRequest,
     ConfirmedSnapshotDeletionRequest,
     SnapshotDeletionRequestCreate,
@@ -1792,6 +1794,79 @@ def masked_snapshot_diff_at_get_not_allowed() -> JSONResponse:
     )
 
 
+# Tamper-evident deletion proofs, declared before the parametric
+# "{snapshot_id}" routes (which would otherwise capture the literal
+# "deletion-proofs" segment as a snapshot id). The chain is version-wide, not
+# tied to one snapshot: one proof is written in the same transaction as each
+# successful deletion and this read lists them all in ascending sequence
+# order, writing nothing. The body is serialized directly so the key order is
+# fixed, the whitespace compact and the document ends with one newline.
+@app.get(
+    f"{SNAPSHOTS_PATH}/deletion-proofs",
+    response_model=list[SnapshotDeletionProof],
+)
+def list_snapshot_deletion_proofs(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset/version resolves first (404); only afterwards are any
+    # body bytes (whitespace-only included) or query parameters rejected
+    # (422). The collection stays readable after every attested snapshot has
+    # been deleted and is simply empty when nothing was deleted yet.
+    proofs = [
+        SnapshotDeletionProof(**proof)
+        for proof in repository.list_snapshot_deletion_proofs(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+    payload = json.dumps(
+        [proof.model_dump(mode="json") for proof in proofs],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only verification of the version's whole deletion-proof chain,
+# likewise declared before "{snapshot_id}/verify". The hashes are recomputed
+# and the sequence run and linkage checked fresh on every read; a tampered or
+# broken chain is a normal valid:false document and an empty chain is valid
+# with a zero count. Same deterministic serialization as the proof list.
+@app.get(
+    f"{SNAPSHOTS_PATH}/deletion-proofs/verify",
+    response_model=SnapshotDeletionProofChainVerifyResponse,
+)
+def verify_snapshot_deletion_proofs(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    verification = SnapshotDeletionProofChainVerifyResponse(
+        **repository.verify_snapshot_deletion_proofs(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        verification.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
 @app.get(f"{SNAPSHOTS_PATH}/{{snapshot_id}}", response_model=SnapshotResponse)
 def get_snapshot(
     dataset_name: str,
@@ -1967,17 +2042,36 @@ DELETION_REQUESTS_PATH = f"{SNAPSHOTS_PATH}/{{snapshot_id}}/deletion-requests"
 
 # Process-local exclusion of the write operations that move one version's
 # deletion-request state — a request recheck, a request confirmation and the
-# batch retention sweep. All three share the repository's per-version lock
-# map (see retention_sweep_lock): the guard is declared before the database
-# dependency so the lock is taken before the request connection is opened and
-# — dependencies tearing down in reverse order — released only after the
-# transaction commits. Two concurrent writers of this process therefore meet
-# a held lock wherever they start and the loser gets a 409 instead of waiting;
-# the fail-fast BEGIN IMMEDIATE in the repository covers writers of another
-# process.
-def _version_retention_write_guard(dataset_name: str, version: int) -> Iterator[None]:
-    lock = repository.retention_sweep_lock(dataset_name, version)
-    if not lock.acquire(blocking=False):
+# batch retention sweep. They share the repository's per-version lock (see
+# version_retention_lock) but enter it differently: a confirmation takes a
+# shared slot so two confirmations deleting different snapshots both run and
+# serialize at the database, while a recheck or sweep takes the exclusive
+# slot and is the single winner against every concurrent writer. Each guard
+# is declared before the database dependency so the slot is taken before the
+# request connection is opened and — dependencies tearing down in reverse
+# order — released only after the transaction commits. A contended slot fails
+# fast with a 409 instead of waiting; the fail-fast BEGIN IMMEDIATE of the
+# admin operations covers writers of another process.
+def _snapshot_deletion_confirm_guard(
+    dataset_name: str, version: int
+) -> Iterator[None]:
+    lock = repository.version_retention_lock(dataset_name, version)
+    if not lock.try_acquire_confirm():
+        raise ConflictError(
+            f"A retention write on version {version} of dataset "
+            f"'{dataset_name}' is already in progress"
+        )
+    try:
+        yield
+    finally:
+        lock.release_confirm()
+
+
+def _version_retention_admin_guard(
+    dataset_name: str, version: int
+) -> Iterator[None]:
+    lock = repository.version_retention_lock(dataset_name, version)
+    if not lock.try_acquire_admin():
         raise ConflictError(
             f"Another retention write on version {version} of dataset "
             f"'{dataset_name}' is already in progress"
@@ -1985,7 +2079,7 @@ def _version_retention_write_guard(dataset_name: str, version: int) -> Iterator[
     try:
         yield
     finally:
-        lock.release()
+        lock.release_admin()
 
 
 @app.post(
@@ -2034,9 +2128,13 @@ def confirm_snapshot_deletion_request(
     version: int,
     snapshot_id: int,
     request_id: int,
-    _write: None = Depends(_version_retention_write_guard),
+    _write: None = Depends(_snapshot_deletion_confirm_guard),
     conn=Depends(get_db),
 ) -> ConfirmedSnapshotDeletionRequest:
+    # Two concurrent confirmations of different snapshots both take a shared
+    # slot and serialize at the database, each appending one deletion proof
+    # from the committed chain tail; a recheck or sweep in progress holds the
+    # exclusive slot, so that race still loses with a 409 and zero writes.
     return ConfirmedSnapshotDeletionRequest(
         **repository.confirm_snapshot_deletion_request(
             conn, dataset_name, version, snapshot_id, request_id
@@ -2060,7 +2158,7 @@ def recheck_snapshot_deletion_request(
     snapshot_id: int,
     request_id: int,
     body: bytes = Depends(_read_request_body),
-    _write: None = Depends(_version_retention_write_guard),
+    _write: None = Depends(_version_retention_admin_guard),
     conn=Depends(get_db),
 ) -> SnapshotDeletionRequest:
     # The path dataset/version and the request resolve first (404), then a
@@ -2089,14 +2187,15 @@ def recheck_snapshot_deletion_request(
 # default JSON response) so the key order is fixed, the whitespace is compact
 # and the document ends with exactly one newline.
 def _retention_sweep_guard(dataset_name: str, version: int) -> Iterator[None]:
-    # Declared before the database dependency so the lock is taken before the
-    # request connection is opened, and — dependencies tearing down in
-    # reverse order — released only after the transaction commits. A
-    # concurrent sweep of the same version therefore meets a held lock
-    # wherever it starts and loses with a 409 instead of waiting (mirrors the
-    # impact cache repair guard).
-    lock = repository.retention_sweep_lock(dataset_name, version)
-    if not lock.acquire(blocking=False):
+    # The sweep is an exclusive admin writer: declared before the database
+    # dependency so the slot is taken before the request connection is opened
+    # and — dependencies tearing down in reverse order — released only after
+    # the transaction commits. A concurrent sweep, recheck or confirmation of
+    # the same version therefore meets a held slot wherever it starts and
+    # loses with a 409 instead of waiting (mirrors the impact cache repair
+    # guard).
+    lock = repository.version_retention_lock(dataset_name, version)
+    if not lock.try_acquire_admin():
         raise ConflictError(
             f"Another retention sweep of version {version} of dataset "
             f"'{dataset_name}' is already in progress"
@@ -2104,7 +2203,7 @@ def _retention_sweep_guard(dataset_name: str, version: int) -> Iterator[None]:
     try:
         yield
     finally:
-        lock.release()
+        lock.release_admin()
 
 
 @app.post(

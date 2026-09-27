@@ -6520,14 +6520,13 @@ def confirm_snapshot_deletion_request(
         conn, version_row, snapshot_id, dataset_name, version_number
     )
 
-    # Take the write lock before the state transition so a concurrent recheck
-    # or another confirmation cannot interleave: the loser meets the held
-    # lock without waiting and receives a 409, leaving the request and the
-    # snapshot untouched. Only validation reads have run so far (they start no
-    # write transaction), so the fail-fast begin is safe here. The usual
-    # timeout is restored immediately so this confirmation's own commit can
-    # still wait out a transient reader.
-    conn.execute("PRAGMA busy_timeout = 0")
+    # The endpoint holds the version's process lock across this whole call:
+    # two confirmations serialize but both proceed, while a recheck or sweep
+    # loses before it gets here. Begin the database write transaction and wait
+    # for a writer of another process rather than failing fast, so a
+    # confirmation of a different snapshot still commits afterwards; the
+    # post-lock re-read below turns waiting behind a competing writer of the
+    # same request into the correct 409.
     try:
         conn.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError as exc:
@@ -6535,14 +6534,15 @@ def confirm_snapshot_deletion_request(
             f"Snapshot deletion request {request_id} is already being "
             f"modified by another request"
         ) from exc
-    finally:
-        conn.execute("PRAGMA busy_timeout = 30000")
 
     # Re-read under the write lock: a concurrent recheck may have moved the
-    # request back to 'blocked' after the earlier read, in which case the
-    # confirmation must fail without deleting anything.
+    # request back to 'blocked' and a competing confirmation may already have
+    # confirmed it, in which case this confirmation fails without deleting
+    # anything. The snapshot's on-disk row count and content fingerprint are
+    # read here too so the deletion proof captures the values at the deletion
+    # instant, immediately before the row is removed.
     locked_row = conn.execute(
-        "SELECT status FROM snapshot_deletion_requests WHERE id = ?",
+        "SELECT status, reason FROM snapshot_deletion_requests WHERE id = ?",
         (request_id,),
     ).fetchone()
     if locked_row["status"] != "pending":
@@ -6550,10 +6550,21 @@ def confirm_snapshot_deletion_request(
             f"Snapshot deletion request {request_id} is "
             f"'{locked_row['status']}'; only pending requests can be confirmed"
         )
+    locked_snapshot = conn.execute(
+        "SELECT id, row_count, content_hash FROM snapshots WHERE id = ?",
+        (snapshot_id,),
+    ).fetchone()
+    if locked_snapshot is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
 
-    # Snapshot removal and request confirmation commit together: either both
-    # take effect or neither does. The status guard is the final backstop for
-    # the rare cross-process race that slips past the lock re-read.
+    # Snapshot removal, request confirmation and the deletion proof commit
+    # together: either all three take effect or none does. The status guard
+    # is the final backstop for the rare cross-process race that slips past
+    # the lock re-read. ``confirmed_at`` is the single deletion commit time:
+    # it marks the request and the proof written by the same transaction.
     confirmed_at = utc_now_iso()
     confirmed_cursor = conn.execute(
         "UPDATE snapshot_deletion_requests "
@@ -6566,6 +6577,15 @@ def confirm_snapshot_deletion_request(
             f"Snapshot deletion request {request_id} is not pending; only "
             f"pending requests can be confirmed"
         )
+    _append_snapshot_deletion_proof(
+        conn,
+        version_id=version_row["id"],
+        snapshot_id=snapshot_id,
+        row_count=locked_snapshot["row_count"],
+        stored_hash=locked_snapshot["content_hash"],
+        reason=locked_row["reason"],
+        confirmed_at=confirmed_at,
+    )
     conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
     updated = conn.execute(
         "SELECT * FROM snapshot_deletion_requests WHERE id = ?", (request_id,)
@@ -6696,28 +6716,274 @@ def recheck_snapshot_deletion_request(
 
 
 # --------------------------------------------------------------------------- #
+# Snapshot deletion proofs (append-only, per-version tamper-evident chain)
+# --------------------------------------------------------------------------- #
+
+
+# Fields covered by the evidence hash, using the same canonical-JSON digest
+# convention as the processing-run audit chain (keys sorted by Unicode code
+# point, compact text, non-ASCII unescaped, UTF-8 encoded, SHA-256 hex). The
+# confirmation time is excluded together with the hash fields: every covered
+# field except ``previous_hash`` captures the deletion itself, while
+# ``previous_hash`` links the proof to the preceding one of the same version.
+DELETION_PROOF_EVIDENCE_FIELDS = (
+    "previous_hash",
+    "reason",
+    "row_count",
+    "sequence",
+    "snapshot_id",
+    "stored_hash",
+)
+
+
+def _deletion_proof_evidence_hash(record: dict[str, Any]) -> str:
+    payload = {field: record[field] for field in DELETION_PROOF_EVIDENCE_FIELDS}
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _deletion_proof_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "sequence": row["sequence"],
+        "snapshot_id": row["snapshot_id"],
+        "row_count": row["row_count"],
+        "stored_hash": row["stored_hash"],
+        "reason": row["reason"],
+        "confirmed_at": row["confirmed_at"],
+        "previous_hash": row["previous_hash"],
+        "evidence_hash": row["evidence_hash"],
+    }
+
+
+def _append_snapshot_deletion_proof(
+    conn: sqlite3.Connection,
+    *,
+    version_id: int,
+    snapshot_id: int,
+    row_count: int,
+    stored_hash: str,
+    reason: str,
+    confirmed_at: str,
+) -> None:
+    """Append one deletion proof to the version's chain.
+
+    Runs inside the caller's open write transaction (a successful deletion
+    confirmation), so the chain read, the proof insert, the request status
+    change and the snapshot removal all commit together. ``sequence`` is the
+    next per-version number (1 for the first proof); ``previous_hash`` is
+    null on the first proof and the preceding proof's ``evidence_hash``
+    afterwards.
+    """
+    tail = conn.execute(
+        "SELECT sequence, evidence_hash FROM snapshot_deletion_proofs "
+        "WHERE version_id = ? ORDER BY sequence DESC LIMIT 1",
+        (version_id,),
+    ).fetchone()
+    if tail is None:
+        sequence = 1
+        previous_hash = None
+    else:
+        sequence = tail["sequence"] + 1
+        previous_hash = tail["evidence_hash"]
+
+    record = {
+        "sequence": sequence,
+        "snapshot_id": snapshot_id,
+        "row_count": row_count,
+        "stored_hash": stored_hash,
+        "reason": reason,
+        "previous_hash": previous_hash,
+    }
+    conn.execute(
+        "INSERT INTO snapshot_deletion_proofs ("
+        "version_id, sequence, snapshot_id, row_count, stored_hash, reason, "
+        "confirmed_at, previous_hash, evidence_hash"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            version_id,
+            sequence,
+            snapshot_id,
+            row_count,
+            stored_hash,
+            reason,
+            confirmed_at,
+            previous_hash,
+            _deletion_proof_evidence_hash(record),
+        ),
+    )
+
+
+def list_snapshot_deletion_proofs(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Return every deletion proof of one version in sequence order.
+
+    The collection exists for a version independently of its snapshots, so it
+    stays readable after the attested snapshots have been deleted; an empty
+    chain is a normal empty list. The endpoint takes no request body and no
+    query parameters (422), checked only after the path dataset/version
+    resolves, so an unknown dataset or version stays a 404. Nothing is
+    written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body:
+        raise RequestInvalidError(
+            "The snapshot deletion proofs endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot deletion proofs endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM snapshot_deletion_proofs WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return [_deletion_proof_row_to_dict(row) for row in rows]
+
+
+def verify_snapshot_deletion_proofs(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Re-verify the whole deletion-proof chain of one version, fresh.
+
+    Every stored evidence hash is recomputed and the ``sequence`` run and the
+    per-proof linkage are checked: sequences must be continuous from 1, the
+    first ``previous_hash`` must be null and every later one must equal the
+    preceding proof's ``evidence_hash``. A rewritten proof or a broken link
+    yields ``valid`` false as a normal result rather than an error; an empty
+    chain is valid with a zero count. Same 404-before-422 request rules as
+    the proof list; nothing is written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body:
+        raise RequestInvalidError(
+            "The snapshot deletion proof verification endpoint does not accept "
+            "a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot deletion proof verification endpoint does not accept "
+            "query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM snapshot_deletion_proofs WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+
+    valid = True
+    expected_sequence = 1
+    previous_hash: str | None = None
+    for row in rows:
+        record = _deletion_proof_row_to_dict(row)
+        if record["sequence"] != expected_sequence:
+            valid = False
+        if record["previous_hash"] != previous_hash:
+            valid = False
+        if _deletion_proof_evidence_hash(record) != record["evidence_hash"]:
+            valid = False
+        previous_hash = record["evidence_hash"]
+        expected_sequence += 1
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "valid": valid,
+        "checked_count": len(rows),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Retention sweep (batch deletion-request creation over one version)
 # --------------------------------------------------------------------------- #
 
 
-# Process-local exclusion of concurrent sweeps of one version's snapshots. The
-# lock is taken by the endpoint's sweep guard before the request connection is
-# opened and released after the transaction commits, so a concurrent sweep
-# meets a held lock wherever it starts and is rejected with a 409 instead of
-# waiting (mirrors the impact cache repair lock; FastAPI runs this synchronous
-# endpoint in one process's threadpool).
-_retention_sweep_locks: dict[tuple[str, int], threading.Lock] = {}
-_retention_sweep_locks_guard = threading.Lock()
+# One process-local lock per version gates every operation that moves the
+# version's deletion state: a request recheck, the batch retention sweep and a
+# request confirmation. Confirmations and the admin operations acquire it with
+# different sharing rules (a reader/writer lock without waiting on either
+# side — every contended acquisition fails fast):
+#
+# * A confirmation enters as a shared holder: two confirmations (of different
+#   snapshots) are both admitted and then serialized at the database by their
+#   waiting ``BEGIN IMMEDIATE`` transactions, so each appends its deletion
+#   proof from the committed chain tail and the per-version sequence stays
+#   continuous.
+# * A recheck or sweep enters as the exclusive holder: it is admitted only
+#   while no confirmation and no other admin operation is active, so it has a
+#   single winner and a concurrent confirmation is the loser (409) as well.
+# * A confirmation arriving while an admin operation is active likewise fails
+#   fast instead of queuing behind it, preserving the recheck/sweep
+#   single-winner race semantics.
+#
+# The fail-fast ``BEGIN IMMEDIATE`` (busy timeout zero) of the admin
+# operations extends the same rules to writers of another process;
+# confirmations wait for the SQLite write lock and rely on their post-lock
+# re-reads and the proof chain's UNIQUE sequence.
+class _VersionRetentionLock:
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+        self._admin_active = False
+        self._active_confirms = 0
+
+    def try_acquire_admin(self) -> bool:
+        """Acquire exclusively for a recheck/sweep; fail fast when busy."""
+        with self._mutex:
+            if self._admin_active or self._active_confirms:
+                return False
+            self._admin_active = True
+            return True
+
+    def try_acquire_confirm(self) -> bool:
+        """Acquire a shared confirmation slot; fail fast behind an admin op."""
+        with self._mutex:
+            if self._admin_active:
+                return False
+            self._active_confirms += 1
+            return True
+
+    def release_admin(self) -> None:
+        with self._mutex:
+            self._admin_active = False
+
+    def release_confirm(self) -> None:
+        with self._mutex:
+            self._active_confirms -= 1
 
 
-def retention_sweep_lock(dataset_name: str, version_number: int) -> threading.Lock:
-    """Process-local exclusion lock of one version's retention sweep."""
+_retention_version_locks: dict[tuple[str, int], _VersionRetentionLock] = {}
+_retention_version_locks_guard = threading.Lock()
+
+
+def version_retention_lock(
+    dataset_name: str, version_number: int
+) -> _VersionRetentionLock:
+    """Process-local lock gating one version's deletion-state writes."""
     key = (dataset_name, version_number)
-    with _retention_sweep_locks_guard:
-        lock = _retention_sweep_locks.get(key)
+    with _retention_version_locks_guard:
+        lock = _retention_version_locks.get(key)
         if lock is None:
-            lock = threading.Lock()
-            _retention_sweep_locks[key] = lock
+            lock = _VersionRetentionLock()
+            _retention_version_locks[key] = lock
         return lock
 
 
