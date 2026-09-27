@@ -1012,6 +1012,23 @@ class CrossVersionSnapshotDiffResponse(BaseModel):
     removed: list[SnapshotDiffEntry]
 
 
+# Cross-version time-travel snapshot diff: each side names a schema version
+# and a timestamp, and the newest snapshot of that version created not later
+# than the timestamp is compared. Field-definition changes and the projected
+# row multiset reuse the cross-version snapshot-id comparison exactly; the
+# timestamps echo the submitted query values verbatim.
+class CrossVersionSnapshotAtDiffResponse(BaseModel):
+    from_timestamp: str
+    to_timestamp: str
+    from_snapshot_id: int
+    to_snapshot_id: int
+    from_version: int
+    to_version: int
+    field_changes: list[CrossVersionSnapshotFieldChange]
+    added: list[SnapshotDiffEntry]
+    removed: list[SnapshotDiffEntry]
+
+
 # --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #

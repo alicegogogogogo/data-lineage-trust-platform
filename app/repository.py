@@ -6267,6 +6267,162 @@ def diff_cross_version_snapshots(
     }
 
 
+# The only query parameters accepted by the cross-version time diff endpoint.
+_CROSS_VERSION_AT_DIFF_PARAMETERS = frozenset(
+    {"from_version", "from", "to_version", "to"}
+)
+
+
+def _parse_version_query_value(raw: str, parameter: str) -> int:
+    """Strict positive-integer parse of a version query parameter (422)."""
+    if not raw.isdigit():
+        raise RequestInvalidError(
+            f"Query parameter '{parameter}' must be a positive integer"
+        )
+    value = int(raw)
+    if value < 1:
+        raise RequestInvalidError(
+            f"Query parameter '{parameter}' must be a positive integer"
+        )
+    return value
+
+
+def diff_cross_version_snapshots_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    raw_from_version: str | None,
+    raw_from: str | None,
+    raw_to_version: str | None,
+    raw_to: str | None,
+    from_version_values: tuple[str, ...] = (),
+    from_values: tuple[str, ...] = (),
+    to_version_values: tuple[str, ...] = (),
+    to_values: tuple[str, ...] = (),
+    query_keys: tuple[str, ...] = (),
+    body: bytes = b"",
+) -> dict:
+    """Read-only cross-version diff between the snapshots selected at two times.
+
+    Each side names a schema version (``from_version``/``to_version``, either
+    order — the from side is the baseline and the to side the target) and a
+    timestamp (``from``/``to``); the newest snapshot of that version created
+    not later than the timestamp is selected, exactly as the same-version
+    time lookup, so the target time may be earlier than the baseline time.
+    The field-definition changes and the row multiset after projection onto
+    the shared field names are computed with the exact semantics of the
+    cross-version snapshot-id comparison.
+
+    The path dataset resolves first (404). The two version parameters are
+    then parsed just enough to resolve the versions — a missing, repeated or
+    non-integer value is a 422, an unknown version a 404 and equal versions a
+    422 — all ahead of every remaining shape check: any request body bytes
+    (whitespace-only included), an unknown or repeated query parameter and a
+    missing/blank, unparseable or timezone-less ``from``/``to`` are 422s.
+    Only afterwards are the snapshots selected; a side without a snapshot at
+    or before its time is a 404. The comparison only reads: no snapshot, row,
+    field definition or privacy trail is ever written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    if len(from_version_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'from_version' must be provided exactly once"
+        )
+    if len(to_version_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'to_version' must be provided exactly once"
+        )
+    if raw_from_version is None or not raw_from_version:
+        raise RequestInvalidError(
+            "Query parameter 'from_version' is required and must be a "
+            "positive integer"
+        )
+    if raw_to_version is None or not raw_to_version:
+        raise RequestInvalidError(
+            "Query parameter 'to_version' is required and must be a "
+            "positive integer"
+        )
+    from_version_number = _parse_version_query_value(
+        raw_from_version, "from_version"
+    )
+    to_version_number = _parse_version_query_value(raw_to_version, "to_version")
+
+    from_version_row = _require_schema_version(conn, dataset, from_version_number)
+    to_version_row = _require_schema_version(conn, dataset, to_version_number)
+
+    if from_version_row["id"] == to_version_row["id"]:
+        raise RequestInvalidError(
+            "Both sides name the same schema version; compare same-version "
+            "snapshots through the snapshot time diff endpoint"
+        )
+
+    # Any request body bytes are a shape error, including a body that is only
+    # whitespace (truthiness, not a strip, so pure-whitespace bytes reject too).
+    if body:
+        raise RequestInvalidError(
+            "The cross-version snapshot time diff endpoint does not accept a "
+            "request body"
+        )
+    unknown_keys = sorted(set(query_keys) - _CROSS_VERSION_AT_DIFF_PARAMETERS)
+    if unknown_keys:
+        raise RequestInvalidError(
+            "Unknown query parameter(s): " + ", ".join(unknown_keys)
+        )
+    if len(from_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'from' must be provided exactly once"
+        )
+    if len(to_values) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'to' must be provided exactly once"
+        )
+    if raw_from is None or not raw_from:
+        raise RequestInvalidError(
+            "Query parameter 'from' is required and must be an ISO-8601 date-time"
+        )
+    if raw_to is None or not raw_to:
+        raise RequestInvalidError(
+            "Query parameter 'to' is required and must be an ISO-8601 date-time"
+        )
+    from_target = _parse_diff_timestamp(raw_from, "from")
+    to_target = _parse_diff_timestamp(raw_to, "to")
+
+    from_row = _select_snapshot_at(conn, from_version_row["id"], from_target)
+    if from_row is None:
+        raise NotFoundError(
+            f"No snapshot of version {from_version_number} of dataset "
+            f"'{dataset_name}' exists at or before the 'from' timestamp"
+        )
+    to_row = _select_snapshot_at(conn, to_version_row["id"], to_target)
+    if to_row is None:
+        raise NotFoundError(
+            f"No snapshot of version {to_version_number} of dataset "
+            f"'{dataset_name}' exists at or before the 'to' timestamp"
+        )
+
+    from_fields = _version_field_definitions(conn, from_version_row["id"])
+    to_fields = _version_field_definitions(conn, to_version_row["id"])
+    field_changes = _cross_version_field_changes(from_fields, to_fields)
+
+    common_fields = set(from_fields) & set(to_fields)
+    from_rows = _project_rows_to_fields(json.loads(from_row["rows"]), common_fields)
+    to_rows = _project_rows_to_fields(json.loads(to_row["rows"]), common_fields)
+    added, removed = _row_multiset_diff(from_rows, to_rows)
+
+    return {
+        "from_timestamp": raw_from,
+        "to_timestamp": raw_to,
+        "from_snapshot_id": from_row["id"],
+        "to_snapshot_id": to_row["id"],
+        "from_version": from_version_row["version"],
+        "to_version": to_version_row["version"],
+        "field_changes": field_changes,
+        "added": added,
+        "removed": removed,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #
