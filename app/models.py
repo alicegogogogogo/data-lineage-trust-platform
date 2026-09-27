@@ -929,6 +929,22 @@ class SnapshotResponse(SnapshotMetadata):
     rows: list[dict[str, Any]]
 
 
+# Read-only content-fingerprint verification of one snapshot: exactly these
+# keys, in this order. ``stored_hash`` is the SHA-256 fingerprint written
+# atomically with the snapshot at creation, ``computed_hash`` the digest of
+# the rows currently persisted and ``valid`` true exactly while both agree.
+# Both verdicts are a normal 200; the document is serialized deterministically
+# (compact JSON, trailing newline).
+class SnapshotVerifyResponse(BaseModel):
+    dataset: str
+    version: int
+    snapshot_id: int
+    row_count: int
+    stored_hash: str
+    computed_hash: str
+    valid: bool
+
+
 # Role-masked time-travel read of a snapshot. The response names the selected
 # snapshot (`snapshot_id` and its `created_at`) and carries an order-preserving
 # copy of its rows masked exactly as the row-submission privacy view would.

@@ -15,6 +15,7 @@ from typing import Any
 
 from app.db import db_session
 from app.errors import ConflictError, NotFoundError, RequestInvalidError
+from app.fingerprint import snapshot_content_hash
 from app.models import ERROR_FIELD_UNSET, FieldSpec
 
 
@@ -5290,12 +5291,15 @@ def create_snapshot(
 
     created_at = utc_now_iso()
     # Re-serializing stores an independent deep copy of the JSON values; list
-    # order and the received object key order are both preserved.
+    # order and the received object key order are both preserved. The content
+    # fingerprint of the same row sequence is computed now and written in the
+    # same statement, so the snapshot and its stored hash commit atomically.
     stored_rows = json.dumps(rows)
+    content_hash = snapshot_content_hash(rows)
     cursor = conn.execute(
-        "INSERT INTO snapshots (version_id, row_count, rows, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (version_row["id"], len(rows), stored_rows, created_at),
+        "INSERT INTO snapshots (version_id, row_count, rows, content_hash, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (version_row["id"], len(rows), stored_rows, content_hash, created_at),
     )
     row = conn.execute(
         "SELECT id, row_count, created_at FROM snapshots WHERE id = ?",
@@ -5322,7 +5326,7 @@ def _get_scoped_snapshot_row(
     conn: sqlite3.Connection, version_id: int, snapshot_id: int
 ) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT id, version_id, row_count, rows, created_at FROM snapshots "
+        "SELECT id, version_id, row_count, rows, content_hash, created_at FROM snapshots "
         "WHERE version_id = ? AND id = ?",
         (version_id, snapshot_id),
     ).fetchone()
@@ -5348,7 +5352,58 @@ def get_snapshot(
     return result
 
 
-def _parse_at_timestamp(raw: str) -> datetime:
+def verify_snapshot(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only content-fingerprint verification of one persisted snapshot.
+
+    The fingerprint stored at creation is compared with a fresh digest of the
+    rows currently persisted: both match while the saved row sequence is
+    intact and disagree once any saved row is changed, added, removed or
+    replaced. Both outcomes return a normal result (the caller renders 200);
+    only an unknown dataset, version or snapshot is a 404, checked ahead of
+    every request-shape check. Any request body bytes (whitespace-only
+    included) or any query parameter are a 422. The verification only reads
+    the snapshot and its rows and never writes or modifies either.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    row = _get_scoped_snapshot_row(conn, version_row["id"], snapshot_id)
+    if row is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+
+    # Any request body bytes are a shape error, including a body that is only
+    # whitespace (truthiness, not a strip, so pure-whitespace bytes reject too).
+    if body:
+        raise RequestInvalidError(
+            "The snapshot verification endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot verification endpoint does not accept query parameters"
+        )
+
+    stored_hash = row["content_hash"]
+    computed_hash = snapshot_content_hash(json.loads(row["rows"]))
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "snapshot_id": row["id"],
+        "row_count": row["row_count"],
+        "stored_hash": stored_hash,
+        "computed_hash": computed_hash,
+        "valid": stored_hash == computed_hash,
+    }
     try:
         parsed = datetime.fromisoformat(raw)
     except (TypeError, ValueError) as exc:
@@ -5390,6 +5445,21 @@ def _select_snapshot_at(
         "SELECT id, version_id, row_count, rows, created_at FROM snapshots WHERE id = ?",
         (match_id,),
     ).fetchone()
+
+
+def _parse_at_timestamp(raw: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must be an ISO-8601 date-time"
+        ) from exc
+    # A trailing timezone designator (offset or 'Z') is mandatory.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must include a timezone"
+        )
+    return parsed
 
 
 def get_snapshot_at(

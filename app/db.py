@@ -8,11 +8,14 @@ in process memory, which keeps persisted data available across restarts.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+from app.fingerprint import snapshot_content_hash
 
 DEFAULT_DB_PATH = "data/lineage.db"
 
@@ -250,11 +253,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS snapshots (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        version_id INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
-        row_count  INTEGER NOT NULL CHECK (row_count >= 0),
-        rows       TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id   INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        row_count    INTEGER NOT NULL CHECK (row_count >= 0),
+        rows         TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at   TEXT NOT NULL
     )
     """,
     """
@@ -459,6 +463,29 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 )
 
 
+def _migrate_snapshot_content_hash(conn: sqlite3.Connection) -> None:
+    """Backfill the snapshot content fingerprint for pre-existing databases.
+
+    Databases created before the fingerprint column existed are upgraded in
+    place: the column is added (idempotently) and every snapshot saved earlier
+    receives the fingerprint of its stored rows, so verification works for
+    them exactly as for newly created snapshots.
+    """
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")
+    }
+    if "content_hash" not in columns:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN content_hash TEXT")
+    missing = conn.execute(
+        "SELECT id, rows FROM snapshots WHERE content_hash IS NULL"
+    ).fetchall()
+    for row in missing:
+        conn.execute(
+            "UPDATE snapshots SET content_hash = ? WHERE id = ?",
+            (snapshot_content_hash(json.loads(row["rows"])), row["id"]),
+        )
+
+
 def database_path() -> Path:
     return Path(os.environ.get("DATA_LINEAGE_DB", DEFAULT_DB_PATH))
 
@@ -473,6 +500,7 @@ def _connect() -> sqlite3.Connection:
     # request works against an initialized database file.
     for statement in SCHEMA_STATEMENTS:
         conn.execute(statement)
+    _migrate_snapshot_content_hash(conn)
     # Establish every version's sequence high-water before any cleanup-aware
     # code can delete records: at this point the surviving maximum equals the
     # historical maximum, so seeding here (and INSERT OR IGNORE on every later
