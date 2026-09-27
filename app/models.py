@@ -949,6 +949,47 @@ class SnapshotResponse(SnapshotMetadata):
     rows: list[dict[str, Any]]
 
 
+# One audited snapshot and the status of its diff-cache record: ``cached``
+# (the record equals the canonical form recomputed from the extant rows),
+# ``missing`` (no record was ever built for the snapshot) or ``mismatch`` (the
+# stored record disagrees with the extant rows).
+class SnapshotDiffCacheAuditEntry(BaseModel):
+    snapshot_id: int
+    status: Literal["cached", "missing", "mismatch"]
+
+
+# The three per-status totals, keyed by the status name plus ``_count``.
+class SnapshotDiffCacheAuditCounts(BaseModel):
+    cached_count: int
+    missing_count: int
+    mismatch_count: int
+
+
+# Read-only consistency audit of one version's snapshot diff cache: exactly
+# these keys, in this order. Entries are sorted by snapshot id ascending and
+# the document is serialized deterministically (compact JSON, trailing
+# newline).
+class SnapshotDiffCacheAuditResponse(BaseModel):
+    dataset: str
+    version: int
+    entries: list[SnapshotDiffCacheAuditEntry]
+    counts: SnapshotDiffCacheAuditCounts
+
+
+# One lifecycle record of the version's snapshot diff cache trail:
+# ``sequence`` numbers the records of the version from 1 in write order,
+# ``cause`` is ``created`` (the snapshot wrote the cache) or ``deleted`` (a
+# confirmed deletion voided it), ``snapshot_id`` names the snapshot and
+# ``created_at`` is the timezone-bearing write time. The trail endpoint
+# returns these records as a bare JSON array (an empty version is ``[]``),
+# mirroring the snapshot deletion-proof collection.
+class SnapshotDiffCacheTrailEntry(BaseModel):
+    sequence: int
+    cause: Literal["created", "deleted"]
+    snapshot_id: int
+    created_at: str
+
+
 # Read-only content-fingerprint verification of one snapshot: exactly these
 # keys, in this order. ``stored_hash`` is the SHA-256 fingerprint written
 # atomically with the snapshot at creation, ``computed_hash`` the digest of

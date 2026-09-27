@@ -839,8 +839,13 @@ time. Snapshots (including their rows) survive restarts.
   computed at creation and written together with the rows in one atomic write,
   so it can later attest that the persisted rows are unchanged; the fingerprint
   is not part of the response, which stays `id`, `dataset`, `version`,
-  `created_at` and `row_count` (no rows). Unknown dataset/version → `404`;
-  malformed or non-object rows → `422` and nothing is written.
+  `created_at` and `row_count` (no rows). In the same transaction the service
+  also maintains the snapshot diff cache incrementally (see "Snapshot diff
+  cache" below): the canonical form of every row (key-sorted compact JSON text
+  in stored row order) and the sorted set of top-level field names are written
+  together with the snapshot, and one `created` record is appended to the
+  version's cache trail. Unknown dataset/version → `404`; malformed or
+  non-object rows → `422` and nothing is written.
 - `GET /datasets/{dataset}/versions/{version}/snapshots` — list snapshot
   metadata sorted by `id` ascending (no `rows`).
 - `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}` — return
@@ -1031,6 +1036,67 @@ time. Snapshots (including their rows) survive restarts.
   `row_count` set to the snapshot's actual row count) that also feeds the
   evaluation diff and anomaly detection. An empty snapshot is recorded with
   zero violations.
+
+### Snapshot diff cache (incremental, maintained at write time)
+
+Every snapshot carries an incrementally maintained diff-cache record: when a
+snapshot is created, the canonical form of its rows (one key-sorted compact
+JSON text per row, in stored row order) and the sorted set of its top-level
+field names are written atomically together with the snapshot and its
+fingerprint. The same-version snapshot diff, the bare and masked time diffs
+and the two cross-version snapshot comparisons synthesize their result from
+the cached canonical forms whenever both sides' records are complete and
+agree with the rows currently persisted; when a record is missing (a
+snapshot saved before the cache existed) or disagrees with the extant rows,
+that side is recomputed from the extant rows instead. The two paths produce
+the exact same comparison down to every byte, and the comparisons
+themselves stay fully read-only (the cache is never written, repaired or
+voided by a read). When a snapshot is confirmed deleted, its cache entry is
+voided in the same transaction that removes the snapshot and writes the
+deletion proof. The cache is persisted across restarts.
+
+- `GET /datasets/{dataset}/versions/{version}/snapshots/cache-audit` —
+  read-only consistency audit, appended one segment after the version
+  snapshot collection and accepting GET only. Every snapshot currently
+  stored in the version is compared against its cache record and the
+  canonical form recomputed fresh from the snapshot's extant rows; a
+  snapshot without a record is `missing` — a normal state, never an error —
+  a stored record equal to the recomputation is `cached` and any
+  disagreement is `mismatch`. Entries are sorted by snapshot id ascending
+  and the sort never depends on database order. The JSON document is
+  deterministic (fixed key order, compact whitespace, lowercase booleans,
+  exactly one trailing newline) with top-level keys `dataset`, `version`,
+  `entries` and `counts` in that order; each entry has exactly `snapshot_id`
+  and `status`, and `counts` gives `cached_count`, `missing_count` and
+  `mismatch_count`, each equal to the number of entries with that status. A
+  version without snapshots returns an empty entry list and all-zero
+  counts. The audit recomputes on every read and never writes: no cache
+  record is inserted, voided or repaired, so snapshot creation, reads,
+  diffs, masking, verification, retention cleanup and deletion behave
+  exactly as before. The endpoint takes no request body and no query
+  parameters; any body bytes — including whitespace-only ones — or any query
+  parameter are a `422`, checked only after the path dataset/version
+  resolves, so an unknown dataset or version is a `404` first, like the
+  existing snapshot reads.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/cache-trail` —
+  read-only cache lifecycle trail, appended one segment after the version
+  snapshot collection and accepting GET only. Every record of the version is
+  returned in ascending `sequence` order as a bare JSON array (an empty
+  version is `[]`, never an error); each record has exactly `sequence`,
+  `cause`, `snapshot_id` and `created_at` in that order. `sequence` numbers
+  the version's records from 1 in write order — continuous, never reused and
+  never skipped — `cause` is `created` (the snapshot wrote its cache record)
+  or `deleted` (a confirmed deletion voided it), `snapshot_id` names the
+  snapshot and `created_at` is the timezone-bearing write time (the snapshot
+  creation time for `created`, the deletion commit time for `deleted`). The
+  trail is append-only (the database itself refuses updates and deletes), is
+  written in the same transaction as the snapshot creation or confirmed
+  deletion it records and survives restarts unchanged. The read only reads
+  persisted records and never writes, voids or repairs anything. The
+  endpoint takes no request body and no query parameters; any body bytes
+  (whitespace-only included) or any query parameter are a `422`, checked
+  only after the path dataset/version resolves, so an unknown dataset or
+  version is a `404` first.
 
 ### Retention policies and lineage-aware snapshot deletion
 

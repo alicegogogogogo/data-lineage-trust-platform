@@ -5411,14 +5411,45 @@ def create_snapshot(
     # same statement, so the snapshot and its stored hash commit atomically.
     stored_rows = json.dumps(rows)
     content_hash = snapshot_content_hash(rows)
+    # The incremental diff cache is maintained at write time: the canonical
+    # form of every row and the top-level field-name set are computed once
+    # here, not on every comparison. Taking the database write lock up front
+    # makes the snapshot insert, the cache row and the per-version trail
+    # sequence allocation one atomic, cross-process-safe write.
+    canonical_keys, field_names = _canonical_snapshot_parts(rows)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        raise ConflictError(
+            "The snapshot is being written by another request; retry the request"
+        ) from exc
     cursor = conn.execute(
         "INSERT INTO snapshots (version_id, row_count, rows, content_hash, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (version_row["id"], len(rows), stored_rows, content_hash, created_at),
     )
+    snapshot_id = cursor.lastrowid
+    conn.execute(
+        "INSERT INTO snapshot_diff_cache ("
+        "snapshot_id, canonical_rows, field_names, created_at"
+        ") VALUES (?, ?, ?, ?)",
+        (
+            snapshot_id,
+            json.dumps(canonical_keys, ensure_ascii=False),
+            json.dumps(field_names, ensure_ascii=False),
+            created_at,
+        ),
+    )
+    _append_snapshot_diff_cache_trail(
+        conn,
+        version_id=version_row["id"],
+        cause="created",
+        snapshot_id=snapshot_id,
+        created_at=created_at,
+    )
     row = conn.execute(
         "SELECT id, row_count, created_at FROM snapshots WHERE id = ?",
-        (cursor.lastrowid,),
+        (snapshot_id,),
     ).fetchone()
     return _snapshot_metadata(row, dataset["name"], version_row["version"])
 
@@ -5557,7 +5588,8 @@ def _select_snapshot_at(
         return None
     match_id = max(eligible, key=lambda item: (item[0], item[1]))[1]
     return conn.execute(
-        "SELECT id, version_id, row_count, rows, created_at FROM snapshots WHERE id = ?",
+        "SELECT id, version_id, row_count, rows, content_hash, created_at "
+        "FROM snapshots WHERE id = ?",
         (match_id,),
     ).fetchone()
 
@@ -5776,7 +5808,8 @@ def _find_snapshot_globally(
 ) -> sqlite3.Row | None:
     return conn.execute(
         """
-        SELECT  s.id, s.version_id, s.row_count, s.rows, s.created_at,
+        SELECT  s.id, s.version_id, s.row_count, s.rows, s.content_hash,
+                s.created_at,
                 sv.version AS version_number,
                 d.name AS dataset_name
         FROM    snapshots s
@@ -5794,63 +5827,273 @@ def _canonical_row_text(row: Any) -> str:
     return json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _snapshot_multiset(
+def _canonical_snapshot_parts(
     rows: list[dict[str, Any]],
-) -> tuple[Counter, dict[str, dict[str, Any]]]:
-    counts: Counter = Counter()
-    examples: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        key = _canonical_row_text(row)
-        counts[key] += 1
-        examples.setdefault(key, row)
-    return counts, examples
+) -> tuple[list[str], list[str]]:
+    """Canonical form of one snapshot's rows and its top-level field names.
 
-
-def _row_multiset_diff(
-    from_rows: list[dict[str, Any]],
-    to_rows: list[dict[str, Any]],
-) -> tuple[list[dict], list[dict]]:
-    """Added/removed row multiset entries between two snapshot row lists.
-
-    Shares the exact comparison semantics of the snapshot-id diff: object key
-    order is irrelevant, array order and value types matter and duplicate rows
-    are counted. Returns the ``added`` (only/more often on the to side) and
-    ``removed`` entries, each ``{"row", "count"}`` sorted by the canonical
-    JSON text of the row.
+    Returns one key-sorted compact JSON text per row in stored row order and
+    the sorted set of field names appearing on at least one row. These are
+    the values maintained incrementally in ``snapshot_diff_cache`` at snapshot
+    creation time.
     """
-    from_counts, from_examples = _snapshot_multiset(from_rows)
-    to_counts, to_examples = _snapshot_multiset(to_rows)
+    canonical_rows = [_canonical_row_text(row) for row in rows]
+    field_names = sorted({name for row in rows for name in row})
+    return canonical_rows, field_names
 
+
+def _canonical_multiset_diff(
+    from_keys: list[str],
+    to_keys: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Added/removed multiset entries between two canonical-row sequences.
+
+    This is the single comparison core shared by every snapshot diff: object
+    key order is irrelevant (the row text is already key-sorted canonical
+    JSON), array order and value types are significant and duplicates are
+    counted. Both a diff synthesized from the incrementally maintained cache
+    and a diff recomputed fresh from stored rows feed this function the same
+    representation, so the two paths agree down to every byte.
+    """
+    from_counts = Counter(from_keys)
+    to_counts = Counter(to_keys)
     added_keys = sorted(key for key in to_counts if to_counts[key] > from_counts[key])
     removed_keys = sorted(key for key in from_counts if from_counts[key] > to_counts[key])
-
     added = [
-        {"row": to_examples[key], "count": to_counts[key] - from_counts[key]}
+        {"row": json.loads(key), "count": to_counts[key] - from_counts[key]}
         for key in added_keys
     ]
     removed = [
-        {"row": from_examples[key], "count": from_counts[key] - to_counts[key]}
+        {"row": json.loads(key), "count": from_counts[key] - to_counts[key]}
         for key in removed_keys
     ]
     return added, removed
 
 
-def _snapshot_field_sets(
-    from_rows: list[dict[str, Any]],
-    to_rows: list[dict[str, Any]],
+def _field_name_lists_diff(
+    from_fields: list[str],
+    to_fields: list[str],
 ) -> tuple[list[str], list[str]]:
-    """Top-level field-name sets of two snapshots.
-
-    A field counts when it appears on at least one row object of the side.
-    Names only on the to side are ``fields_added``; names only on the from
-    side are ``fields_removed``. Both lists sort by field name ascending.
-    """
-    from_fields = {name for row in from_rows for name in row}
-    to_fields = {name for row in to_rows for name in row}
+    """Top-level field-name set difference from two sorted field-name lists."""
     return (
-        sorted(to_fields - from_fields),
-        sorted(from_fields - to_fields),
+        sorted(set(to_fields) - set(from_fields)),
+        sorted(set(from_fields) - set(to_fields)),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot diff cache (incremental, maintained at snapshot write time)
+# --------------------------------------------------------------------------- #
+
+
+def _append_snapshot_diff_cache_trail(
+    conn: sqlite3.Connection,
+    *,
+    version_id: int,
+    cause: str,
+    snapshot_id: int,
+    created_at: str,
+) -> None:
+    """Append one lifecycle record to the version's diff-cache trail.
+
+    Runs inside the caller's open write transaction (a snapshot creation or a
+    confirmed snapshot deletion), so the cache event and its evidence commit
+    together with the snapshot write. Every caller holds a ``BEGIN
+    IMMEDIATE`` write lock, which serializes writers of one version, so the
+    per-version sequences stay continuous, never reused and never skipped
+    across processes.
+    """
+    sequence = conn.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+        "FROM snapshot_diff_cache_trail WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()["next_sequence"]
+    conn.execute(
+        "INSERT INTO snapshot_diff_cache_trail ("
+        "version_id, sequence, cause, snapshot_id, created_at"
+        ") VALUES (?, ?, ?, ?, ?)",
+        (version_id, sequence, cause, snapshot_id, created_at),
+    )
+
+
+def _snapshot_diff_parts(
+    conn: sqlite3.Connection, snapshot_row: sqlite3.Row
+) -> tuple[list[str], list[str]]:
+    """Canonical row texts and sorted field names of one snapshot for diffing.
+
+    When the incrementally maintained cache record is complete and equals the
+    canonical form of the rows currently persisted, the comparison is
+    synthesized from the cached record; when the record is missing (a
+    snapshot saved before the cache existed) or disagrees with the extant
+    rows, the canonical form is recomputed from those rows instead. Both
+    paths hand the diff core the exact same representation (one key-sorted
+    compact JSON text per row in stored row order and the sorted top-level
+    field-name set), so the synthesized diff and a fully recomputed diff are
+    identical down to every byte.
+    """
+    fresh_keys, fresh_fields = _canonical_snapshot_parts(
+        json.loads(snapshot_row["rows"])
+    )
+    cache_row = conn.execute(
+        "SELECT canonical_rows, field_names FROM snapshot_diff_cache "
+        "WHERE snapshot_id = ?",
+        (snapshot_row["id"],),
+    ).fetchone()
+    if cache_row is not None:
+        cached_keys = json.loads(cache_row["canonical_rows"])
+        cached_fields = json.loads(cache_row["field_names"])
+        if cached_keys == fresh_keys and cached_fields == fresh_fields:
+            return cached_keys, cached_fields
+    return fresh_keys, fresh_fields
+
+
+def _project_canonical_row_keys(
+    canonical_keys: list[str], common_fields: set[str]
+) -> list[str]:
+    """Project already-canonical row texts onto the common field names.
+
+    Each parsed row carries its keys in sorted order, so retaining only the
+    common fields keeps them sorted and re-serializing is the canonical
+    projection the cross-version diff computes fresh from the stored rows.
+    """
+    projected: list[str] = []
+    for key in canonical_keys:
+        row = json.loads(key)
+        projected.append(
+            _canonical_row_text(
+                {name: value for name, value in row.items() if name in common_fields}
+            )
+        )
+    return projected
+
+
+def audit_snapshot_diff_cache(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only per-snapshot audit of one version's diff cache.
+
+    Every snapshot currently stored in the version is checked in snapshot-id
+    order: a snapshot without a cache record is ``missing`` (a normal state
+    for a snapshot saved before the cache existed, never an error); a stored
+    record whose canonical rows or field names equal a fresh recomputation
+    from the extant rows is ``cached``; any disagreement is ``mismatch``.
+
+    The audit recomputes on every read and never writes: no cache record is
+    inserted, voided or repaired, so snapshot creation, reads, diffs,
+    masking and deletion behave exactly as before. The path dataset/version
+    resolves first (404); only afterwards are any request body bytes
+    (whitespace-only included) or any query parameter rejected with 422.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body:
+        raise RequestInvalidError(
+            "The snapshot diff cache audit endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot diff cache audit endpoint does not accept query parameters"
+        )
+
+    snapshot_rows = conn.execute(
+        "SELECT id, rows FROM snapshots WHERE version_id = ? ORDER BY id",
+        (version_row["id"],),
+    ).fetchall()
+    cache_rows = conn.execute(
+        "SELECT snapshot_id, canonical_rows, field_names "
+        "FROM snapshot_diff_cache"
+    ).fetchall()
+    cached_by_snapshot = {
+        row["snapshot_id"]: (
+            json.loads(row["canonical_rows"]),
+            json.loads(row["field_names"]),
+        )
+        for row in cache_rows
+    }
+
+    entries: list[dict] = []
+    counts = {"cached_count": 0, "missing_count": 0, "mismatch_count": 0}
+    for snapshot_row in snapshot_rows:
+        snapshot_id = snapshot_row["id"]
+        cached = cached_by_snapshot.get(snapshot_id)
+        if cached is None:
+            status = "missing"
+        else:
+            fresh_keys, fresh_fields = _canonical_snapshot_parts(
+                json.loads(snapshot_row["rows"])
+            )
+            status = (
+                "cached"
+                if cached == (fresh_keys, fresh_fields)
+                else "mismatch"
+            )
+        entries.append({"snapshot_id": snapshot_id, "status": status})
+        counts[f"{status}_count"] += 1
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_number,
+        "entries": entries,
+        "counts": counts,
+    }
+
+
+def list_snapshot_diff_cache_trail(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Read-only lifecycle trail of one version's snapshot diff cache.
+
+    Every record persisted for the version is returned in ascending sequence
+    order as a bare list (sequences number the version's records from 1 in
+    write order, so the sort never depends on database order); a version
+    without records returns an empty list, never an error. Each entry carries
+    exactly ``sequence``, ``cause`` (``created`` when the snapshot wrote the
+    cache or ``deleted`` when a confirmed deletion voided it),
+    ``snapshot_id`` and the timezone-bearing ``created_at`` write time.
+
+    The read only reads persisted records and never writes, voids or repairs
+    anything. The path dataset/version resolves first (404); only afterwards
+    are any request body bytes (whitespace-only included) or any query
+    parameter rejected with 422.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+
+    if body:
+        raise RequestInvalidError(
+            "The snapshot diff cache trail endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot diff cache trail endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT sequence, cause, snapshot_id, created_at "
+        "FROM snapshot_diff_cache_trail "
+        "WHERE version_id = ? ORDER BY sequence",
+        (version_row["id"],),
+    ).fetchall()
+    return [
+        {
+            "sequence": row["sequence"],
+            "cause": row["cause"],
+            "snapshot_id": row["snapshot_id"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
 
 
 def diff_snapshots(
@@ -5879,9 +6122,9 @@ def diff_snapshots(
                 "only be compared within the same dataset and version"
             )
 
-    from_rows = json.loads(from_row["rows"])
-    to_rows = json.loads(to_row["rows"])
-    added, removed = _row_multiset_diff(from_rows, to_rows)
+    from_keys, _from_fields = _snapshot_diff_parts(conn, from_row)
+    to_keys, _to_fields = _snapshot_diff_parts(conn, to_row)
+    added, removed = _canonical_multiset_diff(from_keys, to_keys)
 
     return {
         "from_snapshot_id": from_snapshot_id,
@@ -5984,10 +6227,10 @@ def diff_snapshots_at(
             f"'{dataset_name}' exists at or before the 'to' timestamp"
         )
 
-    from_rows = json.loads(from_row["rows"])
-    to_rows = json.loads(to_row["rows"])
-    added, removed = _row_multiset_diff(from_rows, to_rows)
-    fields_added, fields_removed = _snapshot_field_sets(from_rows, to_rows)
+    from_keys, from_fields = _snapshot_diff_parts(conn, from_row)
+    to_keys, to_fields = _snapshot_diff_parts(conn, to_row)
+    added, removed = _canonical_multiset_diff(from_keys, to_keys)
+    fields_added, fields_removed = _field_name_lists_diff(from_fields, to_fields)
 
     return {
         "from_timestamp": raw_from,
@@ -6199,14 +6442,14 @@ def view_masked_snapshot_diff_at(
         )
     assert from_row is not None and to_row is not None
 
-    from_rows = json.loads(from_row["rows"])
-    to_rows = json.loads(to_row["rows"])
-    # The raw rows decide the multiset membership, counts and ordering; the
-    # emitted entry rows are only rewritten by masking afterwards. The
-    # top-level field-name sets carry no values, so masking can never change
-    # them and they are computed exactly as in the bare-row time diff.
-    added, removed = _row_multiset_diff(from_rows, to_rows)
-    fields_added, fields_removed = _snapshot_field_sets(from_rows, to_rows)
+    from_keys, from_fields = _snapshot_diff_parts(conn, from_row)
+    to_keys, to_fields = _snapshot_diff_parts(conn, to_row)
+    # The raw canonical row keys decide the multiset membership, counts and
+    # ordering; the emitted entry rows (the canonical round-trip rows) are
+    # only rewritten by masking afterwards. The top-level field-name sets
+    # carry no values, so masking can never change them.
+    added, removed = _canonical_multiset_diff(from_keys, to_keys)
+    fields_added, fields_removed = _field_name_lists_diff(from_fields, to_fields)
 
     policies = _enabled_privacy_policies(conn, version_row["id"])
     # Hits follow the document's own deterministic order: added entries first,
@@ -6274,24 +6517,6 @@ def _cross_version_field_changes(
     return changes
 
 
-def _project_rows_to_fields(
-    rows: list[dict[str, Any]], common_fields: set[str]
-) -> list[dict[str, Any]]:
-    """Project rows onto fields defined on both versions.
-
-    Only the named fields participate: every other stored key is dropped,
-    and a field missing from a row is omitted (it never participates as a
-    null). Each projected row keeps the stored object's key order among the
-    retained fields, so — like the same-version diff — the emitted rows echo
-    the stored representation while equality still ignores key order (the
-    canonical multiset text sorts the keys).
-    """
-    return [
-        {name: value for name, value in row.items() if name in common_fields}
-        for row in rows
-    ]
-
-
 def diff_cross_version_snapshots(
     conn: sqlite3.Connection,
     dataset_name: str,
@@ -6308,9 +6533,12 @@ def diff_cross_version_snapshots(
     field-definition changes (see
     :func:`_cross_version_field_changes`) and then the row multisets after
     projection onto the field names both versions define (see
-    :func:`_project_rows_to_fields`), compared with the exact multiset
+    :func:`_project_canonical_row_keys`), compared with the exact multiset
     semantics of the same-version snapshot diff: object key order is
     irrelevant, array order and value types matter and duplicate rows count.
+    Both sides' canonical forms come from the incrementally maintained diff
+    cache when it matches the extant rows, otherwise from a fresh
+    recomputation; the comparison itself stays fully read-only.
 
     Unknown dataset or snapshot is a 404 checked ahead of every request-shape
     check; a snapshot owned by another dataset, or two snapshots of the same
@@ -6363,13 +6591,11 @@ def diff_cross_version_snapshots(
     field_changes = _cross_version_field_changes(base_fields, target_fields)
 
     common_fields = set(base_fields) & set(target_fields)
-    base_rows = _project_rows_to_fields(
-        json.loads(base_row["rows"]), common_fields
-    )
-    target_rows = _project_rows_to_fields(
-        json.loads(target_row["rows"]), common_fields
-    )
-    added, removed = _row_multiset_diff(base_rows, target_rows)
+    base_keys, _ = _snapshot_diff_parts(conn, base_row)
+    target_keys, _ = _snapshot_diff_parts(conn, target_row)
+    base_projected = _project_canonical_row_keys(base_keys, common_fields)
+    target_projected = _project_canonical_row_keys(target_keys, common_fields)
+    added, removed = _canonical_multiset_diff(base_projected, target_projected)
 
     return {
         "base_snapshot_id": base_row["id"],
@@ -6544,13 +6770,11 @@ def diff_cross_version_snapshots_at(
     field_changes = _cross_version_field_changes(from_fields, to_fields)
 
     common_fields = set(from_fields) & set(to_fields)
-    from_rows = _project_rows_to_fields(
-        json.loads(from_row["rows"]), common_fields
-    )
-    to_rows = _project_rows_to_fields(
-        json.loads(to_row["rows"]), common_fields
-    )
-    added, removed = _row_multiset_diff(from_rows, to_rows)
+    from_keys, _ = _snapshot_diff_parts(conn, from_row)
+    to_keys, _ = _snapshot_diff_parts(conn, to_row)
+    from_projected = _project_canonical_row_keys(from_keys, common_fields)
+    to_projected = _project_canonical_row_keys(to_keys, common_fields)
+    added, removed = _canonical_multiset_diff(from_projected, to_projected)
 
     return {
         "from_timestamp": raw_from,
@@ -6885,6 +7109,21 @@ def confirm_snapshot_deletion_request(
         confirmed_at=confirmed_at,
     )
     conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+    # The snapshot's incremental diff-cache entry is voided in the same
+    # transaction and one append-only 'deleted' trail record is appended, so
+    # the cache invalidation and its evidence commit atomically with the
+    # snapshot deletion (and the deletion proof). The cache-row delete is a
+    # no-op for a snapshot saved before the cache existed.
+    conn.execute(
+        "DELETE FROM snapshot_diff_cache WHERE snapshot_id = ?", (snapshot_id,)
+    )
+    _append_snapshot_diff_cache_trail(
+        conn,
+        version_id=version_row["id"],
+        cause="deleted",
+        snapshot_id=snapshot_id,
+        created_at=confirmed_at,
+    )
     updated = conn.execute(
         "SELECT * FROM snapshot_deletion_requests WHERE id = ?", (request_id,)
     ).fetchone()

@@ -261,6 +261,41 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at   TEXT NOT NULL
     )
     """,
+    # Incremental cache maintained alongside snapshot writes: one row per
+    # snapshot, written in the same transaction as the snapshot itself. It
+    # stores the canonical form of every row (one key-sorted compact JSON text
+    # per row, in stored row order) and the sorted set of top-level field
+    # names, so snapshot diffs can be synthesized without re-canonicalizing
+    # the stored rows. The snapshot link is intentionally a plain integer
+    # (mirroring snapshot_deletion_requests): a confirmed deletion removes the
+    # cache row explicitly inside its own write transaction. Snapshots saved
+    # before this table existed simply have no cache row (reported as missing
+    # by the cache audit); they are never backfilled.
+    """
+    CREATE TABLE IF NOT EXISTS snapshot_diff_cache (
+        snapshot_id    INTEGER PRIMARY KEY,
+        canonical_rows TEXT NOT NULL,
+        field_names    TEXT NOT NULL,
+        created_at     TEXT NOT NULL
+    )
+    """,
+    # Append-only trail of the snapshot diff cache lifecycle, one record per
+    # version: 'created' when a snapshot (and its cache row) is written and
+    # 'deleted' when a confirmed deletion voids the cache row. ``sequence``
+    # numbers one version's records from 1 in write order. The version link is
+    # a plain integer, mirroring snapshot_deletion_proofs: a trail record
+    # attests a cache event and is retained with the version.
+    """
+    CREATE TABLE IF NOT EXISTS snapshot_diff_cache_trail (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id  INTEGER NOT NULL,
+        sequence    INTEGER NOT NULL CHECK (sequence >= 1),
+        cause       TEXT NOT NULL CHECK (cause IN ('created', 'deleted')),
+        snapshot_id INTEGER NOT NULL,
+        created_at  TEXT NOT NULL,
+        UNIQUE (version_id, sequence)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS processing_tasks (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -535,6 +570,22 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON lineage_impact_cache_invalidations
     BEGIN
         SELECT RAISE(ABORT, 'impact cache invalidation records are immutable');
+    END
+    """,
+    # The snapshot diff cache trail is append-only as well: the database itself
+    # refuses updates and deletes so the cache history cannot be rewritten.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_snapshot_diff_cache_trail_no_update
+    BEFORE UPDATE ON snapshot_diff_cache_trail
+    BEGIN
+        SELECT RAISE(ABORT, 'snapshot diff cache trail records are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_snapshot_diff_cache_trail_no_delete
+    BEFORE DELETE ON snapshot_diff_cache_trail
+    BEGIN
+        SELECT RAISE(ABORT, 'snapshot diff cache trail records are immutable');
     END
     """,
 )

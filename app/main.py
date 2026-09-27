@@ -91,6 +91,8 @@ from app.models import (
     CrossVersionSnapshotAtDiffResponse,
     CrossVersionSnapshotDiffResponse,
     SnapshotDiffResponse,
+    SnapshotDiffCacheAuditResponse,
+    SnapshotDiffCacheTrailEntry,
     SnapshotMaskedViewResponse,
     SnapshotMetadata,
     SnapshotResponse,
@@ -1905,6 +1907,81 @@ def verify_snapshot_deletion_proofs(
     )
     payload = json.dumps(
         verification.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only consistency audit of the version's snapshot diff cache, declared
+# before the parametric "{snapshot_id}" routes so the literal "cache-audit"
+# segment is not parsed as a snapshot id. Every snapshot of the version is
+# compared against its incrementally maintained cache record and a fresh
+# recomputation from the extant rows; nothing is inserted, voided or repaired.
+# The body is serialized directly so the key order is fixed, the whitespace
+# compact and the document ends with exactly one newline.
+@app.get(
+    f"{SNAPSHOTS_PATH}/cache-audit",
+    response_model=SnapshotDiffCacheAuditResponse,
+)
+def audit_snapshot_diff_cache(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset/version is known, preserving the snapshot reads' 404-before-422
+    # precedence. The audit recomputes on every read and never writes, so the
+    # cache and every snapshot behavior are unaffected.
+    audit = SnapshotDiffCacheAuditResponse(
+        **repository.audit_snapshot_diff_cache(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        audit.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only lifecycle trail of the version's snapshot diff cache, likewise
+# declared before the "{snapshot_id}" routes and accepting GET only. The
+# records (one 'created' entry per snapshot write and one 'deleted' entry per
+# confirmed cache invalidation) are returned in sequence order as a bare JSON
+# array; an empty version is []. Same deterministic serialization as the
+# audit, and the read only reads persisted records.
+@app.get(
+    f"{SNAPSHOTS_PATH}/cache-trail",
+    response_model=list[SnapshotDiffCacheTrailEntry],
+)
+def list_snapshot_diff_cache_trail(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    records = [
+        SnapshotDiffCacheTrailEntry(**record)
+        for record in repository.list_snapshot_diff_cache_trail(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+    payload = json.dumps(
+        [record.model_dump(mode="json") for record in records],
         separators=(",", ":"),
         ensure_ascii=False,
     )
