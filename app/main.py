@@ -87,6 +87,7 @@ from app.models import (
     ConfirmedSnapshotDeletionRequest,
     SnapshotDeletionRequestCreate,
     SnapshotAtDiffResponse,
+    CrossVersionSnapshotAtDiffResponse,
     CrossVersionSnapshotDiffResponse,
     SnapshotDiffResponse,
     SnapshotMaskedViewResponse,
@@ -1936,6 +1937,63 @@ def diff_snapshots(
             conn, dataset_name, version, snapshot_id, other_snapshot_id
         )
     )
+
+
+# Read-only time-travel cross-version snapshot comparison, mounted directly
+# under the dataset and declared before the "{base_snapshot_id}" parametric
+# route below so the literal "at" segment is matched here rather than parsed
+# as a snapshot id. Each side names a schema version and a timestamp in the
+# query string and selects the newest snapshot of that version created not
+# later than it; the two selected snapshots are compared with the exact
+# semantics of the snapshot-id cross-version comparison. The body is
+# serialized directly (rather than through the default JSON response) so the
+# key order is fixed, the whitespace is compact and the document ends with
+# exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/snapshots/at/cross-diff",
+    response_model=CrossVersionSnapshotAtDiffResponse,
+)
+def diff_cross_version_snapshots_at(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    from_version: str | None = Query(default=None),
+    to_version: str | None = Query(default=None),
+    from_timestamp: str | None = Query(default=None, alias="from"),
+    to_timestamp: str | None = Query(default=None, alias="to"),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset resolves first (404); each parseable version number is
+    # resolved next (unknown version 404, equal versions 422), ahead of every
+    # request-shape problem — body bytes (whitespace included), unknown or
+    # repeated query parameters, missing/blank/unparseable version numbers,
+    # missing/blank, unparseable or timezone-less from/to (all 422). Only
+    # afterwards is each side's snapshot selected (a missing snapshot is a
+    # 404). The comparison is fully read-only.
+    diff = CrossVersionSnapshotAtDiffResponse(
+        **repository.diff_cross_version_snapshots_at(
+            conn,
+            dataset_name,
+            raw_from_version=from_version,
+            raw_to_version=to_version,
+            raw_from=from_timestamp,
+            raw_to=to_timestamp,
+            from_version_values=tuple(
+                request.query_params.getlist("from_version")
+            ),
+            to_version_values=tuple(request.query_params.getlist("to_version")),
+            from_values=tuple(request.query_params.getlist("from")),
+            to_values=tuple(request.query_params.getlist("to")),
+            query_keys=tuple(request.query_params.keys()),
+            body=body,
+        )
+    )
+    payload = json.dumps(
+        diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # Read-only cross-version snapshot comparison mounted directly under the

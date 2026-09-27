@@ -6267,6 +6267,189 @@ def diff_cross_version_snapshots(
     }
 
 
+# The only query parameters accepted by the cross-version snapshot time diff.
+_CROSS_VERSION_AT_DIFF_PARAMETERS = frozenset(
+    {"from_version", "from", "to_version", "to"}
+)
+
+
+def _probe_version_number(raw: str | None) -> int | None:
+    """Best-effort strict parse of a version query parameter.
+
+    Returns the positive integer only when ``raw`` is exactly its canonical
+    decimal text (no surrounding whitespace, sign, leading zeros or other
+    ``int()`` leniencies); anything else — missing, blank or unparseable —
+    returns ``None``. Those shape problems are reported as 422 by the strict
+    checks afterwards, but a usable number lets the unknown-version 404 run
+    ahead of every request-shape check.
+    """
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value < 1 or str(value) != raw:
+        return None
+    return value
+
+
+def diff_cross_version_snapshots_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    raw_from_version: str | None,
+    raw_to_version: str | None,
+    raw_from: str | None,
+    raw_to: str | None,
+    from_version_values: tuple[str, ...] = (),
+    to_version_values: tuple[str, ...] = (),
+    from_values: tuple[str, ...] = (),
+    to_values: tuple[str, ...] = (),
+    query_keys: tuple[str, ...] = (),
+    body: bytes = b"",
+) -> dict:
+    """Read-only cross-version comparison of the snapshots selected at two times.
+
+    Each side independently names a schema version and a timestamp and selects
+    the newest snapshot of that version created not later than its timestamp
+    (the same selection as the bare-row time lookup), so the two version
+    numbers may appear in either order and the to time may be earlier than the
+    from time. The two selected snapshots are then compared exactly like the
+    snapshot-id cross-version comparison: field-definition changes first (see
+    :func:`_cross_version_field_changes`), then the row multisets after
+    projection onto the field names both versions define (see
+    :func:`_project_rows_to_fields` and :func:`_row_multiset_diff`).
+
+    The path dataset resolves first (404). Each version number that parses as
+    a positive integer is then resolved (an unknown version is a 404) and two
+    equal version numbers are a 422, all ahead of every request-shape check:
+    any request body bytes (whitespace-only included), an unknown or repeated
+    query parameter, a missing/blank or unparseable version number and a
+    missing/blank, unparseable or timezone-less ``from``/``to`` are a 422
+    checked next. Only afterwards are the snapshots selected; a side without a
+    snapshot at or before its time is a 404. The comparison only reads: no
+    snapshot, row, field definition or privacy trail is ever written.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Resolve each side's version as soon as its number parses, before any
+    # shape check, so an unknown version stays a 404 ahead of a body, an
+    # unknown/repeated parameter or a malformed other parameter.
+    from_version_number = _probe_version_number(raw_from_version)
+    to_version_number = _probe_version_number(raw_to_version)
+    from_version_row = (
+        _require_schema_version(conn, dataset, from_version_number)
+        if from_version_number is not None
+        else None
+    )
+    to_version_row = (
+        _require_schema_version(conn, dataset, to_version_number)
+        if to_version_number is not None
+        else None
+    )
+
+    if (
+        from_version_number is not None
+        and from_version_number == to_version_number
+    ):
+        raise RequestInvalidError(
+            "Query parameters 'from_version' and 'to_version' must name two "
+            "different schema versions; compare same-version snapshots "
+            "through the snapshot time diff endpoint"
+        )
+
+    # Any request body bytes are a shape error, including a body that is only
+    # whitespace (truthiness, not a strip, so pure-whitespace bytes reject too).
+    if body:
+        raise RequestInvalidError(
+            "The cross-version snapshot time comparison endpoint does not "
+            "accept a request body"
+        )
+    unknown_keys = sorted(set(query_keys) - _CROSS_VERSION_AT_DIFF_PARAMETERS)
+    if unknown_keys:
+        raise RequestInvalidError(
+            "Unknown query parameter(s): " + ", ".join(unknown_keys)
+        )
+    for parameter, values in (
+        ("from_version", from_version_values),
+        ("to_version", to_version_values),
+        ("from", from_values),
+        ("to", to_values),
+    ):
+        if len(values) > 1:
+            raise RequestInvalidError(
+                f"Query parameter '{parameter}' must be provided exactly once"
+            )
+    if raw_from_version is None or not raw_from_version:
+        raise RequestInvalidError(
+            "Query parameter 'from_version' is required and must be a "
+            "positive integer"
+        )
+    if raw_to_version is None or not raw_to_version:
+        raise RequestInvalidError(
+            "Query parameter 'to_version' is required and must be a "
+            "positive integer"
+        )
+    if from_version_number is None:
+        raise RequestInvalidError(
+            "Query parameter 'from_version' must be a positive integer"
+        )
+    if to_version_number is None:
+        raise RequestInvalidError(
+            "Query parameter 'to_version' must be a positive integer"
+        )
+    if raw_from is None or not raw_from:
+        raise RequestInvalidError(
+            "Query parameter 'from' is required and must be an ISO-8601 date-time"
+        )
+    if raw_to is None or not raw_to:
+        raise RequestInvalidError(
+            "Query parameter 'to' is required and must be an ISO-8601 date-time"
+        )
+    from_target = _parse_diff_timestamp(raw_from, "from")
+    to_target = _parse_diff_timestamp(raw_to, "to")
+
+    assert from_version_row is not None and to_version_row is not None
+    from_row = _select_snapshot_at(conn, from_version_row["id"], from_target)
+    if from_row is None:
+        raise NotFoundError(
+            f"No snapshot of version {from_version_number} of dataset "
+            f"'{dataset_name}' exists at or before the 'from' timestamp"
+        )
+    to_row = _select_snapshot_at(conn, to_version_row["id"], to_target)
+    if to_row is None:
+        raise NotFoundError(
+            f"No snapshot of version {to_version_number} of dataset "
+            f"'{dataset_name}' exists at or before the 'to' timestamp"
+        )
+
+    from_fields = _version_field_definitions(conn, from_version_row["id"])
+    to_fields = _version_field_definitions(conn, to_version_row["id"])
+    field_changes = _cross_version_field_changes(from_fields, to_fields)
+
+    common_fields = set(from_fields) & set(to_fields)
+    from_rows = _project_rows_to_fields(
+        json.loads(from_row["rows"]), common_fields
+    )
+    to_rows = _project_rows_to_fields(
+        json.loads(to_row["rows"]), common_fields
+    )
+    added, removed = _row_multiset_diff(from_rows, to_rows)
+
+    return {
+        "from_timestamp": raw_from,
+        "to_timestamp": raw_to,
+        "from_snapshot_id": from_row["id"],
+        "to_snapshot_id": to_row["id"],
+        "from_version": from_version_number,
+        "to_version": to_version_number,
+        "field_changes": field_changes,
+        "added": added,
+        "removed": removed,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #
