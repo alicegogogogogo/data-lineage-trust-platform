@@ -1053,6 +1053,36 @@ class ConfirmedSnapshotDeletionRequest(SnapshotDeletionRequest):
     confirmed_at: str
 
 
+# Append-only proof of one confirmed snapshot deletion, appended to the
+# version's deletion-proof chain in the same transaction as the deletion:
+# exactly these keys, in this order. ``row_count`` and ``stored_hash`` are the
+# snapshot's persisted values at the deletion moment, ``reason`` is copied
+# from the confirmed request and ``confirmed_at`` is the deletion commit
+# instant. ``previous_hash`` is null on the first proof of a version and the
+# preceding proof's ``evidence_hash`` afterwards.
+class SnapshotDeletionProof(BaseModel):
+    sequence: int
+    snapshot_id: int
+    row_count: int
+    stored_hash: str
+    reason: str
+    confirmed_at: str
+    previous_hash: str | None
+    evidence_hash: str
+
+
+# Read-only re-verification of a version's whole deletion-proof chain:
+# exactly these keys, in this order. ``valid`` is true exactly while every
+# stored hash recomputes, the sequences are continuous from 1 and the links
+# are intact (an empty chain is valid); ``checked_count`` is the number of
+# proofs examined.
+class SnapshotDeletionProofsVerifyResponse(BaseModel):
+    dataset: str
+    version: int
+    valid: bool
+    checked_count: int
+
+
 class RetentionSweepEntry(BaseModel):
     snapshot_id: int
     request_id: int

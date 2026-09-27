@@ -6567,6 +6567,16 @@ def confirm_snapshot_deletion_request(
             f"pending requests can be confirmed"
         )
     conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+    # The deletion proof commits in the same transaction as the snapshot
+    # removal and the status change: either all three take effect or none, so
+    # a failed or losing confirmation never leaves a proof behind.
+    _append_snapshot_deletion_proof(
+        conn,
+        version_row["id"],
+        snapshot_row,
+        request_row["reason"],
+        confirmed_at,
+    )
     updated = conn.execute(
         "SELECT * FROM snapshot_deletion_requests WHERE id = ?", (request_id,)
     ).fetchone()
@@ -6693,6 +6703,209 @@ def recheck_snapshot_deletion_request(
         "SELECT * FROM snapshot_deletion_requests WHERE id = ?", (request_id,)
     ).fetchone()
     return _deletion_request_row_to_dict(updated)
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot deletion proofs (append-only per-version evidence chain)
+# --------------------------------------------------------------------------- #
+
+
+# Fields covered by a proof's evidence hash, in sorted order (mirrors
+# AUDIT_EVIDENCE_FIELDS): everything except ``confirmed_at`` and the
+# ``evidence_hash`` itself.
+DELETION_PROOF_EVIDENCE_FIELDS = (
+    "previous_hash",
+    "reason",
+    "row_count",
+    "sequence",
+    "snapshot_id",
+    "stored_hash",
+)
+
+
+def _deletion_proof_evidence_hash(proof: dict[str, Any]) -> str:
+    """SHA-256 over the canonical JSON of every hashed field.
+
+    The same digest scheme as the processing-run audit chain: keys are sorted
+    by Unicode code point, no whitespace is emitted and the text is UTF-8
+    encoded (non-ASCII characters are not escaped). ``confirmed_at`` and
+    ``evidence_hash`` itself are excluded.
+    """
+    payload = {field: proof[field] for field in DELETION_PROOF_EVIDENCE_FIELDS}
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _deletion_proof_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "sequence": row["sequence"],
+        "snapshot_id": row["snapshot_id"],
+        "row_count": row["row_count"],
+        "stored_hash": row["stored_hash"],
+        "reason": row["reason"],
+        "confirmed_at": row["confirmed_at"],
+        "previous_hash": row["previous_hash"],
+        "evidence_hash": row["evidence_hash"],
+    }
+
+
+def _append_snapshot_deletion_proof(
+    conn: sqlite3.Connection,
+    version_id: int,
+    snapshot_row: sqlite3.Row,
+    reason: str,
+    confirmed_at: str,
+) -> None:
+    """Append the proof of one confirmed deletion to the version's chain.
+
+    Runs inside the confirmation's write transaction (the caller holds the
+    write lock until commit), so the tail read and the insert see one
+    committed state and concurrent confirmations of the same version
+    serialize: sequences stay continuous, never duplicated and never skipped.
+    The row count and content fingerprint are the snapshot's persisted values
+    at the deletion moment, the reason is copied from the confirmed request
+    and the confirmation instant is the deletion commit timestamp.
+    """
+    tail = conn.execute(
+        "SELECT sequence, evidence_hash FROM snapshot_deletion_proofs "
+        "WHERE version_id = ? ORDER BY sequence DESC LIMIT 1",
+        (version_id,),
+    ).fetchone()
+    if tail is None:
+        sequence = 1
+        previous_hash = None
+    else:
+        sequence = tail["sequence"] + 1
+        previous_hash = tail["evidence_hash"]
+
+    proof = {
+        "sequence": sequence,
+        "snapshot_id": snapshot_row["id"],
+        "row_count": snapshot_row["row_count"],
+        "stored_hash": snapshot_row["content_hash"],
+        "reason": reason,
+        "previous_hash": previous_hash,
+    }
+    conn.execute(
+        "INSERT INTO snapshot_deletion_proofs ("
+        "version_id, sequence, snapshot_id, row_count, stored_hash, reason, "
+        "confirmed_at, previous_hash, evidence_hash"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            version_id,
+            sequence,
+            snapshot_row["id"],
+            snapshot_row["row_count"],
+            snapshot_row["content_hash"],
+            reason,
+            confirmed_at,
+            previous_hash,
+            _deletion_proof_evidence_hash(proof),
+        ),
+    )
+
+
+def _resolve_version_for_deletion_proofs(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    body: bytes,
+    query_keys: tuple[str, ...],
+    endpoint: str,
+) -> tuple[dict, sqlite3.Row]:
+    """Resolve the path and judge the request shape of a proof-chain read.
+
+    The path dataset and version resolve first (404); only afterwards are any
+    body bytes (whitespace-only included) or query parameters rejected (422),
+    preserving the 404-before-422 precedence of the neighboring reads.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body:
+        raise RequestInvalidError(
+            f"The snapshot deletion proofs {endpoint} endpoint does not "
+            f"accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            f"The snapshot deletion proofs {endpoint} endpoint does not "
+            f"accept query parameters"
+        )
+    return dataset, version_row
+
+
+def list_snapshot_deletion_proofs(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """List the version's deletion proofs in ascending sequence order.
+
+    Read-only: proofs are only ever appended by confirmed deletions. A
+    version without confirmed deletions returns an empty list, never an
+    error.
+    """
+    _dataset, version_row = _resolve_version_for_deletion_proofs(
+        conn, dataset_name, version_number, body, query_keys, "list"
+    )
+    rows = conn.execute(
+        "SELECT * FROM snapshot_deletion_proofs WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    return [_deletion_proof_row_to_dict(row) for row in rows]
+
+
+def verify_snapshot_deletion_proofs(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Re-verify the version's whole deletion-proof chain on every read.
+
+    Recomputes every ``evidence_hash`` and checks that ``sequence`` values
+    are continuous from ``1`` and each ``previous_hash`` equals the preceding
+    proof's ``evidence_hash`` (the first must be null). A rewritten or broken
+    chain reports ``valid`` false instead of raising; an empty chain is valid
+    with a zero ``checked_count``. Nothing is written.
+    """
+    dataset, version_row = _resolve_version_for_deletion_proofs(
+        conn, dataset_name, version_number, body, query_keys, "verify"
+    )
+    rows = conn.execute(
+        "SELECT * FROM snapshot_deletion_proofs WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+
+    valid = True
+    expected_sequence = 1
+    previous_hash: str | None = None
+    for row in rows:
+        proof = _deletion_proof_row_to_dict(row)
+        if proof["sequence"] != expected_sequence:
+            valid = False
+        if proof["previous_hash"] != previous_hash:
+            valid = False
+        if _deletion_proof_evidence_hash(proof) != proof["evidence_hash"]:
+            valid = False
+        previous_hash = proof["evidence_hash"]
+        expected_sequence += 1
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "valid": valid,
+        "checked_count": len(rows),
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -81,6 +81,8 @@ from app.models import (
     SchemaVersion,
     SchemaVersionCreate,
     SnapshotCreate,
+    SnapshotDeletionProof,
+    SnapshotDeletionProofsVerifyResponse,
     SnapshotDeletionRequest,
     ConfirmedSnapshotDeletionRequest,
     SnapshotDeletionRequestCreate,
@@ -1790,6 +1792,81 @@ def masked_snapshot_diff_at_get_not_allowed() -> JSONResponse:
         status_code=405,
         headers={"Allow": "POST"},
     )
+
+
+# Append-only deletion-proof chain of the version, appended one segment after
+# the version's snapshot collection. Declared before the "/{snapshot_id}"
+# route so the literal "deletion-proofs" segment is matched here rather than
+# parsed as a snapshot id (mirrors the "/at" routes). One proof is appended in
+# the same transaction as every confirmed deletion; both endpoints are
+# read-only. The body is serialized directly (rather than through the default
+# JSON response) so the key order is fixed, the whitespace is compact and the
+# document ends with exactly one newline.
+@app.get(
+    f"{SNAPSHOTS_PATH}/deletion-proofs",
+    response_model=list[SnapshotDeletionProof],
+)
+def list_snapshot_deletion_proofs(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset/version is known, preserving 404 precedence (mirrors the
+    # snapshot verification endpoint).
+    proofs = [
+        SnapshotDeletionProof(**proof)
+        for proof in repository.list_snapshot_deletion_proofs(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    ]
+    payload = json.dumps(
+        [proof.model_dump(mode="json") for proof in proofs],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only re-verification of the whole chain, appended one segment after
+# the proof collection. The literal "verify" segment is declared before the
+# parametric snapshot routes for the same reason as "deletion-proofs".
+@app.get(
+    f"{SNAPSHOTS_PATH}/deletion-proofs/verify",
+    response_model=SnapshotDeletionProofsVerifyResponse,
+)
+def verify_snapshot_deletion_proofs(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Same 404-before-422 precedence and deterministic serialization as the
+    # proof list; a rewritten or broken chain reports "valid": false instead
+    # of an error, and an empty chain verifies with a zero count.
+    verification = SnapshotDeletionProofsVerifyResponse(
+        **repository.verify_snapshot_deletion_proofs(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        verification.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 @app.get(f"{SNAPSHOTS_PATH}/{{snapshot_id}}", response_model=SnapshotResponse)

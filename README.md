@@ -1129,6 +1129,50 @@ downstream fields. Policies and requests are persisted across restarts.
   bytes included) or any query parameter → `422`, and no rejection writes
   anything.
 
+#### Snapshot deletion proofs (append-only evidence chain)
+
+Every confirmed snapshot deletion appends one tamper-evident proof to the
+version's deletion-proof chain, committed in the same transaction as the
+snapshot removal and the request confirmation — a failed deletion, a rejected
+request or a confirmation that loses a concurrency race writes no proof at
+all. Proofs are append-only (the database rejects updates and deletes, and
+there are no mutating HTTP routes), numbered from `1` per version without
+gaps or reuse, linked through SHA-256 evidence hashes and persisted across
+restarts. Snapshot ids are never reused after deletion, and snapshots deleted
+before proofs existed are not backfilled and never appear in the chain.
+
+- `GET /datasets/{dataset}/versions/{version}/snapshots/deletion-proofs` —
+  list the version's proofs in ascending `sequence` order (empty when no
+  deletion was ever confirmed, never an error). Each proof has exactly
+  `sequence`, `snapshot_id`, `row_count`, `stored_hash`, `reason`,
+  `confirmed_at`, `previous_hash` and `evidence_hash` in that order:
+  `row_count` and `stored_hash` are the snapshot's persisted row count and
+  content fingerprint at the deletion moment, `reason` is copied from the
+  confirmed request, `confirmed_at` is the deletion commit instant,
+  `previous_hash` is `null` on the first proof and the preceding proof's
+  `evidence_hash` afterwards. The endpoint takes no request body and no query
+  parameters (`422`); unknown dataset/version → `404`, checked first. The
+  JSON document is deterministic (fixed key order, compact whitespace,
+  exactly one trailing newline).
+- `GET /datasets/{dataset}/versions/{version}/snapshots/deletion-proofs/verify` —
+  read-only re-verification of the whole chain, recomputed on every read:
+  every `evidence_hash` is recalculated, the `sequence` values must be
+  continuous from `1` and each `previous_hash` must equal the preceding
+  proof's `evidence_hash` (the first must be `null`). Returns the
+  deterministic document `{"dataset", "version", "valid", "checked_count"}`
+  (fixed key order, compact whitespace, lowercase booleans, exactly one
+  trailing newline). An intact chain returns `"valid": true`; a rewritten or
+  broken chain returns `"valid": false` rather than an error; an empty chain
+  is valid with a zero `checked_count`. Same `404`/`422` rules as the proof
+  list; nothing is ever written.
+
+A proof's `evidence_hash` uses the same digest scheme as the processing-run
+audit chain: the hexadecimal SHA-256 of a canonical JSON document built from
+every proof field except `confirmed_at` and `evidence_hash` itself
+(`sequence`, `snapshot_id`, `row_count`, `stored_hash`, `reason`,
+`previous_hash`), with keys sorted by Unicode code point, no insignificant
+whitespace and UTF-8 encoding (non-ASCII characters unescaped).
+
 ### Processing tasks
 
 A processing task is a named unit of work attached to a schema version; each

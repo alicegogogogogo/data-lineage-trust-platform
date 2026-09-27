@@ -339,6 +339,29 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     ON snapshot_deletion_requests (snapshot_id)
     WHERE status IN ('pending', 'blocked')
     """,
+    # Append-only deletion proofs: one record per confirmed snapshot deletion,
+    # written in the same transaction as the snapshot removal and the request
+    # confirmation. ``version_id`` and ``snapshot_id`` are plain integers
+    # (mirroring snapshot_deletion_requests): the snapshot row is gone by
+    # construction and the proof must survive it. ``sequence`` numbers the
+    # proofs of one version from 1 without gaps or reuse; ``previous_hash``
+    # links each proof to its predecessor's ``evidence_hash`` (null on the
+    # first), making the per-version chain tamper-evident.
+    """
+    CREATE TABLE IF NOT EXISTS snapshot_deletion_proofs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id    INTEGER NOT NULL,
+        sequence      INTEGER NOT NULL CHECK (sequence >= 1),
+        snapshot_id   INTEGER NOT NULL,
+        row_count     INTEGER NOT NULL CHECK (row_count >= 0),
+        stored_hash   TEXT NOT NULL,
+        reason        TEXT NOT NULL,
+        confirmed_at  TEXT NOT NULL,
+        previous_hash TEXT,
+        evidence_hash TEXT NOT NULL,
+        UNIQUE (version_id, sequence)
+    )
+    """,
     # A released or expired exception must survive the deletion of the snapshot
     # it named, so the snapshot link is intentionally a plain integer instead of
     # a cascading foreign key (mirroring snapshot_deletion_requests).
@@ -458,6 +481,23 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON privacy_view_access_records
     BEGIN
         SELECT RAISE(ABORT, 'privacy view access records are immutable');
+    END
+    """,
+    # Snapshot deletion proofs are append-only as well: the database itself
+    # refuses updates and deletes so the deletion evidence chain cannot be
+    # rewritten.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_snapshot_deletion_proofs_no_update
+    BEFORE UPDATE ON snapshot_deletion_proofs
+    BEGIN
+        SELECT RAISE(ABORT, 'snapshot deletion proofs are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_snapshot_deletion_proofs_no_delete
+    BEFORE DELETE ON snapshot_deletion_proofs
+    BEGIN
+        SELECT RAISE(ABORT, 'snapshot deletion proofs are immutable');
     END
     """,
 )
