@@ -1049,6 +1049,53 @@ class CrossVersionSnapshotAtDiffResponse(BaseModel):
     removed: list[SnapshotDiffEntry]
 
 
+# One audited snapshot and the status of its maintained diff cache record:
+# ``cached`` (the record matches the canonical form recomputed from the
+# currently persisted rows), ``missing`` (no record was ever written) or
+# ``mismatch`` (the stored record disagrees with the current rows).
+class SnapshotDiffCacheAuditEntry(BaseModel):
+    snapshot_id: int
+    status: Literal["cached", "missing", "mismatch"]
+
+
+# The three per-status totals, keyed by the status name plus ``_count``.
+class SnapshotDiffCacheAuditCounts(BaseModel):
+    cached_count: int
+    missing_count: int
+    mismatch_count: int
+
+
+# Read-only consistency audit of one version's snapshot diff cache: exactly
+# these keys, in this order. Entries are sorted by snapshot id ascending and
+# the document is serialized deterministically (compact JSON, trailing
+# newline).
+class SnapshotDiffCacheAuditResponse(BaseModel):
+    dataset: str
+    version: int
+    entries: list[SnapshotDiffCacheAuditEntry]
+    counts: SnapshotDiffCacheAuditCounts
+
+
+# One snapshot diff cache trail record: ``sequence`` numbers the version's
+# records from 1 in write order, ``cause`` is the trigger (``created`` for a
+# snapshot creation, ``deleted`` for a confirmed deletion invalidating the
+# cache) and ``created_at`` is the timezone-bearing write time.
+class SnapshotDiffCacheTrailEntry(BaseModel):
+    sequence: int
+    cause: Literal["created", "deleted"]
+    snapshot_id: int
+    created_at: str
+
+
+# Read-only trail of one version's snapshot diff cache: exactly these keys,
+# in this order. Entries are sorted by sequence ascending and the document is
+# serialized deterministically (compact JSON, trailing newline).
+class SnapshotDiffCacheTrailResponse(BaseModel):
+    dataset: str
+    version: int
+    entries: list[SnapshotDiffCacheTrailEntry]
+
+
 # --------------------------------------------------------------------------- #
 # Retention policies and lineage-aware snapshot deletion
 # --------------------------------------------------------------------------- #
