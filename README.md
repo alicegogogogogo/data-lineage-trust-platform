@@ -808,19 +808,52 @@ stable ids) persist across restarts.
 ### Row snapshots
 
 A row snapshot persistently records the rows of a schema version at one point in
-time. Snapshots (including their rows) survive restarts.
+time. Snapshots (including their rows) survive restarts. Each snapshot is
+stored together with a SHA-256 content fingerprint of its saved row sequence;
+the fingerprint is written atomically with the snapshot and can be checked with
+the read-only verification endpoint below.
 
 - `POST /datasets/{dataset}/versions/{version}/snapshots` — persist a snapshot.
   Body: `{"rows": [{...}, ...]}` where `rows` must be an array of JSON objects
   (it may be empty). The JSON values and the order of rows/object keys are deep
-  copied verbatim. Returns `201` with `id`, `dataset`, `version`,
-  `created_at` and `row_count` (no rows). Unknown dataset/version → `404`;
-  malformed or non-object rows → `422` and nothing is written.
+  copied verbatim, and a SHA-256 fingerprint of the saved row sequence is
+  recorded with the rows in one atomic write. Returns `201` with `id`,
+  `dataset`, `version`, `created_at` and `row_count` (no rows and no
+  fingerprint — that response shape is unchanged). Unknown dataset/version →
+  `404`; malformed or non-object rows → `422` and nothing is written.
 - `GET /datasets/{dataset}/versions/{version}/snapshots` — list snapshot
   metadata sorted by `id` ascending (no `rows`).
 - `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}` — return
   the metadata together with the saved `rows`. Unknown dataset/version/snapshot
   → `404`.
+- `GET /datasets/{dataset}/versions/{version}/snapshots/{snapshot_id}/verify` —
+  read-only content-fingerprint verification, appended one segment after the
+  single-snapshot read address and accepting GET only. On every read the
+  fingerprint is recomputed from the snapshot's currently stored rows and
+  compared with the fingerprint recorded when the snapshot was written; the
+  check never writes, modifies or deletes the snapshot or its rows. The JSON
+  document is deterministic (fixed key order, compact whitespace, lowercase
+  booleans, exactly one trailing newline) with the top-level keys `dataset`,
+  `version`, `snapshot_id`, `row_count`, `stored_hash`, `computed_hash` and
+  `valid` in that order. The hashes are 64-character lowercase SHA-256 hex
+  digests; `valid` is `true` when the two agree and `false` when the stored
+  rows no longer match the persisted fingerprint — both outcomes return `200`.
+  The fingerprint digests the saved row sequence as a JSON array in row order;
+  each object's keys are written sorted by Unicode code point (recursively),
+  the text has no superfluous whitespace, non-ASCII characters are not escaped
+  and the UTF-8 encoding is hashed. Array order and value types are
+  significant (`1`, `1.0`, `"1"` and `true` all differ), negative zero has its
+  own representation, and an empty snapshot is fingerprinted as `[]`; the same
+  rows produce the same value across process restarts, while any direct
+  modification, addition, deletion or replacement of saved rows changes the
+  computed hash and turns `valid` to `false`. Unknown dataset, version or
+  snapshot → `404`, checked before every request-shape check; any request body
+  bytes (whitespace-only included), any query parameter or any other
+  out-of-path control → `422`; every rejection writes nothing. Only the
+  snapshot and its rows are read — lineage, quality, privacy and processing
+  state are never consulted, and retention and deletion flows are unaffected.
+  Once a deletion confirmation removes a snapshot, its verification address
+  returns `404` as the snapshot read does.
 - `GET /datasets/{dataset}/versions/{version}/snapshots/at?timestamp=<ISO-8601>` —
   return the most recent snapshot whose `created_at` is not later than
   `timestamp`, including its rows. The timestamp must be a timezone-aware

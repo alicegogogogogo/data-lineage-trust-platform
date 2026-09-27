@@ -8,13 +8,35 @@ in process memory, which keeps persisted data available across restarts.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 DEFAULT_DB_PATH = "data/lineage.db"
+
+
+def canonical_snapshot_text(rows: Any) -> str:
+    """Deterministic JSON text of a saved snapshot row sequence.
+
+    The array is written in row order while every object's keys are sorted by
+    Unicode code point (``sort_keys`` recurses into nested objects); the text
+    carries no superfluous whitespace and non-ASCII characters are not
+    escaped. Array order and JSON value types stay significant (``1``,
+    ``1.0``, ``"1"`` and ``true`` differ) and negative zero serializes as
+    ``-0.0``, so the text of one row sequence is identical across processes.
+    """
+    return json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def snapshot_content_hash(rows: Any) -> str:
+    """SHA-256 hex digest of the canonical UTF-8 text of the row sequence."""
+    digest = hashlib.sha256(canonical_snapshot_text(rows).encode("utf-8"))
+    return digest.hexdigest()
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -250,11 +272,14 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS snapshots (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        version_id INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
-        row_count  INTEGER NOT NULL CHECK (row_count >= 0),
-        rows       TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id   INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        row_count    INTEGER NOT NULL CHECK (row_count >= 0),
+        rows         TEXT NOT NULL,
+        -- SHA-256 content fingerprint of the saved row sequence, written in
+        -- the same transaction as the rows so the two never disagree on disk.
+        content_hash TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL
     )
     """,
     """
@@ -473,6 +498,21 @@ def _connect() -> sqlite3.Connection:
     # request works against an initialized database file.
     for statement in SCHEMA_STATEMENTS:
         conn.execute(statement)
+    # Databases initialized before content fingerprints existed gain the
+    # column here; each already-persisted snapshot's fingerprint is backfilled
+    # once from its stored rows, so verification works for older snapshots too.
+    snapshot_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(snapshots)")
+    }
+    if "content_hash" not in snapshot_columns:
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+        )
+        for legacy in conn.execute("SELECT id, rows FROM snapshots"):
+            conn.execute(
+                "UPDATE snapshots SET content_hash = ? WHERE id = ?",
+                (snapshot_content_hash(json.loads(legacy["rows"])), legacy["id"]),
+            )
     # Establish every version's sequence high-water before any cleanup-aware
     # code can delete records: at this point the surviving maximum equals the
     # historical maximum, so seeding here (and INSERT OR IGNORE on every later

@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.db import db_session
+from app.db import db_session, snapshot_content_hash
 from app.errors import ConflictError, NotFoundError, RequestInvalidError
 from app.models import ERROR_FIELD_UNSET, FieldSpec
 
@@ -5290,12 +5290,16 @@ def create_snapshot(
 
     created_at = utc_now_iso()
     # Re-serializing stores an independent deep copy of the JSON values; list
-    # order and the received object key order are both preserved.
+    # order and the received object key order are both preserved. The content
+    # fingerprint of the saved row sequence is computed from the same deep
+    # copy and written in the same insert, so the rows and their hash always
+    # land together atomically.
     stored_rows = json.dumps(rows)
+    content_hash = snapshot_content_hash(rows)
     cursor = conn.execute(
-        "INSERT INTO snapshots (version_id, row_count, rows, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (version_row["id"], len(rows), stored_rows, created_at),
+        "INSERT INTO snapshots (version_id, row_count, rows, content_hash, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (version_row["id"], len(rows), stored_rows, content_hash, created_at),
     )
     row = conn.execute(
         "SELECT id, row_count, created_at FROM snapshots WHERE id = ?",
@@ -5322,8 +5326,8 @@ def _get_scoped_snapshot_row(
     conn: sqlite3.Connection, version_id: int, snapshot_id: int
 ) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT id, version_id, row_count, rows, created_at FROM snapshots "
-        "WHERE version_id = ? AND id = ?",
+        "SELECT id, version_id, row_count, rows, content_hash, created_at "
+        "FROM snapshots WHERE version_id = ? AND id = ?",
         (version_id, snapshot_id),
     ).fetchone()
 
@@ -5346,6 +5350,58 @@ def get_snapshot(
     result = _snapshot_metadata(row, dataset["name"], version_row["version"])
     result["rows"] = json.loads(row["rows"])
     return result
+
+
+def verify_snapshot(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    snapshot_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only content-fingerprint check of one persisted snapshot.
+
+    The stored fingerprint is compared against a fresh SHA-256 recomputation
+    over the currently stored row sequence (canonical JSON text, row order
+    kept, object keys code-point sorted). Nothing is written or changed — not
+    even when the two digests disagree; a mismatch is a normal ``200`` with
+    ``valid`` false.
+
+    The path dataset/version/snapshot resolves first (404); only afterwards
+    are any request body bytes (whitespace-only included) or query
+    parameters rejected (422), preserving the same 404-before-422 precedence
+    as the other parameterless snapshot reads.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    row = _get_scoped_snapshot_row(conn, version_row["id"], snapshot_id)
+    if row is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    if body:
+        raise RequestInvalidError(
+            "The snapshot verification endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot verification endpoint does not accept query parameters"
+        )
+
+    stored_rows = json.loads(row["rows"])
+    computed_hash = snapshot_content_hash(stored_rows)
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "snapshot_id": snapshot_id,
+        "row_count": row["row_count"],
+        "stored_hash": row["content_hash"],
+        "computed_hash": computed_hash,
+        "valid": row["content_hash"] == computed_hash,
+    }
 
 
 def _parse_at_timestamp(raw: str) -> datetime:

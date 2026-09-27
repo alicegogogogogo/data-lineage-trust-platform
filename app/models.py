@@ -929,6 +929,19 @@ class SnapshotResponse(SnapshotMetadata):
     rows: list[dict[str, Any]]
 
 
+# Read-only content-fingerprint verification of one snapshot. The fields are
+# exactly these, in this order, and the endpoint serializes the document
+# itself so the whitespace stays compact and the file ends with one newline.
+class SnapshotVerifyResponse(BaseModel):
+    dataset: str
+    version: int
+    snapshot_id: int
+    row_count: int
+    stored_hash: str
+    computed_hash: str
+    valid: bool
+
+
 # Role-masked time-travel read of a snapshot. The response names the selected
 # snapshot (`snapshot_id` and its `created_at`) and carries an order-preserving
 # copy of its rows masked exactly as the row-submission privacy view would.
