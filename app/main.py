@@ -73,6 +73,7 @@ from app.models import (
     QualityRuleEvaluationDiffResponse,
     QualityRuleEvaluationRecord,
     QualityGateResponse,
+    QualityGateExportResponse,
     RetentionPolicy,
     RetentionPolicyCreate,
     RetentionException,
@@ -925,6 +926,51 @@ def get_quality_gate_at(
     )
     payload = json.dumps(
         gate.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version quality gate export
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that returns the current quality gate state of every
+# schema version at once as verdicts and counts only; it never repeats the
+# per-version gate's reason details. The path carries only the dataset name;
+# there is no request body or query parameter.
+QUALITY_GATE_EXPORT_PATH = "/datasets/{dataset_name}/quality-gate-export"
+
+
+@app.get(
+    QUALITY_GATE_EXPORT_PATH,
+    response_model=QualityGateExportResponse,
+)
+def export_dataset_quality_gate(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset is known, preserving the same 404 precedence as the compliance
+    # exports. Recomputed on every read; no evaluation, anomaly record or
+    # gate verdict is ever written. The body is serialized directly (rather
+    # than through the default JSON response) so the key order is fixed, the
+    # whitespace is compact and the document ends with exactly one newline.
+    export = QualityGateExportResponse(
+        **repository.export_dataset_quality_gate(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        export.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

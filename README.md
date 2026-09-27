@@ -478,6 +478,37 @@ recorded for rules since disabled still count).
   (whitespace-only included), a missing, repeated, unparseable or
   timezone-less `timestamp`, or any other query parameter are a `422` that
   writes nothing.
+- `GET /datasets/{dataset}/quality-gate-export` — read-only cross-version
+  export of the dataset's whole quality gate state, computed fresh on every
+  read (no caching; nothing is written, modified or deleted, and no
+  evaluation, anomaly record or gate verdict is touched). The path carries
+  only the dataset name; the request takes no body and no query parameters —
+  any body bytes, including a purely whitespace or single-space body, or any
+  query parameter → `422`; an unknown dataset → `404`, checked before the
+  request shape, with the same 404-before-422 precedence as the compliance
+  exports. A dataset without schema versions returns `200` with an empty
+  `versions` array and all-zero totals, never an error. The JSON document is
+  deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"verdict":"fail","reason_count":1,"violation_row_count":2},{"version":2,"verdict":"undetermined","reason_count":0,"violation_row_count":null}],"totals":{"version_count":2,"failed_count":1,"reason_count":1,"violation_row_count":2}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions`, `totals` in that
+  order. `versions` is ordered by version number ascending and each entry has
+  exactly `version`, `verdict`, `reason_count` and `violation_row_count` in
+  that order. `verdict` is the current per-version gate verdict (one of
+  `pass`, `undetermined`, `fail`) under exactly the same computation as the
+  per-version gate read; `reason_count` is the number of reasons currently
+  lowering that verdict (the length of the per-version gate's reason list);
+  `violation_row_count` is the violation row count of the latest recorded
+  evaluation and is `null` — never omitted — when the version was never
+  evaluated. `totals` has exactly `version_count`, `failed_count`,
+  `reason_count` and `violation_row_count`: the number of version entries,
+  the number of versions whose verdict is `fail`, and the sums of the
+  per-version reason and violation row counts (null violation row counts
+  count as zero).
 
 ### Privacy policies
 
