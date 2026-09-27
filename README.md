@@ -171,7 +171,10 @@ schema version in a different (source) dataset.
 
   Target must match the path. Source and target datasets must differ and every
   referenced dataset/version/field must exist (`404` / `422` otherwise).
-  Submitting the same complete mapping twice returns `409`.
+  Submitting the same complete mapping twice returns `409`. The cached impacts
+  of the mapping's source field and of every field that can reach it are
+  invalidated; each dropped cache record leaves an append-only trace (see the
+  `cache-invalidations` endpoint below).
 - `DELETE /datasets/{dataset}/versions/{version}/lineage` — remove one
   registered mapping. Same address and same body shape as registration: the
   six locating fields name the complete mapping to delete and the body target
@@ -189,7 +192,9 @@ schema version in a different (source) dataset.
   exactly once (the loser gets `404` and changes nothing). The deletion is
   visible to every lineage read immediately and survives restarts; the cached
   impacts of the mapping's source field and of every field that can reach it
-  are invalidated exactly as on registration, unrelated entries are kept.
+  are invalidated exactly as on registration, unrelated entries are kept, and
+  each dropped cache record leaves an append-only trace (see the
+  `cache-invalidations` endpoint below).
 - `GET /datasets/{dataset}/versions/{version}/lineage` — return every target
   field (including fields without sources) together with its source references.
   Results are sorted by target field name, then source dataset name, source
@@ -248,6 +253,30 @@ schema version in a different (source) dataset.
   loser receiving `409` and changing nothing. Every rejection writes
   nothing; lineage registrations and deletions, impact queries, path
   explanations, source-path reads and the read-only audit are unaffected.
+- `GET /datasets/{dataset}/versions/{version}/lineage/impact/cache-invalidations`
+  — read-only invalidation trail of the version's impact cache, appended one
+  segment after the impact query address. Whenever a lineage mapping is
+  successfully registered or deleted, every invalidated field that actually
+  had a cache record leaves one append-only trace, filed under the cache
+  entry's own dataset and version (schema-version creation invalidation is
+  not traced). The JSON document is deterministic (fixed key order, compact
+  whitespace, exactly one trailing newline) with top-level keys `dataset`,
+  `version` and `entries` in that order. Each entry has exactly `sequence`,
+  `cause`, `field` and `created_at` in that order: `sequence` numbers the
+  version's traces from 1 in write order (continuous, never reused, assigned
+  under the write lock so concurrent registrations and deletions stay
+  gap-free), `cause` is `registered` or `deleted` after the mapping change
+  that triggered the invalidation, `field` is the version's own field whose
+  cache record was dropped and `created_at` is the timezone-bearing write
+  timestamp. Entries are returned in `sequence` order, never in database
+  natural order, and a version without traces returns an empty `entries`
+  array, never an error. The trail is append-only (the database refuses
+  updates and deletes), survives restarts and is only read here: the listing
+  never writes, invalidates or repairs any cache record. The endpoint takes
+  no request body and no query parameters; any body bytes (whitespace-only
+  included) or query parameter → `422`, and an unknown dataset or version →
+  `404`, with `404` taking precedence over `422` as in the impact query.
+  Failed registrations and deletions leave no trace.
 - `GET /datasets/{dataset}/versions/{version}/lineage/impact-paths?field=<field>` —
   read-only shortest-path explanation of the same impact, computed fresh on
   every read (no caching; nothing is written, and version definitions, lineage

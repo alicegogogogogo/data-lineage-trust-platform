@@ -845,7 +845,12 @@ def create_lineage_link(
 
     # The new edge can only extend the impact of fields that reach its source.
     _invalidate_impact_cache_for_upstream(
-        conn, source["name"], source_version, source_field, source_field_id
+        conn,
+        source["name"],
+        source_version,
+        source_field,
+        source_field_id,
+        cause="registered",
     )
 
     return {
@@ -1062,6 +1067,7 @@ def delete_lineage_link(
         payload["source_version"],
         payload["source_field"],
         source_field_id,
+        cause="deleted",
     )
 
     deleted = conn.execute(
@@ -1260,19 +1266,75 @@ def invalidate_impact_cache_for_dataset(
     )
 
 
+def _record_impact_cache_invalidations(
+    conn: sqlite3.Connection,
+    fields: list[tuple[str, int, str]],
+    cause: str,
+) -> None:
+    """Trace the invalidation of every listed field that has a cache record.
+
+    One append-only row is written per invalidated field with an existing
+    cache entry, filed under the cache entry's own dataset and version.
+    ``sequence`` continues each version's run from 1 with no gaps or reuse:
+    the caller always holds the database write lock (registration inserted
+    the link first, deletion began with ``BEGIN IMMEDIATE``), so concurrent
+    registrations and deletions serialize and the ``MAX(sequence)`` probe
+    below cannot interleave with another writer. Fields are processed in
+    sorted order, so a batch's sequences are assigned deterministically.
+    """
+    cached = [
+        (dataset, version, field)
+        for dataset, version, field in fields
+        if conn.execute(
+            "SELECT 1 FROM lineage_impact_cache "
+            "WHERE source_dataset = ? AND source_version = ? AND source_field = ?",
+            (dataset, version, field),
+        ).fetchone()
+        is not None
+    ]
+    if not cached:
+        return
+    written_at = utc_now_iso()
+    next_sequence: dict[tuple[str, int], int] = {}
+    for dataset, version, field in cached:
+        key = (dataset, version)
+        if key not in next_sequence:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+                "FROM lineage_impact_cache_invalidations "
+                "WHERE source_dataset = ? AND source_version = ?",
+                key,
+            ).fetchone()
+            next_sequence[key] = row["next_sequence"]
+        sequence = next_sequence[key]
+        next_sequence[key] = sequence + 1
+        conn.execute(
+            "INSERT INTO lineage_impact_cache_invalidations ("
+            "source_dataset, source_version, sequence, cause, field, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (dataset, version, sequence, cause, field, written_at),
+        )
+
+
 def _invalidate_impact_cache_for_upstream(
     conn: sqlite3.Connection,
     source_dataset: str,
     source_version: int,
     source_field: str,
     source_field_id: int,
+    *,
+    cause: str | None = None,
 ) -> None:
     """Invalidate cached impacts of the new link's source and its upstream.
 
     A new mapping ``source -> target`` only changes the impact result of
     fields that can reach ``source`` (``source`` itself included), so exactly
     those cached entries are dropped; unrelated entries are kept. The reverse
-    walk runs after the link was inserted so cycles are covered too.
+    walk runs after the link was inserted so cycles are covered too. When
+    ``cause`` is given ('registered' or 'deleted'), every dropped entry also
+    leaves an append-only invalidation trace under its own dataset and
+    version; schema-version creation invalidation passes no cause and is
+    never traced.
     """
     rows = conn.execute(
         """
@@ -1305,6 +1367,10 @@ def _invalidate_impact_cache_for_upstream(
             )
             queue.append(row["source_field_id"])
 
+    if cause is not None:
+        # Traced before the delete, while the doomed cache rows still exist
+        # to be counted; both steps commit or roll back together.
+        _record_impact_cache_invalidations(conn, sorted(upstream), cause)
     conn.executemany(
         "DELETE FROM lineage_impact_cache "
         "WHERE source_dataset = ? AND source_version = ? AND source_field = ?",
@@ -1580,6 +1646,71 @@ def repair_lineage_impact_cache(
         "version": version_number,
         "entries": entries,
         "counts": counts,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Lineage impact cache invalidation trail (read-only)
+# --------------------------------------------------------------------------- #
+
+
+def list_lineage_impact_cache_invalidations(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only listing of one version's impact cache invalidation trail.
+
+    Every successful lineage registration or deletion that dropped a cache
+    record of this version left one append-only trace per dropped field; the
+    traces are returned in ``sequence`` order (the per-version write order,
+    never the database's natural row order). A version without traces returns
+    an empty ``entries`` list, never an error.
+
+    The listing reads only persisted traces and never writes: no cache record
+    is inserted, invalidated or repaired and no trace is added, so impact
+    queries, the cache audit and the repair flow behave exactly as before.
+    The path dataset/version resolves first (404); only afterwards are any
+    request body bytes — whitespace-only included — or any query parameter
+    rejected with 422, preserving the impact query's 404-before-422
+    precedence.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    _require_schema_version(conn, dataset, version_number)
+
+    if body:
+        raise RequestInvalidError(
+            "The lineage impact cache invalidations endpoint does not accept "
+            "a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The lineage impact cache invalidations endpoint does not accept "
+            "query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT sequence, cause, field, created_at "
+        "FROM lineage_impact_cache_invalidations "
+        "WHERE source_dataset = ? AND source_version = ? "
+        "ORDER BY sequence",
+        (dataset["name"], version_number),
+    ).fetchall()
+    return {
+        "dataset": dataset["name"],
+        "version": version_number,
+        "entries": [
+            {
+                "sequence": row["sequence"],
+                "cause": row["cause"],
+                "field": row["field"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ],
     }
 
 

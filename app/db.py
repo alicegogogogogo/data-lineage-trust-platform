@@ -408,6 +408,26 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         dataset  TEXT NOT NULL
     )
     """,
+    # Append-only invalidation trail of the impact cache: whenever a lineage
+    # mapping is registered or deleted, every invalidated field that actually
+    # had a cache record leaves one row here, filed under the cache entry's
+    # own dataset and version (plain text keys, mirroring
+    # lineage_impact_cache). ``sequence`` numbers the traces of one version
+    # from 1 in write order; ``cause`` is 'registered' or 'deleted' after the
+    # mapping change that triggered the invalidation. Schema-version creation
+    # invalidation is deliberately not traced.
+    """
+    CREATE TABLE IF NOT EXISTS lineage_impact_cache_invalidations (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_dataset TEXT NOT NULL,
+        source_version INTEGER NOT NULL,
+        sequence       INTEGER NOT NULL CHECK (sequence >= 1),
+        cause          TEXT NOT NULL CHECK (cause IN ('registered', 'deleted')),
+        field          TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        UNIQUE (source_dataset, source_version, sequence)
+    )
+    """,
     # Audit records are an append-only proof chain: the database itself refuses
     # updates and deletes so the evidence history cannot be rewritten.
     """
@@ -500,6 +520,23 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON snapshot_deletion_proofs
     BEGIN
         SELECT RAISE(ABORT, 'snapshot deletion proofs are immutable');
+    END
+    """,
+    # Impact cache invalidation traces are append-only as well: the database
+    # itself refuses updates and deletes so the invalidation history cannot be
+    # rewritten.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_impact_cache_invalidations_no_update
+    BEFORE UPDATE ON lineage_impact_cache_invalidations
+    BEGIN
+        SELECT RAISE(ABORT, 'impact cache invalidation records are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_impact_cache_invalidations_no_delete
+    BEFORE DELETE ON lineage_impact_cache_invalidations
+    BEGIN
+        SELECT RAISE(ABORT, 'impact cache invalidation records are immutable');
     END
     """,
 )
