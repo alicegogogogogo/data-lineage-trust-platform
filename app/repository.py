@@ -8413,6 +8413,166 @@ def export_dataset_deletion_compliance(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version snapshot scale summary
+# --------------------------------------------------------------------------- #
+
+
+def get_dataset_snapshot_scale_summary(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset summary of the extant snapshots' scale.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry lists every snapshot currently existing in that
+    version by snapshot id ascending — id, the currently persisted row count
+    and the timezone-bearing write time — together with statistics over
+    exactly those snapshots: the snapshot count, the row-count total and the
+    minimum/maximum row counts and earliest/latest write times (the last
+    four are ``None`` for a version without snapshots; the keys are never
+    omitted). Confirmed-deleted snapshots are gone from the snapshots table
+    and therefore neither appear nor count toward any statistic. Write-time
+    ties are broken by snapshot id ascending, never by database order.
+
+    The whole-dataset ``totals`` give the number of versions and the overall
+    snapshot and row-count totals (each the sum of the per-version values),
+    while the minimum/maximum row counts and earliest/latest write times are
+    the overall values over every currently existing snapshot of the dataset
+    (all ``None`` when the dataset has no snapshot). A dataset without
+    schema versions yields an empty version list, zero totals and null
+    extremes, never an error.
+
+    The summary is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a snapshot, row, fingerprint, diff-cache
+    entry or deletion proof. Like the compliance exports, the dataset
+    resolves first (404); any request body bytes (whitespace-only included)
+    or any query parameter is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the compliance export reads.
+    if body:
+        raise RequestInvalidError(
+            "The snapshot scale summary endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot scale summary endpoint does not accept query parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        # Only currently existing snapshots: a confirmed deletion removes the
+        # snapshot row in the same transaction as the deletion proof, so no
+        # tombstone filter is needed. Explicit id ordering keeps the list
+        # independent of the database's natural row order.
+        snapshot_rows = conn.execute(
+            "SELECT id, row_count, created_at FROM snapshots "
+            "WHERE version_id = ? ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+        snapshots = [
+            {
+                "snapshot_id": row["id"],
+                "row_count": row["row_count"],
+                "created_at": row["created_at"],
+            }
+            for row in snapshot_rows
+        ]
+
+        if snapshot_rows:
+            row_counts = [row["row_count"] for row in snapshot_rows]
+            # Earliest/latest are picked over (write time, snapshot id): the id
+            # tie-break makes snapshots written at the same instant order by
+            # snapshot number ascending rather than by database order.
+            ordered = sorted(
+                snapshot_rows,
+                key=lambda row: (datetime.fromisoformat(row["created_at"]), row["id"]),
+            )
+            stats = {
+                "snapshot_count": len(snapshot_rows),
+                "row_count_total": sum(row_counts),
+                "min_row_count": min(row_counts),
+                "max_row_count": max(row_counts),
+                "first_created_at": ordered[0]["created_at"],
+                "last_created_at": ordered[-1]["created_at"],
+            }
+        else:
+            # A version without snapshots: the list is empty, the count and
+            # total are zero and every extreme is null (keys retained).
+            stats = {
+                "snapshot_count": 0,
+                "row_count_total": 0,
+                "min_row_count": None,
+                "max_row_count": None,
+                "first_created_at": None,
+                "last_created_at": None,
+            }
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "snapshots": snapshots,
+                "stats": stats,
+            }
+        )
+
+    # Overall extremes span every extant snapshot of the dataset, not just
+    # the per-version extremes (those would not combine correctly for the
+    # write times).
+    all_snapshot_rows = conn.execute(
+        "SELECT s.id AS id, s.row_count AS row_count, s.created_at AS created_at "
+        "FROM snapshots s "
+        "JOIN schema_versions v ON s.version_id = v.id "
+        "WHERE v.dataset_id = ?",
+        (dataset["id"],),
+    ).fetchall()
+    if all_snapshot_rows:
+        all_row_counts = [row["row_count"] for row in all_snapshot_rows]
+        ordered_all = sorted(
+            all_snapshot_rows,
+            key=lambda row: (datetime.fromisoformat(row["created_at"]), row["id"]),
+        )
+        min_row_count: int | None = min(all_row_counts)
+        max_row_count: int | None = max(all_row_counts)
+        first_created_at: str | None = ordered_all[0]["created_at"]
+        last_created_at: str | None = ordered_all[-1]["created_at"]
+    else:
+        min_row_count = None
+        max_row_count = None
+        first_created_at = None
+        last_created_at = None
+
+    totals = {
+        "version_count": len(versions),
+        "snapshot_count": sum(
+            version["stats"]["snapshot_count"] for version in versions
+        ),
+        "row_count_total": sum(
+            version["stats"]["row_count_total"] for version in versions
+        ),
+        "min_row_count": min_row_count,
+        "max_row_count": max_row_count,
+        "first_created_at": first_created_at,
+        "last_created_at": last_created_at,
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
 # Retention sweep (batch deletion-request creation over one version)
 # --------------------------------------------------------------------------- #
 

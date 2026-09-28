@@ -105,6 +105,7 @@ from app.models import (
     SnapshotMaskedViewResponse,
     SnapshotMetadata,
     SnapshotResponse,
+    SnapshotScaleSummaryResponse,
     SnapshotVerifyResponse,
     VersionCompatibilityResponse,
     VersionCompatibilityImpactResponse,
@@ -1906,6 +1907,54 @@ def export_dataset_deletion_compliance(
     )
     payload = json.dumps(
         export.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version snapshot scale summary
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that returns, for every schema version at once, the
+# currently existing snapshots and their row-count scale. The path carries
+# only the dataset name; there is no request body or query parameter.
+SNAPSHOT_SCALE_SUMMARY_PATH = (
+    "/datasets/{dataset_name}/snapshot-scale-summary"
+)
+
+
+@app.get(
+    SNAPSHOT_SCALE_SUMMARY_PATH,
+    response_model=SnapshotScaleSummaryResponse,
+)
+def get_dataset_snapshot_scale_summary(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only and a
+    # single space included) or query parameters are a 422 validated in the
+    # repository once the path dataset is known, preserving the same
+    # 404-before-422 precedence as the compliance exports. Recomputed on
+    # every read; no snapshot, row, fingerprint, diff-cache entry or
+    # deletion proof is ever written. The body is serialized directly
+    # (rather than through the default JSON response) so the key order is
+    # fixed, the whitespace is compact and the document ends with exactly
+    # one newline.
+    summary = SnapshotScaleSummaryResponse(
+        **repository.get_dataset_snapshot_scale_summary(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        summary.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

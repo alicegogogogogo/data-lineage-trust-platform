@@ -1843,3 +1843,60 @@ class ProcessingBlockerSummaryResponse(BaseModel):
     dataset: str
     versions: list[ProcessingBlockerSummaryVersion]
     totals: ProcessingBlockerSummaryTotals
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version snapshot scale summary
+# --------------------------------------------------------------------------- #
+
+
+# One currently existing snapshot of a version: its id, the row count
+# currently persisted and the timezone-bearing write time, in snapshot id
+# ascending order. Snapshots whose deletion has been confirmed never appear.
+class SnapshotScaleSummarySnapshot(BaseModel):
+    snapshot_id: int
+    row_count: int
+    created_at: str
+
+
+# One version's snapshot scale statistics. ``snapshot_count`` and
+# ``row_count_total`` are zero for a version without snapshots while the
+# minimum/maximum row counts and the earliest/latest write times stay null
+# (the keys are never omitted). Ties on the write time resolve by snapshot id
+# ascending, so the earliest and latest never depend on database order.
+class SnapshotScaleSummaryStats(BaseModel):
+    snapshot_count: int
+    row_count_total: int
+    min_row_count: int | None
+    max_row_count: int | None
+    first_created_at: str | None
+    last_created_at: str | None
+
+
+# One schema version's entry: every currently existing snapshot in snapshot id
+# ascending order and the statistics computed over exactly those snapshots.
+class SnapshotScaleSummaryVersion(BaseModel):
+    version: int
+    snapshots: list[SnapshotScaleSummarySnapshot]
+    stats: SnapshotScaleSummaryStats
+
+
+# Whole-dataset counters. The version, snapshot and row-count totals are the
+# sums of the per-version values; the minimum/maximum row counts and the
+# earliest/latest write times are overall values over every currently
+# existing snapshot of the dataset (all null when no snapshot exists).
+class SnapshotScaleSummaryTotals(BaseModel):
+    version_count: int
+    snapshot_count: int
+    row_count_total: int
+    min_row_count: int | None
+    max_row_count: int | None
+    first_created_at: str | None
+    last_created_at: str | None
+
+
+# Deterministic whole-dataset snapshot scale read: exactly these keys, in
+# this order.
+class SnapshotScaleSummaryResponse(BaseModel):
+    dataset: str
+    versions: list[SnapshotScaleSummaryVersion]
+    totals: SnapshotScaleSummaryTotals
