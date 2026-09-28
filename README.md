@@ -386,6 +386,34 @@ and persisted (including their enabled state) across restarts.
   evaluations the response is an explicit empty result (null sequences,
   empty lists), not an error. Same `404`/`422` rules as the history
   endpoint; nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/evaluations/diff/at?timestamp=...`
+  — read-only point-in-time companion of the evaluation diff, appended one
+  segment after the pairwise diff address and accepting GET only.
+  `timestamp` must be a timezone-bearing ISO-8601 date-time (an offset or
+  trailing `Z`); only evaluation summaries written at or before it count as
+  the look-back window, and the two that participate are the window's
+  highest-sequence pair — the newest is `to`, its predecessor `from`. The
+  comparison is exactly the pairwise diff's: `added_violation_rows` /
+  `removed_violation_rows` are the 0-based row indices that started or
+  stopped violating any rule, and each `rules` entry carries the rule's
+  `before`/`after` side (`violation_count` and `violations`), the per-rule
+  `added_violations` / `removed_violations` and the numeric
+  `violation_count_delta`. A rule missing from one side (disabled or created
+  between the two evaluations) has a `null` side and `null` row-level diff
+  fields — the key is never omitted. A window with fewer than two recorded
+  evaluations returns the same explicit empty result as the pairwise diff
+  (null sequences, empty lists), not an error. Only persisted evaluation
+  summaries are read: rules are never re-run, history summaries are never
+  rewritten, nothing is cached or written, and the window grows naturally as
+  new evaluations are persisted, so the same data yields the same document
+  byte for byte across process restarts. The JSON document is deterministic
+  (fixed key order, compact whitespace, exactly one trailing newline). The
+  path dataset/version resolves first (`404`); afterwards any request body
+  bytes (whitespace-only included), a missing, repeated, unparseable or
+  timezone-less `timestamp`, or any other query parameter are a `422` that
+  writes nothing. Errors keep the stable `{"error", "detail"}` shape without
+  exposing SQL, stack traces or internal objects; the evaluation history,
+  the pairwise diff and every other endpoint are unchanged.
 
 ### Quality anomaly detection
 

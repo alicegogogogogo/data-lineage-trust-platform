@@ -2478,37 +2478,27 @@ def list_quality_rule_evaluations(
     ]
 
 
-def diff_quality_rule_evaluations(
-    conn: sqlite3.Connection,
-    dataset_name: str,
-    version_number: int,
-    *,
-    body: bytes = b"",
-    query_keys: tuple[str, ...] = (),
+def _evaluation_diff_document(
+    dataset: dict,
+    version_row: sqlite3.Row,
+    rows: list[sqlite3.Row],
 ) -> dict:
-    """Read-only diff between the two most recent evaluations of one version.
+    """Build the pairwise evaluation diff document.
 
-    The latest recorded evaluation (``to``) is compared against its immediate
-    predecessor (``from``) using exactly the results each of them recorded;
-    the persisted rule definitions and submitted rows of the two evaluations
-    are all that is consulted. Row positions are the 0-based indices each
-    evaluation reported. A rule missing from one side (disabled or not yet
-    created between the two evaluations) keeps a null side, and its row-level
-    diff fields are null as well, so a missing side stays distinguishable from
-    a present side with zero violations. With fewer than two recorded
-    evaluations the result is explicitly empty (null sequences, empty lists),
-    never an error. Nothing is written.
+    ``rows`` holds zero, one or two evaluation summaries (never more). With
+    fewer than two evaluations the result is explicitly empty (null
+    sequences, empty lists), never an error; otherwise the first row is the
+    later evaluation (``to``) and the second its predecessor (``from``). The
+    comparison uses exactly the results each evaluation recorded — the
+    persisted rule definitions are never consulted and nothing is written.
+    Row positions are the 0-based indices each evaluation reported. A rule
+    missing from one side (disabled or not yet created between the two
+    evaluations) keeps a null side, and its row-level diff fields are null as
+    well, so a missing side stays distinguishable from a present side with
+    zero violations. The ordering of rules and row indices never depends on
+    database order, so the document is identical across processes and
+    restarts.
     """
-    dataset, version_row = _require_evaluation_path(
-        conn, dataset_name, version_number, body=body, query_keys=query_keys,
-        endpoint="evaluation diff",
-    )
-    rows = conn.execute(
-        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
-        "ORDER BY sequence DESC LIMIT 2",
-        (version_row["id"],),
-    ).fetchall()
-
     empty = {
         "dataset": dataset["name"],
         "version": version_row["version"],
@@ -2579,6 +2569,97 @@ def diff_quality_rule_evaluations(
         "removed_violation_rows": sorted(before_rows - after_rows),
         "rules": rule_diffs,
     }
+
+
+def diff_quality_rule_evaluations(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only diff between the two most recent evaluations of one version.
+
+    The latest recorded evaluation (``to``) is compared against its immediate
+    predecessor (``from``) with the comparison in
+    ``_evaluation_diff_document``; with fewer than two recorded evaluations
+    the result is explicitly empty (null sequences, empty lists), never an
+    error. Nothing is written.
+    """
+    dataset, version_row = _require_evaluation_path(
+        conn, dataset_name, version_number, body=body, query_keys=query_keys,
+        endpoint="evaluation diff",
+    )
+    rows = conn.execute(
+        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence DESC LIMIT 2",
+        (version_row["id"],),
+    ).fetchall()
+    return _evaluation_diff_document(dataset, version_row, rows)
+
+
+def diff_quality_rule_evaluations_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_params: tuple[tuple[str, str], ...] = (),
+) -> dict:
+    """Read-only diff between the two latest evaluations written at or before
+    the requested instant.
+
+    Same comparison and literal output as ``diff_quality_rule_evaluations``,
+    but over the look-back window of evaluations whose write time is not later
+    than the ``timestamp`` query parameter (a timezone-bearing ISO-8601
+    date-time): only persisted evaluations inside the window count, and the
+    two that participate are the window's highest-sequence pair. With fewer
+    than two recorded evaluations in the window the result is explicitly
+    empty (null sequences, empty lists), never an error. Only already
+    persisted evaluation summaries are consulted — rules are never re-run and
+    no history summary is rewritten — and nothing is cached or written, so
+    repeated calls and restarts return identical documents and the window
+    grows naturally as new evaluations are persisted.
+
+    The path dataset/version resolves first (404). Afterwards every shape
+    problem is a 422 that writes nothing: any request body bytes (including
+    whitespace-only ones), a missing, repeated, unparseable or timezone-less
+    ``timestamp``, or any other query parameter.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body:
+        raise RequestInvalidError(
+            "The evaluation diff endpoint does not accept a request body"
+        )
+    extra_keys = sorted({key for key, _ in query_params} - {"timestamp"})
+    if extra_keys:
+        raise RequestInvalidError(
+            "The evaluation diff endpoint does not accept query parameter(s): "
+            + ", ".join(extra_keys)
+        )
+    timestamps = [value for key, value in query_params if key == "timestamp"]
+    if not timestamps:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' is required and must be an ISO-8601 "
+            "date-time"
+        )
+    if len(timestamps) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must appear exactly once"
+        )
+    target = _parse_at_timestamp(timestamps[0])
+
+    rows = conn.execute(
+        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence DESC",
+        (version_row["id"],),
+    ).fetchall()
+    in_window = [
+        row for row in rows if datetime.fromisoformat(row["created_at"]) <= target
+    ]
+    return _evaluation_diff_document(dataset, version_row, in_window[:2])
 
 
 # --------------------------------------------------------------------------- #

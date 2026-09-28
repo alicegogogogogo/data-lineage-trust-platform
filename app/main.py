@@ -858,6 +858,47 @@ def list_quality_rule_evaluations(
     ]
 
 
+# Read-only point-in-time companion of the evaluation diff, appended one
+# segment after it and accepting GET only. The same pairwise comparison and
+# document shape, but over the two highest-sequence evaluations written at or
+# before the 'timestamp' query parameter; nothing is cached, re-run or
+# written. The body is serialized directly (rather than through the default
+# JSON response) so the key order is fixed, the whitespace is compact and the
+# document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/quality-rules/evaluations/diff/at",
+    response_model=QualityRuleEvaluationDiffResponse,
+)
+def diff_quality_rule_evaluations_at(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset/version resolves first (404); any body bytes
+    # (whitespace-only included), a missing/repeated/unparseable/timezone-less
+    # 'timestamp' or any other query parameter are a 422 validated in the
+    # repository afterwards. The raw query pairs are passed through so a
+    # repeated 'timestamp' is rejected instead of silently collapsed.
+    diff = QualityRuleEvaluationDiffResponse(
+        **repository.diff_quality_rule_evaluations_at(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_params=tuple(request.query_params.multi_items()),
+        )
+    )
+    payload = json.dumps(
+        diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
 # Read-only release-readiness verdict of the version, computed fresh from the
 # persisted evaluation history and anomaly records on every call; nothing is
 # cached or written. The body is serialized directly (rather than through the
