@@ -351,6 +351,38 @@ schema version in a different (source) dataset.
   takes no request body and no query parameters; any body bytes
   (whitespace-only included) or query parameter → `422`, and an unknown
   dataset → `404`, with `404` taking precedence over the shape checks.
+- `GET /datasets/{dataset}/lineage-source-coverage` — read-only whole-dataset
+  source-side companion of the lineage coverage check, reporting, for every
+  schema version at once, how the version's fields are registered as a source
+  by lineage mappings. Versions are sorted by version number ascending and a
+  dataset without versions returns an empty `versions` array, never an error.
+  Each version entry has exactly `version`, `fields`,
+  `referenced_field_count`, `unreferenced_field_count` and `mapping_count` in
+  that order; `fields` lists every field of the version sorted by field name,
+  each entry having exactly `field`, `downstreams` and
+  `downstream_dataset_count`. `downstreams` lists every mapping target
+  registered with the field as its source; each reference has the location
+  keys `dataset`, `version` and `field` in that order, is deduplicated and
+  sorted by those three keys ascending, and the sort never depends on
+  database order. A field never used as a source is listed all the same with
+  an empty `downstreams` array and a `downstream_dataset_count` of zero; that
+  count counts the distinct target dataset names among the references, never
+  the number of mappings. `mapping_count` equals the sum of the fields'
+  downstream-reference counts and `referenced_field_count` plus
+  `unreferenced_field_count` equals the number of fields. The JSON document
+  is deterministic (fixed key order, compact whitespace, lowercase booleans,
+  exactly one trailing newline) with top-level keys `dataset`, `versions`
+  and `totals` in that order; `totals` gives `version_count`, `field_count`,
+  `referenced_field_count`, `unreferenced_field_count` and `mapping_count`,
+  each equal to the sum of the matching per-version values (all zero for a
+  dataset without versions). The check is recomputed on every read and never
+  writes: lineage mappings and the impact cache are never inserted,
+  invalidated, repaired or otherwise touched. The endpoint takes no request
+  body and no query parameters — any body bytes, including a purely
+  whitespace or single-space body, or any query parameter → `422`, and an
+  unknown dataset → `404`, with `404` taking precedence over the shape
+  checks. The target-side lineage coverage check and every other lineage
+  read behave exactly as before.
 
   Impact results are cached persistently (they survive restarts) and every
   read reflects the currently committed lineage graph: creating a schema
