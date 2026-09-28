@@ -64,6 +64,7 @@ from app.models import (
     ProcessingScheduleResponse,
     ProcessingAuditReportResponse,
     ProcessingAuditExportResponse,
+    ProcessingBlockerSummaryResponse,
     QualityAnomalyDetectionConfig,
     QualityAnomalyDetectionConfigCreate,
     QualityAnomalyRecord,
@@ -1952,6 +1953,53 @@ def export_dataset_processing_audit(
     )
     payload = json.dumps(
         export.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version processing blocker summary
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that shows, for every schema version at once, what keeps
+# each task from proceeding: the schedule state, the not-yet-succeeded direct
+# dependencies and the blocker category. The path carries only the dataset
+# name; there is no request body or query parameter.
+PROCESSING_BLOCKER_SUMMARY_PATH = (
+    "/datasets/{dataset_name}/processing-blocker-summary"
+)
+
+
+@app.get(
+    PROCESSING_BLOCKER_SUMMARY_PATH,
+    response_model=ProcessingBlockerSummaryResponse,
+)
+def get_dataset_processing_blocker_summary(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset is known, preserving the same 404 precedence as the processing
+    # audit export. Recomputed on every read; no task, run, dependency or
+    # audit record is ever written. Serialized directly (rather than through
+    # the default JSON response) so the key order is fixed, the whitespace is
+    # compact and the document ends with exactly one newline.
+    summary = ProcessingBlockerSummaryResponse(
+        **repository.get_processing_blocker_summary(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        summary.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

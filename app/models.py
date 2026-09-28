@@ -1777,3 +1777,69 @@ class ProcessingAuditExportResponse(BaseModel):
     dataset: str
     versions: list[ProcessingAuditExportVersion]
     totals: ProcessingAuditExportTotals
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version processing blocker summary
+# --------------------------------------------------------------------------- #
+
+
+# Blocker categories a task can hit. ``attempts_exhausted`` wins the primary
+# cause, then ``upstream_failed``; ``direct_dependency`` is the lowest
+# priority. ``causes`` instead lists every category alphabetically.
+BlockerCause = Literal[
+    "attempts_exhausted",
+    "direct_dependency",
+    "upstream_failed",
+]
+
+
+# One task's blocker view: identity and stored status, the same schedule state
+# the per-version schedule view computes, the direct dependencies that still
+# keep a pending task from starting (empty for every non-pending task) and the
+# blocker classification. Exactly these keys, in this order.
+class ProcessingBlockerSummaryTask(BaseModel):
+    id: int
+    name: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    schedule_state: ScheduleState
+    blocking_task_ids: list[int]
+    # Highest-priority blocker category; null when the task hits no blocker.
+    cause: BlockerCause | None
+    # Every blocker category that applies, alphabetically ordered; empty when
+    # the task hits no blocker.
+    causes: list[BlockerCause]
+
+
+# One schema version's tasks plus the six mutually exclusive schedule-state
+# buckets (the seven schedule states merge into these six).
+class ProcessingBlockerSummaryVersion(BaseModel):
+    version: int
+    tasks: list[ProcessingBlockerSummaryTask]
+    ready_count: int
+    running_count: int
+    succeeded_count: int
+    failed_count: int
+    exhausted_count: int
+    blocked_count: int
+
+
+# Every counter is the sum of the matching per-version values; task_count is
+# the sum of the six buckets (equivalently, of the version task totals) and
+# version_count is the number of version entries.
+class ProcessingBlockerSummaryTotals(BaseModel):
+    version_count: int
+    task_count: int
+    ready_count: int
+    running_count: int
+    succeeded_count: int
+    failed_count: int
+    exhausted_count: int
+    blocked_count: int
+
+
+# Deterministic whole-dataset summary: exactly these keys, in this order.
+class ProcessingBlockerSummaryResponse(BaseModel):
+    dataset: str
+    versions: list[ProcessingBlockerSummaryVersion]
+    totals: ProcessingBlockerSummaryTotals

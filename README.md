@@ -1705,6 +1705,46 @@ run records one attempt. Tasks and runs are persisted across restarts.
   `task_count`, `run_count`, `invalid_audit_runs`, `succeeded_tasks`,
   `failed_tasks` and `exhausted_tasks`, each the sum of the matching
   per-version values over the whole dataset.
+- `GET /datasets/{dataset}/processing-blocker-summary` — read-only
+  cross-version summary of what keeps each version's processing tasks from
+  proceeding, computed fresh on every read (no caching; nothing is written,
+  modified or deleted, and no task, run, dependency or audit record is
+  touched). The path carries only the dataset name; the request takes no
+  body and no query parameters — any body bytes, including a purely
+  whitespace or single-space body, or any query parameter → `422`; an
+  unknown dataset → `404`, checked before the body/query validation. A
+  dataset without schema versions returns `200` with an empty `versions`
+  array and all-zero totals, never an error. The JSON document is
+  deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline). The top-level keys are exactly `dataset`, `versions` and
+  `totals` in that order; `versions` is ordered by version number ascending
+  and each entry has exactly `version`, `tasks`, `ready_count`,
+  `running_count`, `succeeded_count`, `failed_count`, `exhausted_count` and
+  `blocked_count` in that order. `tasks` is ordered by task `id` ascending;
+  each task has exactly `id`, `name`, `status` (the stored task status),
+  `schedule_state`, `blocking_task_ids`, `cause` and `causes` in that
+  order. `schedule_state` uses the same seven literals and the same
+  derivation as the per-version schedule view (`running`, `succeeded`,
+  `retryable`, `exhausted`, `ready`, `blocked`, `upstream_failed`);
+  `blocking_task_ids` likewise lists the not-yet-succeeded direct
+  dependencies of a pending task, id-ascending and de-duplicated, and is an
+  empty array for every non-pending task. The blocker categories are
+  `direct_dependency` (a pending task still waiting on an unsucceeded
+  direct dependency), `upstream_failed` (a dependency chain is exhausted or
+  upstream-failed, at any distance) and `attempts_exhausted` (a `failed`
+  task that has used up `max_attempts`); the categories are independent, so
+  a pending task whose dependency chain failed hits both
+  `direct_dependency` and `upstream_failed`. `causes` lists every category
+  that applies in alphabetical order (an empty array when none applies),
+  and `cause` is the single highest-priority category —
+  `attempts_exhausted`, then `upstream_failed`, then `direct_dependency` —
+  or `null` when no category applies. The six counts partition the seven
+  schedule states into mutually exclusive buckets (the counts always sum to
+  the version's task count): `ready`, `running`, `succeeded` and `exhausted`
+  keep their own buckets, a `retryable` task is counted as `failed`, and
+  `blocked` together with `upstream_failed` is counted as `blocked`.
+  `totals` has exactly `version_count`, `task_count` and the six
+  `*_count` counters, each the sum of the matching per-version values.
 
 ### Processing run audit records (append-only proof chain)
 

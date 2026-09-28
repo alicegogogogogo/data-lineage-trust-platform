@@ -10314,3 +10314,207 @@ def export_dataset_processing_audit(
         ),
     }
     return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version processing blocker summary
+# --------------------------------------------------------------------------- #
+
+
+# The six mutually exclusive count buckets. The schedule view's seven states
+# merge into them: ``blocked`` and ``upstream_failed`` join ``blocked_count``;
+# a failed task's ``retryable`` state joins ``failed_count``; ``ready``,
+# ``running``, ``succeeded`` and ``exhausted`` keep their own bucket.
+_BLOCKER_COUNT_KEYS = (
+    "ready_count",
+    "running_count",
+    "succeeded_count",
+    "failed_count",
+    "exhausted_count",
+    "blocked_count",
+)
+
+_BLOCKER_STATE_BUCKET = {
+    "ready": "ready_count",
+    "running": "running_count",
+    "succeeded": "succeeded_count",
+    "retryable": "failed_count",
+    "exhausted": "exhausted_count",
+    "blocked": "blocked_count",
+    "upstream_failed": "blocked_count",
+}
+
+# Primary-cause precedence, highest first. ``causes`` lists the matching
+# categories alphabetically instead; ``cause`` takes one from this ordering.
+_BLOCKER_CAUSE_PRIORITY = (
+    "attempts_exhausted",
+    "upstream_failed",
+    "direct_dependency",
+)
+
+
+def _blocker_categories(
+    status: str,
+    attempt_count: int,
+    max_attempts: int,
+    schedule_state: str,
+    blocking_task_ids: list[int],
+) -> list[str]:
+    """List every blocker category a task hits, alphabetically ordered.
+
+    The categories are independent predicates, so more than one can hit:
+
+    * ``attempts_exhausted`` — a stored ``failed`` task with no attempts left,
+      exactly the schedule's ``exhausted`` criterion.
+    * ``upstream_failed`` — the schedule state of the same name: a dependency
+      chain contains an exhausted or already upstream-failed task, however
+      many hops away.
+    * ``direct_dependency`` — a still-pending task with at least one direct
+      dependency that has not yet succeeded (a non-empty
+      ``blocking_task_ids``); the task is waiting on a dependency regardless
+      of whether that wait is temporary (``blocked``) or terminal
+      (``upstream_failed``).
+
+    A pending task whose dependency chain failed therefore hits both
+    ``direct_dependency`` and ``upstream_failed``; ``cause`` then takes the
+    higher-priority one (see ``_BLOCKER_CAUSE_PRIORITY``). A task that hits
+    no category (a ready, running or succeeded task, or a failed task with
+    attempts left) gets an empty list.
+    """
+    categories: list[str] = []
+    if status == "failed" and attempt_count >= max_attempts:
+        categories.append("attempts_exhausted")
+    if schedule_state == "upstream_failed":
+        categories.append("upstream_failed")
+    if status == "pending" and blocking_task_ids:
+        categories.append("direct_dependency")
+    categories.sort()
+    return categories
+
+
+def get_processing_blocker_summary(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset summary of what blocks each version's tasks.
+
+    One entry per schema version, ordered by version number ascending; tasks
+    within an entry are ordered by id ascending. Schedule states reuse the
+    per-version schedule view's derivation (``_schedule_states``) and its
+    seven literals exactly, so the classification here always agrees with
+    that read. ``blocking_task_ids`` likewise reuses the schedule rule: the
+    not-yet-succeeded direct dependencies of a pending task, id-ascending
+    and de-duplicated; an empty list for every non-pending task.
+
+    The six per-version counts partition the seven schedule states into six
+    mutually exclusive buckets (``_BLOCKER_STATE_BUCKET``); they always sum
+    to the version's task count. ``totals`` holds the version count, the
+    overall task count and the six bucket counts summed over the versions.
+    A dataset without versions yields an empty ``versions`` list and
+    all-zero totals, never an error.
+
+    The summary is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a task, run, dependency or audit record. The
+    dataset resolves first (404); any request body bytes (whitespace-only
+    included) or any query parameter is a 422 checked afterwards, matching
+    the processing audit export.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the processing audit export.
+    if body:
+        raise RequestInvalidError(
+            "The processing blocker summary endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The processing blocker summary endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        task_rows = _version_task_rows(conn, version_row["id"])
+        graph: dict[int, tuple[str, int, int, list[int]]] = {
+            row["id"]: (
+                row["status"],
+                row["attempt_count"],
+                row["max_attempts"],
+                json.loads(row["depends_on"]),
+            )
+            for row in task_rows
+        }
+        # The same fixed-point derivation as the per-version schedule view, so
+        # the schedule_state literals and the blocking judgement agree.
+        states = _schedule_states(graph)
+
+        tasks: list[dict] = []
+        counts = {key: 0 for key in _BLOCKER_COUNT_KEYS}
+        for row in task_rows:
+            schedule_state = states[row["id"]]
+            if row["status"] == "pending":
+                blocking_task_ids = sorted(
+                    dependency_id
+                    for dependency_id in graph[row["id"]][3]
+                    if states.get(dependency_id) != "succeeded"
+                )
+            else:
+                blocking_task_ids = []
+
+            categories = _blocker_categories(
+                row["status"],
+                row["attempt_count"],
+                row["max_attempts"],
+                schedule_state,
+                blocking_task_ids,
+            )
+            cause = next(
+                (
+                    candidate
+                    for candidate in _BLOCKER_CAUSE_PRIORITY
+                    if candidate in categories
+                ),
+                None,
+            )
+
+            tasks.append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "status": row["status"],
+                    "schedule_state": schedule_state,
+                    "blocking_task_ids": blocking_task_ids,
+                    "cause": cause,
+                    "causes": categories,
+                }
+            )
+            counts[_BLOCKER_STATE_BUCKET[schedule_state]] += 1
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "tasks": tasks,
+                **counts,
+            }
+        )
+
+    totals: dict[str, int] = {
+        "version_count": len(versions),
+        "task_count": sum(len(version["tasks"]) for version in versions),
+    }
+    for key in _BLOCKER_COUNT_KEYS:
+        totals[key] = sum(version[key] for version in versions)
+
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
