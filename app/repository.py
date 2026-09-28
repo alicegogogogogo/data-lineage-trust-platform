@@ -1296,6 +1296,152 @@ def lineage_coverage(
 
 
 # --------------------------------------------------------------------------- #
+# Whole-dataset lineage source coverage check
+# --------------------------------------------------------------------------- #
+
+
+def lineage_source_coverage(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset lineage source coverage check.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry lists every field of the version (ordered by field
+    name) with the downstream references of every mapping registered with
+    that field as its source; each reference carries the ``dataset``,
+    ``version`` and ``field`` locating keys and is deduplicated and sorted by
+    those three keys ascending. A field without a downstream is listed all
+    the same with an empty ``downstreams`` list and a
+    ``downstream_dataset_count`` of zero; that count counts the distinct
+    target dataset names among the references, never the number of mappings.
+    Every version entry additionally reports the referenced field count, the
+    unreferenced field count and the mapping count (the sum of the fields'
+    downstream-reference counts; referenced plus unreferenced equals the
+    number of fields). ``totals`` reports the version count, field count,
+    referenced count, unreferenced count and mapping count, each the sum of
+    the per-version values; a dataset without versions yields an empty
+    version list and all-zero totals, never an error.
+
+    The check is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a lineage mapping or an impact cache record.
+    The dataset resolves first (404); any request body bytes
+    (whitespace-only included) or any query parameter is a 422 checked
+    afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body, matching the other whole-dataset read-only checks.
+    if body:
+        raise RequestInvalidError(
+            "The lineage source coverage endpoint does not accept a request "
+            "body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The lineage source coverage endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    # Every mapping whose source field belongs to one of the dataset's
+    # versions, ordered so a deterministic sort never relies on database
+    # insertion order. Targets may live in any other dataset.
+    link_rows = conn.execute(
+        """
+        SELECT  sv.version  AS source_version,
+                sf.name     AS source_field,
+                td.name     AS target_dataset,
+                tv.version  AS target_version,
+                tf.name     AS target_field
+        FROM    lineage_links ll
+        JOIN    schema_versions sv ON sv.id = ll.source_version_id
+        JOIN    schema_fields sf ON sf.id = ll.source_field_id
+        JOIN    datasets td ON td.id = ll.target_dataset_id
+        JOIN    schema_versions tv ON tv.id = ll.target_version_id
+        JOIN    schema_fields tf ON tf.id = ll.target_field_id
+        WHERE   sv.dataset_id = ?
+        ORDER BY sv.version ASC, sf.name ASC,
+                 td.name ASC, tv.version ASC, tf.name ASC
+        """,
+        (dataset["id"],),
+    ).fetchall()
+    # Group references per (source version number, source field name). The
+    # key set deduplicates defensively even though the database already
+    # forbids a repeated (source, target) field pair.
+    refs_by_source: dict[tuple[int, str], dict[tuple[str, int, str], dict]] = {}
+    for link in link_rows:
+        ref = {
+            "dataset": link["target_dataset"],
+            "version": link["target_version"],
+            "field": link["target_field"],
+        }
+        refs_by_source.setdefault(
+            (link["source_version"], link["source_field"]), {}
+        )[(ref["dataset"], ref["version"], ref["field"])] = ref
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        version_number = version_row["version"]
+        field_rows = conn.execute(
+            "SELECT name FROM schema_fields WHERE version_id = ? "
+            "ORDER BY name ASC",
+            (version_row["id"],),
+        ).fetchall()
+
+        fields: list[dict] = []
+        mapping_count = 0
+        for field_row in field_rows:
+            refs_by_key = refs_by_source.get((version_number, field_row["name"]), {})
+            downstreams = [refs_by_key[key] for key in sorted(refs_by_key)]
+            mapping_count += len(downstreams)
+            fields.append(
+                {
+                    "field": field_row["name"],
+                    "downstreams": downstreams,
+                    "downstream_dataset_count": len(
+                        {ref["dataset"] for ref in downstreams}
+                    ),
+                }
+            )
+
+        referenced_field_count = sum(
+            1 for field in fields if field["downstreams"]
+        )
+        versions.append(
+            {
+                "version": version_number,
+                "fields": fields,
+                "referenced_field_count": referenced_field_count,
+                "unreferenced_field_count": len(fields) - referenced_field_count,
+                "mapping_count": mapping_count,
+            }
+        )
+
+    totals = {
+        "version_count": len(versions),
+        "field_count": sum(len(version["fields"]) for version in versions),
+        "referenced_field_count": sum(
+            version["referenced_field_count"] for version in versions
+        ),
+        "unreferenced_field_count": sum(
+            version["unreferenced_field_count"] for version in versions
+        ),
+        "mapping_count": sum(version["mapping_count"] for version in versions),
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
 # Lineage impact queries (with persistent cache)
 # --------------------------------------------------------------------------- #
 

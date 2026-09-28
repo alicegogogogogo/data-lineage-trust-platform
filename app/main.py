@@ -32,6 +32,7 @@ from app.models import (
     LineageResponse,
     LineageSourcePathsResponse,
     LineageCoverageResponse,
+    LineageSourceCoverageResponse,
     PrivacyComplianceExportResponse,
     PrivacyPolicyCoverageResponse,
     MaskingSuggestion,
@@ -770,6 +771,53 @@ def get_lineage_coverage(
     # with exactly one newline.
     coverage = LineageCoverageResponse(
         **repository.lineage_coverage(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        coverage.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version lineage source coverage check
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that reports, for every schema version at once, how the
+# version's fields are registered as a source by lineage mappings: each
+# field's downstream target references and the distinct downstream-dataset
+# count, plus referenced, unreferenced and mapping counts and whole-dataset
+# totals. The path carries only the dataset name; there is no request body or
+# query parameter.
+LINEAGE_SOURCE_COVERAGE_PATH = "/datasets/{dataset_name}/lineage-source-coverage"
+
+
+@app.get(
+    LINEAGE_SOURCE_COVERAGE_PATH,
+    response_model=LineageSourceCoverageResponse,
+)
+def get_lineage_source_coverage(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset is known, preserving 404 precedence. Recomputed on every read;
+    # no lineage mapping or impact cache record is ever written. The body is
+    # serialized directly (rather than through the default JSON response) so
+    # the key order is fixed, the whitespace is compact and the document ends
+    # with exactly one newline.
+    coverage = LineageSourceCoverageResponse(
+        **repository.lineage_source_coverage(
             conn,
             dataset_name,
             body=body,

@@ -288,6 +288,55 @@ class LineageCoverageResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only whole-dataset lineage source coverage check
+# --------------------------------------------------------------------------- #
+
+
+# One source field's downstream registration coverage within one schema
+# version. ``downstreams`` lists every mapping target registered with the
+# field as its source, each located by the ``dataset``, ``version`` and
+# ``field`` keys; references are deduplicated and sorted by those three keys
+# ascending. A field without a downstream is listed all the same with an
+# empty ``downstreams`` list. ``downstream_dataset_count`` counts the
+# distinct target dataset names among the references (zero for a field
+# without downstreams), never the number of mappings.
+class LineageSourceCoverageField(BaseModel):
+    field: str
+    downstreams: list[LineageSourceRef]
+    downstream_dataset_count: int
+
+
+# One schema version's source coverage summary. Exactly these keys, in this
+# order: the version number, its field list and the referenced,
+# unreferenced and mapping counts. ``mapping_count`` equals the sum of the
+# fields' downstream-reference counts and referenced plus unreferenced
+# equals the number of fields.
+class LineageSourceCoverageVersion(BaseModel):
+    version: int
+    fields: list[LineageSourceCoverageField]
+    referenced_field_count: int
+    unreferenced_field_count: int
+    mapping_count: int
+
+
+class LineageSourceCoverageTotals(BaseModel):
+    version_count: int
+    field_count: int
+    referenced_field_count: int
+    unreferenced_field_count: int
+    mapping_count: int
+
+
+# Deterministic whole-dataset source coverage check: exactly these keys, in
+# this order. Each total equals the sum of the matching per-version values; a
+# dataset without versions yields an empty version list and all-zero totals.
+class LineageSourceCoverageResponse(BaseModel):
+    dataset: str
+    versions: list[LineageSourceCoverageVersion]
+    totals: LineageSourceCoverageTotals
+
+
+# --------------------------------------------------------------------------- #
 # Read-only breaking-change compatibility check with downstream impact
 # --------------------------------------------------------------------------- #
 
