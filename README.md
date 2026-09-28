@@ -599,6 +599,41 @@ recorded for rules since disabled still count).
   the number of versions whose verdict is `fail`, and the sums of the
   per-version reason and violation row counts (null violation row counts
   count as zero).
+- `GET /datasets/{dataset}/quality-rule-coverage` — read-only cross-version
+  check of how the dataset's schema fields are covered by quality rules,
+  computed fresh on every read (no caching; nothing is written, modified or
+  deleted, and no rule definition or evaluation record is touched). The path
+  carries only the dataset name; the request takes no body and no query
+  parameters — any body bytes, including a purely whitespace or single-space
+  body, or any query parameter → `422`; an unknown dataset → `404`, checked
+  before the request shape, with the same 404-before-422 precedence as the
+  compliance exports. A dataset without schema versions returns `200` with an
+  empty `versions` array and all-zero totals, never an error. The JSON
+  document is deterministic (fixed key order, compact whitespace, exactly one
+  trailing newline; the same data renders byte-identically after a process
+  restart and ordering never depends on the database's natural order):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"fields":[{"field":"amount","coverage":"disabled","kinds":["numeric_range"],"rule_ids":[3]},{"field":"id","coverage":"enabled","kinds":["not_null","unique"],"rule_ids":[1,2]},{"field":"region","coverage":"unregistered","kinds":null,"rule_ids":null}]}],"totals":{"version_count":1,"field_count":3,"enabled_count":1,"disabled_count":1,"unregistered_count":1}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions`, `totals` in that
+  order. `versions` is ordered by version number ascending and each entry has
+  exactly `version` and `fields`, with every field of the version listed by
+  field name ascending. Each field entry has exactly `field`, `coverage`,
+  `kinds` and `rule_ids` in that order. `coverage` is one of the literals
+  `enabled` (at least one enabled rule references the field), `disabled`
+  (rules reference the field but all of them are disabled) and
+  `unregistered` (no rule references the field). `kinds` is the
+  de-duplicated list of referencing rule kinds sorted by literal value and
+  `rule_ids` the referencing rules' ids de-duplicated and sorted ascending;
+  every field of a unique rule counts as referenced. When a field is also
+  referenced by disabled rules alongside enabled ones, their kinds and ids
+  are included too. For an `unregistered` field both `kinds` and `rule_ids`
+  are `null` — the keys are never omitted. `totals` has exactly
+  `version_count`, `field_count`, `enabled_count`, `disabled_count` and
+  `unregistered_count`: each is the sum of the per-version entries, and the
+  field count equals the sum of the three per-state counts.
 
 ### Privacy policies
 
