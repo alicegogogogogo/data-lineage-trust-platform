@@ -10314,3 +10314,169 @@ def export_dataset_processing_audit(
         ),
     }
     return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# Maps the schedule view's seven states onto this summary's six mutually
+# exclusive buckets: ``retryable`` tasks count as ``failed`` and
+# ``upstream_failed`` merges into ``blocked``.
+_BLOCKER_BUCKET_BY_SCHEDULE_STATE = {
+    "ready": "ready",
+    "running": "running",
+    "succeeded": "succeeded",
+    "retryable": "failed",
+    "exhausted": "exhausted",
+    "blocked": "blocked",
+    "upstream_failed": "blocked",
+}
+
+# A task can hit more than one blocker category; ``cause`` names one primary
+# by this priority while ``causes`` lists every hit alphabetically.
+_BLOCKER_CAUSE_PRIORITY = (
+    "attempts_exhausted",
+    "upstream_failed",
+    "direct_dependency",
+)
+
+
+def processing_blocker_summary(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset summary of what blocks processing tasks.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending (a version without tasks is still listed), and each task within
+    a version ordered by id ascending. The schedule state and blocker ids are
+    derived exactly as in the per-version schedule read
+    (``_schedule_states``): the seven schedule literals are then merged into
+    six exclusive buckets — ``ready``, ``running``, ``succeeded``, ``failed``
+    (retryable tasks), ``exhausted`` and ``blocked`` (``upstream_failed``
+    joins ``blocked``) — whose counts sum to the version's task total.
+
+    A pending task hits ``direct_dependency`` while any direct dependency has
+    not succeeded, ``upstream_failed`` when its schedule state is
+    ``upstream_failed``; a failed task without attempts left hits
+    ``attempts_exhausted``. ``causes`` lists every hit alphabetically and
+    ``cause`` the primary one by priority (attempts_exhausted, then
+    upstream_failed, then direct_dependency); an unblocked task has a null
+    ``cause`` and empty ``causes``, and only pending tasks ever carry
+    ``blocking_task_ids``.
+
+    The summary is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a task, run, dependency or audit record. The
+    dataset resolves first (404); any request body bytes (whitespace-only
+    included) or any query parameter is a 422 checked afterwards. A dataset
+    without versions yields an empty version list and all-zero totals.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the cross-version exports.
+    if body:
+        raise RequestInvalidError(
+            "The processing blocker summary endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The processing blocker summary endpoint does not accept query "
+            "parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    bucket_keys = (
+        "ready",
+        "running",
+        "succeeded",
+        "failed",
+        "exhausted",
+        "blocked",
+    )
+    versions: list[dict] = []
+    totals_counts = {key: 0 for key in bucket_keys}
+    total_tasks = 0
+
+    for version_row in version_rows:
+        rows = _version_task_rows(conn, version_row["id"])
+        graph = {
+            row["id"]: (
+                row["status"],
+                row["attempt_count"],
+                row["max_attempts"],
+                json.loads(row["depends_on"]),
+            )
+            for row in rows
+        }
+        states = _schedule_states(graph)
+
+        tasks: list[dict] = []
+        counts = {key: 0 for key in bucket_keys}
+        for row in rows:
+            task_id = row["id"]
+            status = row["status"]
+            schedule_state = states[task_id]
+
+            if status == "pending":
+                dependencies = graph[task_id][3]
+                blocking_ids = sorted(
+                    dependency_id
+                    for dependency_id in dependencies
+                    if states.get(dependency_id) != "succeeded"
+                )
+            else:
+                blocking_ids = []
+
+            causes: list[str] = []
+            if schedule_state == "exhausted":
+                causes.append("attempts_exhausted")
+            if status == "pending":
+                if schedule_state == "upstream_failed":
+                    causes.append("upstream_failed")
+                if blocking_ids:
+                    causes.append("direct_dependency")
+            causes.sort()
+            cause = next(
+                (
+                    candidate
+                    for candidate in _BLOCKER_CAUSE_PRIORITY
+                    if candidate in causes
+                ),
+                None,
+            )
+
+            tasks.append(
+                {
+                    "id": task_id,
+                    "name": row["name"],
+                    "status": status,
+                    "schedule_state": schedule_state,
+                    "blocking_task_ids": blocking_ids,
+                    "cause": cause,
+                    "causes": causes,
+                }
+            )
+            counts[_BLOCKER_BUCKET_BY_SCHEDULE_STATE[schedule_state]] += 1
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "tasks": tasks,
+                **{f"{key}_count": counts[key] for key in bucket_keys},
+            }
+        )
+        total_tasks += len(tasks)
+        for key in bucket_keys:
+            totals_counts[key] += counts[key]
+
+    totals = {"version_count": len(versions), "task_count": total_tasks}
+    totals.update({f"{key}_count": value for key, value in totals_counts.items()})
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}

@@ -1777,3 +1777,67 @@ class ProcessingAuditExportResponse(BaseModel):
     dataset: str
     versions: list[ProcessingAuditExportVersion]
     totals: ProcessingAuditExportTotals
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version processing blocker summary
+# --------------------------------------------------------------------------- #
+
+
+# One task's blocker classification. ``cause`` is the single primary category
+# by the priority attempts_exhausted > upstream_failed > direct_dependency, or
+# null when the task is not blocked; ``causes`` lists every category that hit,
+# sorted alphabetically and is empty for an unblocked task.
+BlockerCause = Literal[
+    "direct_dependency", "upstream_failed", "attempts_exhausted"
+]
+
+
+# Exactly these keys, in this order; only the locating/state fields are
+# reported, never the task's runs, attempts or timestamps.
+class ProcessingBlockerSummaryTask(BaseModel):
+    id: int
+    name: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    # One of the seven schedule-view literals, judged exactly as in that read.
+    schedule_state: ScheduleState
+    # Direct dependencies that have not succeeded, ascending; empty for
+    # non-pending tasks.
+    blocking_task_ids: list[int]
+    cause: BlockerCause | None
+    causes: list[BlockerCause]
+
+
+# Six mutually exclusive buckets of the seven schedule states: ready,
+# running, succeeded, failed (retryable tasks), exhausted and blocked
+# (upstream_failed merges into blocked). The six counts sum to the version's
+# task total.
+class ProcessingBlockerSummaryVersion(BaseModel):
+    version: int
+    tasks: list[ProcessingBlockerSummaryTask]
+    ready_count: int
+    running_count: int
+    succeeded_count: int
+    failed_count: int
+    exhausted_count: int
+    blocked_count: int
+
+
+# Every counter is the sum of the matching per-version values over the whole
+# dataset; ``version_count`` is the number of version entries.
+class ProcessingBlockerSummaryTotals(BaseModel):
+    version_count: int
+    task_count: int
+    ready_count: int
+    running_count: int
+    succeeded_count: int
+    failed_count: int
+    exhausted_count: int
+    blocked_count: int
+
+
+# Deterministic whole-dataset summary: exactly these keys, in this order.
+class ProcessingBlockerSummaryResponse(BaseModel):
+    dataset: str
+    versions: list[ProcessingBlockerSummaryVersion]
+    totals: ProcessingBlockerSummaryTotals
