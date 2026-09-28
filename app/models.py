@@ -400,6 +400,19 @@ class QualityRuleEvaluationRecord(BaseModel):
     created_at: str
 
 
+# Point-in-time single-evaluation look-back. Exactly the same keys, in the same
+# order, as one history record; sequence, row_count, violation_row_count and
+# created_at are null (never omitted) when the look-back window is empty.
+class QualityRuleEvaluationAtResponse(BaseModel):
+    sequence: int | None
+    dataset: str
+    version: int
+    row_count: int | None
+    violation_row_count: int | None
+    results: list[QualityRuleResult]
+    created_at: str | None
+
+
 class QualityRuleEvaluationSide(BaseModel):
     violation_count: int
     violations: list[int]

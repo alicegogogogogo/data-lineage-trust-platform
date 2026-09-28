@@ -373,6 +373,30 @@ and persisted (including their enabled state) across restarts.
   evaluations leave no record, and an empty `rows` submission is recorded
   with zero violations. The endpoint takes no request body and no query
   parameters (`422`); unknown dataset/version → `404`.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/evaluations/at?timestamp=...`
+  — read-only point-in-time companion of the evaluation history, appended one
+  segment after the history address and accepting GET only. `timestamp` must
+  be a timezone-bearing ISO-8601 date-time (an offset or trailing `Z`); only
+  evaluation summaries written at or before it count as the look-back window,
+  and the returned record is the window's highest-sequence one. The response
+  is a single summary with exactly the same fields, in the same order, as one
+  history record (`sequence`, `dataset`, `version`, `row_count`,
+  `violation_row_count`, `results` and `created_at`); the ordering of the
+  rule results never depends on database natural order. A window without any
+  recorded evaluation is a normal response, not an error: the same keys are
+  present but `sequence`, `row_count`, `violation_row_count` and `created_at`
+  are `null` and `results` is an empty list. Only persisted evaluation
+  summaries are read: rules are never re-run, history summaries are never
+  rewritten, nothing is cached or written, and the window grows naturally as
+  new evaluations are persisted, so the same data yields the same document
+  byte for byte across process restarts. The JSON document is deterministic
+  (fixed key order, compact whitespace, exactly one trailing newline). The
+  path dataset/version resolves first (`404`); afterwards any request body
+  bytes (whitespace-only included), a missing, repeated, unparseable or
+  timezone-less `timestamp`, or any other query parameter are a `422` that
+  writes nothing. Errors keep the stable `{"error", "detail"}` shape without
+  exposing SQL, stack traces or internal objects; the evaluation history, the
+  pairwise and point-in-time diffs and every other endpoint are unchanged.
 - `GET /datasets/{dataset}/versions/{version}/quality-rules/evaluations/diff`
   — read-only diff between the two most recent recorded evaluations
   (`from_sequence` → `to_sequence`). `added_violation_rows` /
