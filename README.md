@@ -409,8 +409,9 @@ and persisted (including their enabled state) across restarts.
   one side (disabled or created between the two evaluations) has a `null`
   side and `null` row-level diff fields. With fewer than two recorded
   evaluations the response is an explicit empty result (null sequences,
-  empty lists), not an error. Same `404`/`422` rules as the history
-  endpoint; nothing is written.
+  empty lists), not an error. The path dataset/version resolves first
+  (`404`); afterwards any request body bytes (whitespace-only included) or
+  any query parameter are a `422` that writes nothing.
 - `GET /datasets/{dataset}/versions/{version}/quality-rules/evaluations/diff/at?timestamp=...`
   — read-only point-in-time companion of the evaluation diff, appended one
   segment after the pairwise diff address and accepting GET only.
@@ -439,6 +440,42 @@ and persisted (including their enabled state) across restarts.
   writes nothing. Errors keep the stable `{"error", "detail"}` shape without
   exposing SQL, stack traces or internal objects; the evaluation history,
   the pairwise diff and every other endpoint are unchanged.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/evaluations/trend`
+  — read-only trend summary, appended one segment after the evaluation
+  history address and accepting GET only. The caller sends no request body
+  and no query parameter. The summary is computed fresh from the persisted
+  evaluation history on every read: rules are never re-run, history
+  summaries are never rewritten, nothing is cached or written, and the same
+  history yields the same document byte for byte across process restarts,
+  with every ordering explicit rather than dependent on database natural
+  order.
+  - `evaluations` lists one entry per evaluation ordered by ascending
+    `sequence`, each carrying the history summary's `created_at` (write
+    time), `row_count` (submitted rows) and `violation_row_count`, plus
+    `violation_row_count_delta` — the change in violation row count against
+    the previous evaluation; on the first evaluation it is `null` and the
+    key is never omitted.
+  - `rules` gives one row per rule that appears in the history, sorted by
+    rule id ascending, including rules that have since been disabled and
+    rules that never recorded a violation. Each row carries `rule_id` and
+    `name`, the cumulative `violation_row_count` (summed over evaluations),
+    the `violating_evaluation_count`, and `first_violation_sequence` /
+    `last_violation_sequence` — the sequences of the rule's first and last
+    violating evaluation, both `null` (never omitted) when the rule never
+    violated; its counts are zero in that case.
+  - `totals` reports the whole-version `evaluation_count`, the
+    `violation_row_count` total (the sum of the per-evaluation counts) and
+    the `rule_count` of distinct rules the history involves. An empty
+    history is an explicit empty result (empty `evaluations` and `rules`,
+    all-zero totals), returned normally rather than as an error.
+  - The JSON document is deterministic (fixed key order, compact
+    whitespace, lowercase booleans, exactly one trailing newline). The path
+    dataset/version resolves first (`404`); afterwards any request body
+    bytes (whitespace-only included) or any query parameter are a `422`
+    that writes nothing. Errors keep the stable `{"error", "detail"}`
+    shape without exposing SQL, stack traces or internal objects; the
+    evaluation history, the pairwise and point-in-time diffs, anomaly
+    detection and every other endpoint are unchanged.
 
 ### Quality anomaly detection
 

@@ -2433,6 +2433,7 @@ def _require_evaluation_path(
     body: bytes,
     query_keys: tuple[str, ...],
     endpoint: str,
+    reject_any_body_bytes: bool = False,
 ) -> tuple[dict, sqlite3.Row]:
     """Resolve the path (404) before rejecting body bytes/query params (422).
 
@@ -2440,10 +2441,15 @@ def _require_evaluation_path(
     run only once the dataset and version are known, so an unknown
     dataset/version stays a 404 (mirroring the parameterless audit-report
     endpoint).
+
+    By default a whitespace-only body is tolerated (``body.strip()``), the
+    historical behavior of the history list and the anomaly endpoints.
+    Endpoints whose documented contract rejects *any* request body bytes pass
+    ``reject_any_body_bytes=True`` so even a single space is a 422.
     """
     dataset = require_dataset(conn, dataset_name)
     version_row = _require_schema_version(conn, dataset, version_number)
-    if body.strip():
+    if (body if reject_any_body_bytes else body.strip()):
         raise RequestInvalidError(
             f"The {endpoint} endpoint does not accept a request body"
         )
@@ -2589,7 +2595,7 @@ def diff_quality_rule_evaluations(
     """
     dataset, version_row = _require_evaluation_path(
         conn, dataset_name, version_number, body=body, query_keys=query_keys,
-        endpoint="evaluation diff",
+        endpoint="evaluation diff", reject_any_body_bytes=True,
     )
     rows = conn.execute(
         "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
@@ -2735,6 +2741,141 @@ def get_quality_rule_evaluation_at(
         "violation_row_count": None,
         "results": [],
         "created_at": None,
+    }
+
+
+def trend_quality_rule_evaluations(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only trend summary over one version's evaluation history.
+
+    Appended one segment after the evaluation history address. Only already
+    persisted evaluation summaries are read: rules are never re-run, no
+    history summary is rewritten, and nothing is cached or written, so the
+    same history yields the same document byte for byte across process
+    restarts and every ordering is explicit rather than relying on database
+    natural order.
+
+    ``evaluations`` lists the recorded evaluations by ascending sequence —
+    one entry each with the history summary's ``created_at`` (write time),
+    ``row_count`` (submitted rows) and ``violation_row_count`` plus
+    ``violation_row_count_delta``, the violation row count change against the
+    immediately preceding evaluation (null on the first evaluation; the key
+    is never omitted).
+
+    ``rules`` holds one row per rule that appears anywhere in the history —
+    including rules disabled since and rules present in an evaluation without
+    violations. Rows sort by rule id ascending. Each row carries the rule id
+    and name, the cumulative violating row count (summed over evaluations),
+    the number of evaluations in which the rule violated, and the sequences
+    of the rule's first and last violating evaluation (both null — never
+    omitted — when it never violated; the counts are zero then).
+
+    ``totals`` reports the number of evaluations, the sum of the evaluations'
+    violation row counts and the number of distinct rules the history
+    involves. An empty history is an explicit empty result: empty lists and
+    all-zero totals, never an error.
+
+    The path dataset/version resolves first (404). Afterwards the presence of
+    any request body byte (whitespace-only included) or any query parameter
+    is a 422 that writes nothing.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body:
+        raise RequestInvalidError(
+            "The evaluation trend endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The evaluation trend endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT sequence, row_count, violation_row_count, results, created_at "
+        "FROM quality_rule_evaluations WHERE version_id = ? ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+
+    evaluations: list[dict] = []
+    # rule_id -> aggregation state accumulated in ascending sequence order.
+    rule_states: dict[int, dict[str, Any]] = {}
+    total_violation_rows = 0
+    previous_violation_rows: int | None = None
+    for row in rows:
+        violation_row_count = row["violation_row_count"]
+        if previous_violation_rows is None:
+            delta: int | None = None
+        else:
+            delta = violation_row_count - previous_violation_rows
+        evaluations.append(
+            {
+                "created_at": row["created_at"],
+                "row_count": row["row_count"],
+                "violation_row_count": violation_row_count,
+                "violation_row_count_delta": delta,
+            }
+        )
+        total_violation_rows += violation_row_count
+
+        for result in json.loads(row["results"]):
+            rule_id = result["rule_id"]
+            state = rule_states.get(rule_id)
+            if state is None:
+                # Rule names are immutable (only `enabled` can change), so the
+                # name carried by the first summary in which the rule appears
+                # is the one used on the trend row.
+                state = {
+                    "name": result["name"],
+                    "violation_row_count": 0,
+                    "violating_evaluation_count": 0,
+                    "first_violation_sequence": None,
+                    "last_violation_sequence": None,
+                }
+                rule_states[rule_id] = state
+            per_rule_count = len(result["violations"])
+            state["violation_row_count"] += per_rule_count
+            if per_rule_count:
+                state["violating_evaluation_count"] += 1
+                if state["first_violation_sequence"] is None:
+                    state["first_violation_sequence"] = row["sequence"]
+                state["last_violation_sequence"] = row["sequence"]
+
+        previous_violation_rows = violation_row_count
+
+    rules = [
+        {
+            "rule_id": rule_id,
+            "name": rule_states[rule_id]["name"],
+            "violation_row_count": rule_states[rule_id]["violation_row_count"],
+            "violating_evaluation_count": rule_states[rule_id][
+                "violating_evaluation_count"
+            ],
+            "first_violation_sequence": rule_states[rule_id][
+                "first_violation_sequence"
+            ],
+            "last_violation_sequence": rule_states[rule_id][
+                "last_violation_sequence"
+            ],
+        }
+        for rule_id in sorted(rule_states)
+    ]
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "evaluations": evaluations,
+        "rules": rules,
+        "totals": {
+            "evaluation_count": len(rows),
+            "violation_row_count": total_violation_rows,
+            "rule_count": len(rules),
+        },
     }
 
 

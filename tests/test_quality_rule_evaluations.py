@@ -310,6 +310,9 @@ def test_diff_rejects_body_and_query_params_without_writing(
     evaluate(client, [])
 
     assert client.request("GET", diff_path(), content=b"{}").status_code == 422
+    # Whitespace-only body bytes are request body bytes too.
+    assert client.request("GET", diff_path(), content=b" ").status_code == 422
+    assert client.request("GET", diff_path(), content=b" \t\n").status_code == 422
     assert client.get(diff_path(), params={"full": "1"}).status_code == 422
     assert (
         client.request("GET", diff_path("ghost"), content=b"{}").status_code == 404

@@ -442,6 +442,56 @@ class QualityRuleEvaluationDiffResponse(BaseModel):
     rules: list[QualityRuleEvaluationRuleDiff]
 
 
+# --------------------------------------------------------------------------- #
+# Read-only trend summary over the evaluation history
+# --------------------------------------------------------------------------- #
+
+
+# One evaluation in sequence order, carrying the history summary's write time,
+# submitted row count and violation row count (those keys keep their history
+# names) plus the violation row count difference against the immediately
+# preceding evaluation — null on the first evaluation, the key is never
+# omitted.
+class QualityRuleEvaluationTrendEntry(BaseModel):
+    created_at: str
+    row_count: int
+    violation_row_count: int
+    violation_row_count_delta: int | None
+
+
+# Per-rule aggregation across every recorded evaluation. A row exists for
+# every rule that appears in the history — including rules disabled since and
+# rules that never recorded a violation (zero counts and null first/last
+# violation sequences, the keys are never omitted).
+class QualityRuleEvaluationTrendRule(BaseModel):
+    rule_id: int
+    name: str
+    # Sum of the rule's distinct violating rows across the evaluations.
+    violation_row_count: int
+    # Number of evaluations in which the rule recorded at least one violation.
+    violating_evaluation_count: int
+    first_violation_sequence: int | None
+    last_violation_sequence: int | None
+
+
+# Whole-version totals: number of evaluations, the sum of the evaluations'
+# violation row counts and the number of distinct rules the history involves
+# (one per rule row, including never-violating ones).
+class QualityRuleEvaluationTrendTotals(BaseModel):
+    evaluation_count: int
+    violation_row_count: int
+    rule_count: int
+
+
+# Deterministic read-only trend: exactly these keys, in this order.
+class QualityRuleEvaluationTrendResponse(BaseModel):
+    dataset: str
+    version: int
+    evaluations: list[QualityRuleEvaluationTrendEntry]
+    rules: list[QualityRuleEvaluationTrendRule]
+    totals: QualityRuleEvaluationTrendTotals
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None
