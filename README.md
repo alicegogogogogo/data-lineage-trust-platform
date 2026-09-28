@@ -1527,6 +1527,46 @@ sweep and the deletion-request collection are otherwise unchanged.
   exactly `version_count`, `deletion_request_count`,
   `confirmed_request_count` and `proof_count`, each the sum of the
   per-version values over the whole dataset.
+- `GET /datasets/{dataset}/snapshot-scale-summary` — read-only cross-version
+  summary of the current row-count scale of the dataset's snapshots, computed
+  fresh on every read (no caching; nothing is written, modified or deleted,
+  and no snapshot, row, fingerprint, diff cache or deletion-proof record is
+  touched). Only currently persisted snapshots are counted: a confirmed-deleted
+  snapshot no longer appears and its rows count toward no statistic. The path
+  carries only the dataset name; the request takes no body and no query
+  parameters — any body bytes, including a purely whitespace or single-space
+  body, or any query parameter → `422`; an unknown dataset → `404`, checked
+  before the request shape, with the same 404-before-422 precedence as the
+  deletion compliance export. A dataset without schema versions, or one whose
+  versions have no snapshots, returns `200` normally, never an error. The
+  JSON document is deterministic (fixed key order, compact whitespace,
+  lowercase booleans, exactly one trailing newline; the same data renders
+  byte-identically after a process restart and ordering never depends on the
+  database's natural order):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"snapshots":[{"snapshot_id":1,"row_count":12,"created_at":"2026-01-01T00:00:00+00:00"},{"snapshot_id":2,"row_count":3,"created_at":"2026-01-02T00:00:00+00:00"}],"stats":{"snapshot_count":2,"total_row_count":15,"min_row_count":3,"max_row_count":12,"first_created_at":"2026-01-01T00:00:00+00:00","last_created_at":"2026-01-02T00:00:00+00:00"}}],"totals":{"version_count":1,"snapshot_count":2,"total_row_count":15,"min_row_count":3,"max_row_count":12,"first_created_at":"2026-01-01T00:00:00+00:00","last_created_at":"2026-01-02T00:00:00+00:00"}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions` and `totals` in that
+  order. `versions` is ordered by version number ascending and each entry has
+  exactly `version`, `snapshots` and `stats` in that order. `snapshots`
+  lists the version's currently persisted snapshots ordered by snapshot id
+  ascending; each entry has exactly `snapshot_id`, `row_count` (the currently
+  persisted number of rows) and `created_at` (the timezone-bearing write
+  time). `stats` has exactly `snapshot_count`, `total_row_count`,
+  `min_row_count`, `max_row_count`, `first_created_at` and
+  `last_created_at` in that order: the snapshot count and the row-count sum
+  are zero for a version without snapshots, and the minimum/maximum row
+  counts and earliest/latest write times are `null` then — the keys are never
+  omitted. Several snapshots written at the same instant are ordered by
+  snapshot id ascending, so the earliest/latest write times never depend on
+  database order. `totals` has exactly `version_count`, `snapshot_count`,
+  `total_row_count`, `min_row_count`, `max_row_count`, `first_created_at` and
+  `last_created_at`: the first three are the sums of the matching
+  per-version values, while the extrema and the time range are taken over
+  every currently persisted snapshot of the whole dataset (all `null` when no
+  snapshot exists).
 
 ### Processing tasks
 

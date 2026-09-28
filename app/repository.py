@@ -8412,6 +8412,145 @@ def export_dataset_deletion_compliance(
     return {"dataset": dataset["name"], "versions": versions, "totals": totals}
 
 
+def export_dataset_snapshot_scales(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset summary of the extant snapshots' row scale.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry lists the version's currently persisted snapshots in
+    snapshot id ascending order — each carrying its id, its currently persisted
+    row count and its timezone-bearing write time — together with the
+    snapshot count, the row-count total, the minimum and maximum row counts
+    and the earliest and latest write times (the four extrema are ``None``
+    when the version has no snapshot, but the keys are never omitted).
+    Confirmed-deleted snapshots no longer have a row in ``snapshots``, so they
+    neither appear nor count toward any statistic; write-time ties are broken
+    by snapshot id ascending rather than by database order.
+
+    ``totals`` covers the version count, the snapshot count and the row-count
+    total (each the sum of the per-version values) plus the overall minimum
+    and maximum row counts and the overall earliest and latest write times
+    over every currently persisted snapshot of the whole dataset (all
+    ``None`` when none exists). A dataset without versions yields an empty
+    version list and all-zero/None totals, never an error.
+
+    The summary is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a snapshot, its rows, its fingerprint, the
+    diff cache or the deletion-proof chain. The dataset resolves first
+    (404); any request body bytes (whitespace-only included) or any query
+    parameter is a 422 checked afterwards, matching the deletion compliance
+    export.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the compliance export reads.
+    if body:
+        raise RequestInvalidError(
+            "The snapshot scale summary endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot scale summary endpoint does not accept query parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    all_row_counts: list[int] = []
+    # (parsed write time, snapshot id, stored write time) for the whole-dataset
+    # time range; the id breaks same-instant ties ascending.
+    all_time_keys: list[tuple[datetime, int, str]] = []
+
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        # Only extant snapshots: a confirmed deletion removes the snapshot
+        # row in the same transaction that writes its proof, so nothing extra
+        # has to be filtered. Explicit id ordering keeps the list independent
+        # of the database's natural row order.
+        snapshot_rows = conn.execute(
+            "SELECT id, row_count, created_at FROM snapshots "
+            "WHERE version_id = ? ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+
+        snapshots = [
+            {
+                "snapshot_id": row["id"],
+                "row_count": row["row_count"],
+                "created_at": row["created_at"],
+            }
+            for row in snapshot_rows
+        ]
+
+        row_counts = [row["row_count"] for row in snapshot_rows]
+        time_keys = [
+            (datetime.fromisoformat(row["created_at"]), row["id"], row["created_at"])
+            for row in snapshot_rows
+        ]
+        if row_counts:
+            stats = {
+                "snapshot_count": len(snapshots),
+                "total_row_count": sum(row_counts),
+                "min_row_count": min(row_counts),
+                "max_row_count": max(row_counts),
+                "first_created_at": min(time_keys)[2],
+                "last_created_at": max(time_keys)[2],
+            }
+        else:
+            stats = {
+                "snapshot_count": 0,
+                "total_row_count": 0,
+                "min_row_count": None,
+                "max_row_count": None,
+                "first_created_at": None,
+                "last_created_at": None,
+            }
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "snapshots": snapshots,
+                "stats": stats,
+            }
+        )
+        all_row_counts.extend(row_counts)
+        all_time_keys.extend(time_keys)
+
+    if all_row_counts:
+        totals = {
+            "version_count": len(versions),
+            "snapshot_count": len(all_row_counts),
+            "total_row_count": sum(all_row_counts),
+            "min_row_count": min(all_row_counts),
+            "max_row_count": max(all_row_counts),
+            "first_created_at": min(all_time_keys)[2],
+            "last_created_at": max(all_time_keys)[2],
+        }
+    else:
+        totals = {
+            "version_count": len(versions),
+            "snapshot_count": 0,
+            "total_row_count": 0,
+            "min_row_count": None,
+            "max_row_count": None,
+            "first_created_at": None,
+            "last_created_at": None,
+        }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
 # --------------------------------------------------------------------------- #
 # Retention sweep (batch deletion-request creation over one version)
 # --------------------------------------------------------------------------- #
