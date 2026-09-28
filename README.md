@@ -323,6 +323,34 @@ schema version in a different (source) dataset.
   likewise a `422`); unknown dataset/version/field → `404`, with `404`
   taking precedence over every `422` except that a repeated `field` is judged
   before the field lookup and is therefore always a `422`.
+- `GET /datasets/{dataset}/lineage-coverage` — read-only whole-dataset check
+  reporting, for every schema version at once, how the version's fields are
+  covered by registered lineage mappings. Versions are sorted by version
+  number ascending and a dataset without versions returns an empty `versions`
+  array, never an error. Each version entry has exactly `version`, `fields`,
+  `linked_field_count`, `unlinked_field_count` and `mapping_count` in that
+  order; `fields` lists every field of the version sorted by field name, each
+  entry having exactly `field`, `sources` and `source_dataset_count`.
+  `sources` lists every mapping source registered with the field as its
+  target; each reference has the location keys `dataset`, `version` and
+  `field` in that order, is deduplicated and sorted by those three keys
+  ascending, and the sort never depends on database order. A field without a
+  source is listed all the same with an empty `sources` array and a
+  `source_dataset_count` of zero; that count counts the distinct source
+  dataset names among the references, never the number of mappings.
+  `mapping_count` equals the sum of the fields' source-reference counts and
+  `linked_field_count` plus `unlinked_field_count` equals the number of
+  fields. The JSON document is deterministic (fixed key order, compact
+  whitespace, exactly one trailing newline) with top-level keys `dataset`,
+  `versions` and `totals` in that order; `totals` gives `version_count`,
+  `field_count`, `linked_field_count`, `unlinked_field_count` and
+  `mapping_count`, each equal to the sum of the matching per-version values
+  (all zero for a dataset without versions). The check is recomputed on
+  every read and never writes: lineage mappings and the impact cache are
+  never inserted, invalidated, repaired or otherwise touched. The endpoint
+  takes no request body and no query parameters; any body bytes
+  (whitespace-only included) or query parameter → `422`, and an unknown
+  dataset → `404`, with `404` taking precedence over the shape checks.
 
   Impact results are cached persistently (they survive restarts) and every
   read reflects the currently committed lineage graph: creating a schema

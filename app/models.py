@@ -240,6 +240,54 @@ class LineageSourcePathsResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only whole-dataset lineage registration coverage check
+# --------------------------------------------------------------------------- #
+
+
+# One target field's registration coverage within one schema version.
+# ``sources`` lists every mapping source registered with the field as its
+# target, each located by the ``dataset``, ``version`` and ``field`` keys;
+# references are deduplicated and sorted by those three keys ascending. A
+# field without a source is listed all the same with an empty ``sources``
+# list. ``source_dataset_count`` counts the distinct source dataset names
+# among the references (zero for a field without sources), never the number
+# of mappings.
+class LineageCoverageField(BaseModel):
+    field: str
+    sources: list[LineageSourceRef]
+    source_dataset_count: int
+
+
+# One schema version's coverage summary. Exactly these keys, in this order:
+# the version number, its field list and the linked, unlinked and mapping
+# counts. ``mapping_count`` equals the sum of the fields' source-reference
+# counts and linked plus unlinked equals the number of fields.
+class LineageCoverageVersion(BaseModel):
+    version: int
+    fields: list[LineageCoverageField]
+    linked_field_count: int
+    unlinked_field_count: int
+    mapping_count: int
+
+
+class LineageCoverageTotals(BaseModel):
+    version_count: int
+    field_count: int
+    linked_field_count: int
+    unlinked_field_count: int
+    mapping_count: int
+
+
+# Deterministic whole-dataset coverage check: exactly these keys, in this
+# order. Each total equals the sum of the matching per-version values; a
+# dataset without versions yields an empty version list and all-zero totals.
+class LineageCoverageResponse(BaseModel):
+    dataset: str
+    versions: list[LineageCoverageVersion]
+    totals: LineageCoverageTotals
+
+
+# --------------------------------------------------------------------------- #
 # Read-only breaking-change compatibility check with downstream impact
 # --------------------------------------------------------------------------- #
 
