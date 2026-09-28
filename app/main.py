@@ -835,6 +835,46 @@ def diff_quality_rule_evaluations(
     )
 
 
+# As-of (point-in-time) evaluation diff, appended one segment after the bare
+# pairwise diff and accepting GET only. Only evaluations written at or before
+# the 'timestamp' query parameter count, and the two highest-sequence records
+# of that window are compared with exactly the bare diff's semantics. Read-only
+# and recomputed on every call; serialized directly so the key order is fixed,
+# the whitespace is compact and the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/quality-rules/evaluations/diff/at",
+    response_model=QualityRuleEvaluationDiffResponse,
+)
+def diff_quality_rule_evaluations_at(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset/version resolves first (404); any body bytes
+    # (whitespace-only included), a missing/repeated/unparseable/timezone-less
+    # 'timestamp' or any other query parameter is a 422 validated in the
+    # repository afterwards. The raw query pairs are passed through so a
+    # repeated 'timestamp' is rejected instead of silently collapsed.
+    diff = QualityRuleEvaluationDiffResponse(
+        **repository.diff_quality_rule_evaluations_at(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_params=tuple(request.query_params.multi_items()),
+        )
+    )
+    payload = json.dumps(
+        diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
 @app.get(
     "/datasets/{dataset_name}/versions/{version}/quality-rules/evaluations",
     response_model=list[QualityRuleEvaluationRecord],

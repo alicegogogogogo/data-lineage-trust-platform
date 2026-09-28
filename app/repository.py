@@ -2508,7 +2508,88 @@ def diff_quality_rule_evaluations(
         "ORDER BY sequence DESC LIMIT 2",
         (version_row["id"],),
     ).fetchall()
+    return _evaluation_diff_result(dataset, version_row, rows)
 
+
+def diff_quality_rule_evaluations_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_params: tuple[tuple[str, str], ...] = (),
+) -> dict:
+    """Read-only diff between the two newest evaluations written by an instant.
+
+    The comparison semantics are exactly those of
+    ``diff_quality_rule_evaluations`` (shared through
+    ``_evaluation_diff_result``): the two participating evaluations are the
+    ones with the highest ``sequence`` among the records whose ``created_at``
+    is at or before the ``timestamp`` query parameter (a timezone-bearing
+    ISO-8601 date-time); the newest of the two is ``to`` and its immediate
+    predecessor inside the window is ``from``. With fewer than two recorded
+    evaluations in the window the result is the same explicit empty result as
+    the bare diff (null sequences, empty lists), never an error.
+
+    The read is strictly read-only and recomputed every time: nothing is
+    cached, written, re-run or rewritten, so the same persisted data yields the
+    same document across calls and process restarts, and the window expands
+    naturally as new evaluations are persisted.
+
+    The path dataset/version resolves first (404). Afterwards every shape
+    problem is a 422 that writes nothing: any request body bytes (including
+    whitespace-only ones), a missing, repeated, unparseable or timezone-less
+    ``timestamp``, or any other query parameter.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body:
+        raise RequestInvalidError(
+            "The evaluation diff endpoint does not accept a request body"
+        )
+    extra_keys = sorted({key for key, _ in query_params} - {"timestamp"})
+    if extra_keys:
+        raise RequestInvalidError(
+            "The evaluation diff endpoint does not accept query parameter(s): "
+            + ", ".join(extra_keys)
+        )
+    timestamps = [value for key, value in query_params if key == "timestamp"]
+    if not timestamps:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' is required and must be an ISO-8601 "
+            "date-time"
+        )
+    if len(timestamps) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must appear exactly once"
+        )
+    target = _parse_at_timestamp(timestamps[0])
+
+    rows = conn.execute(
+        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence ASC",
+        (version_row["id"],),
+    ).fetchall()
+    in_window = [
+        row for row in rows if datetime.fromisoformat(row["created_at"]) <= target
+    ]
+    return _evaluation_diff_result(dataset, version_row, list(reversed(in_window[-2:])))
+
+
+def _evaluation_diff_result(
+    dataset: dict,
+    version_row: sqlite3.Row,
+    rows: list[sqlite3.Row],
+) -> dict:
+    """The pairwise evaluation diff document for ``rows`` ordered newest-first.
+
+    Shared verbatim by the bare diff (the two latest evaluations of the full
+    history) and the as-of diff (the two latest evaluations inside the
+    lookback window). ``rows`` is expected newest-first; with fewer than two
+    rows the result is the explicit empty document (null sequences, empty
+    lists). Rule ids are sorted explicitly and row indices sorted, so the
+    document never depends on the database's natural order.
+    """
     empty = {
         "dataset": dataset["name"],
         "version": version_row["version"],

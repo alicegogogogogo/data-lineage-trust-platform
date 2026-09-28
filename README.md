@@ -386,6 +386,25 @@ and persisted (including their enabled state) across restarts.
   evaluations the response is an explicit empty result (null sequences,
   empty lists), not an error. Same `404`/`422` rules as the history
   endpoint; nothing is written.
+- `GET /datasets/{dataset}/versions/{version}/quality-rules/evaluations/diff/at?timestamp=...`
+  — the same pairwise diff as it stood at a requested instant. `timestamp`
+  must be a timezone-bearing ISO-8601 date-time; only evaluations written at
+  or before it count, and the two records with the highest `sequence` inside
+  that window are compared with exactly the bare diff's semantics
+  (`added_violation_rows` / `removed_violation_rows`, per-rule
+  `before`/`after` sides with null kept — never omitted — on a missing side,
+  per-rule added/removed row indices and `violation_count_delta`). With
+  fewer than two recorded evaluations in the window the response is the same
+  explicit empty result (null sequences, empty lists), not an error. The
+  response is the same deterministic document shape as the bare diff (fixed
+  key order, compact whitespace, exactly one trailing newline), recomputed
+  on every read: nothing is cached, written, re-run or rewritten, so results
+  are byte-identical across restarts and the window expands naturally as
+  evaluations are persisted. The endpoint accepts GET only. The path
+  dataset/version resolves first (`404`); afterwards any request body bytes
+  (whitespace-only included), a missing, repeated, unparseable or
+  timezone-less `timestamp`, or any other query parameter are a `422` that
+  writes nothing.
 
 ### Quality anomaly detection
 
