@@ -2662,6 +2662,82 @@ def diff_quality_rule_evaluations_at(
     return _evaluation_diff_document(dataset, version_row, in_window[:2])
 
 
+def get_quality_rule_evaluation_at(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_params: tuple[tuple[str, str], ...] = (),
+) -> dict:
+    """Read-only single-record look-back over evaluations written at or before
+    the requested instant.
+
+    The point-in-time companion of ``list_quality_rule_evaluations`` (the
+    evaluation history), appended one segment after its address. The look-back
+    window holds the persisted evaluations whose write time is not later than
+    the ``timestamp`` query parameter (a timezone-bearing ISO-8601 date-time),
+    and the returned summary is the window's highest-sequence record in exactly
+    the shape of one history entry. A window without any evaluation is not an
+    error: the same key set is still returned with ``sequence``,
+    ``row_count``, ``violation_row_count`` and ``created_at`` null and
+    ``results`` an empty list.
+
+    Only already persisted evaluation summaries are consulted — rules are
+    never re-run and no history summary is rewritten — and nothing is cached
+    or written, so repeated calls and restarts return identical documents and
+    the window grows naturally as new evaluations are persisted.
+
+    The path dataset/version resolves first (404). Afterwards every shape
+    problem is a 422 that writes nothing: any request body bytes (including
+    whitespace-only ones), a missing, repeated, unparseable or timezone-less
+    ``timestamp``, or any other query parameter.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    if body:
+        raise RequestInvalidError(
+            "The evaluation history endpoint does not accept a request body"
+        )
+    extra_keys = sorted({key for key, _ in query_params} - {"timestamp"})
+    if extra_keys:
+        raise RequestInvalidError(
+            "The evaluation history endpoint does not accept query parameter(s): "
+            + ", ".join(extra_keys)
+        )
+    timestamps = [value for key, value in query_params if key == "timestamp"]
+    if not timestamps:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' is required and must be an ISO-8601 "
+            "date-time"
+        )
+    if len(timestamps) > 1:
+        raise RequestInvalidError(
+            "Query parameter 'timestamp' must appear exactly once"
+        )
+    target = _parse_at_timestamp(timestamps[0])
+
+    rows = conn.execute(
+        "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
+        "ORDER BY sequence DESC",
+        (version_row["id"],),
+    ).fetchall()
+    for row in rows:
+        if datetime.fromisoformat(row["created_at"]) <= target:
+            return _evaluation_row_to_dict(
+                row, dataset["name"], version_row["version"]
+            )
+    return {
+        "sequence": None,
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "row_count": None,
+        "violation_row_count": None,
+        "results": [],
+        "created_at": None,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Quality anomaly detection over the evaluation history
 # --------------------------------------------------------------------------- #

@@ -72,6 +72,7 @@ from app.models import (
     QualityRuleEvaluateResponse,
     QualityRuleEvaluationDiffResponse,
     QualityRuleEvaluationRecord,
+    QualityRuleEvaluationAtResponse,
     QualityGateResponse,
     QualityGateExportResponse,
     RetentionPolicy,
@@ -856,6 +857,48 @@ def list_quality_rule_evaluations(
             query_keys=tuple(request.query_params.keys()),
         )
     ]
+
+
+# Read-only point-in-time companion of the evaluation history, appended one
+# segment after its address and accepting GET only. It returns one summary —
+# the highest-sequence evaluation written at or before the 'timestamp' query
+# parameter — in exactly the single-record shape of the history; a window with
+# no evaluation is a normal response carrying the same keys with null values.
+# Nothing is cached, re-run or written. The body is serialized directly
+# (rather than through the default JSON response) so the key order is fixed,
+# the whitespace is compact and the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/quality-rules/evaluations/at",
+    response_model=QualityRuleEvaluationAtResponse,
+)
+def get_quality_rule_evaluation_at(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset/version resolves first (404); any body bytes
+    # (whitespace-only included), a missing/repeated/unparseable/timezone-less
+    # 'timestamp' or any other query parameter are a 422 validated in the
+    # repository afterwards. The raw query pairs are passed through so a
+    # repeated 'timestamp' is rejected instead of silently collapsed.
+    record = QualityRuleEvaluationAtResponse(
+        **repository.get_quality_rule_evaluation_at(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_params=tuple(request.query_params.multi_items()),
+        )
+    )
+    payload = json.dumps(
+        record.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # Read-only point-in-time companion of the evaluation diff, appended one
