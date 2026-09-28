@@ -76,6 +76,7 @@ from app.models import (
     QualityRuleEvaluationTrendResponse,
     QualityGateResponse,
     QualityGateExportResponse,
+    QualityRuleCoverageResponse,
     RetentionPolicy,
     RetentionPolicyCreate,
     RetentionException,
@@ -1098,6 +1099,51 @@ def export_dataset_quality_gate(
     )
     payload = json.dumps(
         export.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version quality rule coverage check
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that reports, for every schema version at once, which
+# fields the quality rules reference and whether the referencing rules are
+# enabled or disabled. The path carries only the dataset name; there is no
+# request body or query parameter.
+QUALITY_RULE_COVERAGE_PATH = "/datasets/{dataset_name}/quality-rule-coverage"
+
+
+@app.get(
+    QUALITY_RULE_COVERAGE_PATH,
+    response_model=QualityRuleCoverageResponse,
+)
+def get_quality_rule_coverage(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset is known, preserving the same 404 precedence as the compliance
+    # exports. Recomputed on every read; no rule definition or identification
+    # record is ever written. The body is serialized directly (rather than
+    # through the default JSON response) so the key order is fixed, the
+    # whitespace is compact and the document ends with exactly one newline.
+    coverage = QualityRuleCoverageResponse(
+        **repository.quality_rule_coverage(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        coverage.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

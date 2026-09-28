@@ -3457,6 +3457,150 @@ def export_dataset_quality_gate(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version quality rule coverage check
+# --------------------------------------------------------------------------- #
+
+
+def _quality_rule_referenced_fields(kind: str, params: dict[str, Any]) -> list[str]:
+    """Field names a rule references: one for the scalar kinds, every entry
+    of ``fields`` for a 'unique' rule."""
+    if kind == "unique":
+        return list(params["fields"])
+    return [params["field"]]
+
+
+def quality_rule_coverage(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset quality rule coverage check.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry lists every field of the version (ordered by field
+    name) with its coverage state — ``enabled`` (at least one enabled rule
+    references the field), ``disabled`` (every referencing rule is disabled)
+    or ``unregistered`` (no rule references the field) — together with the
+    distinct kinds of the referencing rules (sorted by literal ascending) and
+    their distinct ids (sorted ascending); a 'unique' rule references every
+    field in its ``fields`` parameter. Both lists are null (never omitted) for
+    a field no rule references. ``totals`` reports the three per-state counts
+    (summing the version entries), the version count and the field count; a
+    dataset without versions yields an empty version list and all-zero
+    totals, never an error.
+
+    The check is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a rule definition or an identification
+    record. Like the compliance exports, the dataset resolves first (404);
+    any request body bytes (whitespace-only included) or any query parameter
+    is a 422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the quality gate export.
+    if body:
+        raise RequestInvalidError(
+            "The quality rule coverage endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The quality rule coverage endpoint does not accept query parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        field_rows = conn.execute(
+            "SELECT name FROM schema_fields WHERE version_id = ? "
+            "ORDER BY name ASC",
+            (version_id,),
+        ).fetchall()
+        rule_rows = conn.execute(
+            "SELECT id, kind, params, enabled FROM quality_rules "
+            "WHERE version_id = ? ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+
+        # Per field: the enabled/disabled rule ids and rule kinds referencing
+        # it. Referenced field names always exist in the version (validated at
+        # rule creation); ids and kinds are deduplicated here regardless.
+        enabled_ids: dict[str, set[int]] = {}
+        disabled_ids: dict[str, set[int]] = {}
+        kinds_by_field: dict[str, set[str]] = {}
+        for rule_row in rule_rows:
+            rule_id = rule_row["id"]
+            kind = rule_row["kind"]
+            params = json.loads(rule_row["params"])
+            target = enabled_ids if rule_row["enabled"] else disabled_ids
+            for name in _quality_rule_referenced_fields(kind, params):
+                target.setdefault(name, set()).add(rule_id)
+                kinds_by_field.setdefault(name, set()).add(kind)
+
+        fields: list[dict] = []
+        for field_row in field_rows:
+            name = field_row["name"]
+            enabled_rule_ids = enabled_ids.get(name, set())
+            disabled_rule_ids = disabled_ids.get(name, set())
+            if enabled_rule_ids:
+                coverage = "enabled"
+            elif disabled_rule_ids:
+                coverage = "disabled"
+            else:
+                coverage = "unregistered"
+            if coverage == "unregistered":
+                kinds: list[str] | None = None
+                rule_id_list: list[int] | None = None
+            else:
+                kinds = sorted(kinds_by_field[name])
+                rule_id_list = sorted(enabled_rule_ids | disabled_rule_ids)
+            fields.append(
+                {
+                    "field": name,
+                    "coverage": coverage,
+                    "kinds": kinds,
+                    "rule_ids": rule_id_list,
+                }
+            )
+
+        versions.append({"version": version_row["version"], "fields": fields})
+
+    totals = {
+        "enabled_count": sum(
+            1
+            for version in versions
+            for field in version["fields"]
+            if field["coverage"] == "enabled"
+        ),
+        "disabled_count": sum(
+            1
+            for version in versions
+            for field in version["fields"]
+            if field["coverage"] == "disabled"
+        ),
+        "unregistered_count": sum(
+            1
+            for version in versions
+            for field in version["fields"]
+            if field["coverage"] == "unregistered"
+        ),
+        "version_count": len(versions),
+        "field_count": sum(len(version["fields"]) for version in versions),
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 

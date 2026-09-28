@@ -614,6 +614,47 @@ class QualityGateExportResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version quality rule coverage check
+# --------------------------------------------------------------------------- #
+
+
+# One field's rule coverage as it appears in the check, sorted by field name.
+# ``coverage`` is "enabled" when at least one enabled rule references the
+# field, "disabled" when every referencing rule is disabled and "unregistered"
+# when no rule references it. A 'unique' rule references every field in its
+# ``fields`` parameter. ``kinds`` lists the distinct referencing rule kinds by
+# literal ascending and ``rule_ids`` the distinct referencing rule ids
+# ascending; both are null (never omitted) when no rule references the field.
+class QualityRuleCoverageField(BaseModel):
+    field: str
+    coverage: Literal["enabled", "disabled", "unregistered"]
+    kinds: list[str] | None
+    rule_ids: list[int] | None
+
+
+# One schema version's coverage summary. Exactly these keys, in this order.
+class QualityRuleCoverageVersion(BaseModel):
+    version: int
+    fields: list[QualityRuleCoverageField]
+
+
+class QualityRuleCoverageTotals(BaseModel):
+    enabled_count: int
+    disabled_count: int
+    unregistered_count: int
+    version_count: int
+    field_count: int
+
+
+# Deterministic whole-dataset coverage check: exactly these keys, in this
+# order.
+class QualityRuleCoverageResponse(BaseModel):
+    dataset: str
+    versions: list[QualityRuleCoverageVersion]
+    totals: QualityRuleCoverageTotals
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 
