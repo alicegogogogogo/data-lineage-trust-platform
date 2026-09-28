@@ -73,6 +73,7 @@ from app.models import (
     QualityRuleEvaluationDiffResponse,
     QualityRuleEvaluationRecord,
     QualityRuleEvaluationAtResponse,
+    QualityRuleEvaluationTrendResponse,
     QualityGateResponse,
     QualityGateExportResponse,
     RetentionPolicy,
@@ -936,6 +937,45 @@ def diff_quality_rule_evaluations_at(
     )
     payload = json.dumps(
         diff.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# Read-only trend aggregate of the evaluation history, appended one segment
+# after the history address and accepting GET only. It is computed fresh from
+# the persisted summaries on every call — rules are never re-run, summaries
+# are never rewritten, and nothing is cached or written. The body is
+# serialized directly (rather than through the default JSON response) so the
+# key order is fixed, the whitespace is compact, booleans are lowercase and
+# the document ends with exactly one newline.
+@app.get(
+    "/datasets/{dataset_name}/versions/{version}"
+    "/quality-rules/evaluations/trend",
+    response_model=QualityRuleEvaluationTrendResponse,
+)
+def get_quality_rule_evaluation_trend(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # The path dataset/version resolves first (404); any body bytes
+    # (whitespace-only included) or any query parameter are a 422 validated
+    # in the repository afterwards.
+    trend = QualityRuleEvaluationTrendResponse(
+        **repository.get_quality_rule_evaluation_trend(
+            conn,
+            dataset_name,
+            version,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        trend.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

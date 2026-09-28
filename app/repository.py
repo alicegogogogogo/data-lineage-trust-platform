@@ -2433,6 +2433,7 @@ def _require_evaluation_path(
     body: bytes,
     query_keys: tuple[str, ...],
     endpoint: str,
+    body_must_be_empty: bool = False,
 ) -> tuple[dict, sqlite3.Row]:
     """Resolve the path (404) before rejecting body bytes/query params (422).
 
@@ -2440,10 +2441,16 @@ def _require_evaluation_path(
     run only once the dataset and version are known, so an unknown
     dataset/version stays a 404 (mirroring the parameterless audit-report
     endpoint).
+
+    By default a body containing only whitespace is tolerated for backwards
+    compatibility with the older endpoints; endpoints whose public contract
+    rejects any body bytes (whitespace-only included) pass
+    ``body_must_be_empty=True``.
     """
     dataset = require_dataset(conn, dataset_name)
     version_row = _require_schema_version(conn, dataset, version_number)
-    if body.strip():
+    has_body = body if body_must_be_empty else body.strip()
+    if has_body:
         raise RequestInvalidError(
             f"The {endpoint} endpoint does not accept a request body"
         )
@@ -2589,7 +2596,7 @@ def diff_quality_rule_evaluations(
     """
     dataset, version_row = _require_evaluation_path(
         conn, dataset_name, version_number, body=body, query_keys=query_keys,
-        endpoint="evaluation diff",
+        endpoint="evaluation diff", body_must_be_empty=True,
     )
     rows = conn.execute(
         "SELECT * FROM quality_rule_evaluations WHERE version_id = ? "
@@ -2735,6 +2742,159 @@ def get_quality_rule_evaluation_at(
         "violation_row_count": None,
         "results": [],
         "created_at": None,
+    }
+
+
+def get_quality_rule_evaluation_trend(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only trend aggregate over the version's evaluation history.
+
+    The aggregate is computed fresh from the persisted evaluation summaries
+    and rule definitions on every call: nothing is cached, written, re-run or
+    rewritten. It has two parts:
+
+    * ``evaluations`` — one point per recorded evaluation in sequence
+      ascending, reusing the history-summary keys ``sequence``, ``created_at``,
+      ``row_count`` and ``violation_row_count``, each followed by
+      ``violation_row_count_delta`` (the change in violation rows against the
+      previous evaluation; null — never omitted — on the first one).
+    * ``rules`` — one row per rule that appears in the recorded history,
+      sorted by rule id ascending. That is every rule with a result in some
+      evaluation, including rules that always passed and rules later
+      disabled (their older results stay in the history); a rule that never
+      ran in any recorded evaluation (e.g. created after the last
+      evaluation) has no result to aggregate and is absent, so an empty
+      history yields an empty rule collection. Each row carries the rule's
+      id and name, the cumulative number of violating rows attributed to
+      the rule, the number of evaluations in which the rule violated, and
+      the first/last evaluation sequence at which it violated (both null —
+      never omitted — for a rule that appeared but never violated).
+
+    ``totals`` reports the number of recorded evaluations, their summed
+    violation row counts and the number of rules involved in at least one
+    violation. An empty history yields an explicit empty result: the series
+    and rule collections are empty and every total is zero, never an error.
+    Every ordering is applied explicitly, so the same history produces the
+    same document byte for byte across processes and restarts without
+    relying on database natural order.
+
+    The path dataset/version resolves first (404); any request body bytes
+    (whitespace-only included) or any query parameter are a 422 checked
+    afterwards, and nothing is written on any rejection.
+    """
+    dataset, version_row = _require_evaluation_path(
+        conn,
+        dataset_name,
+        version_number,
+        body=body,
+        query_keys=query_keys,
+        endpoint="evaluation trend",
+        body_must_be_empty=True,
+    )
+    version_id = version_row["id"]
+
+    history_rows = conn.execute(
+        "SELECT sequence, row_count, violation_row_count, results, created_at "
+        "FROM quality_rule_evaluations WHERE version_id = ? ORDER BY sequence ASC",
+        (version_id,),
+    ).fetchall()
+
+    evaluations: list[dict] = []
+    previous_violation_rows: int | None = None
+    total_violation_rows = 0
+    # Every rule that appears in at least one recorded evaluation result —
+    # including rules that always passed and rules disabled before later
+    # evaluations — gets a trend row. A rule that never ran in any recorded
+    # evaluation (e.g. created after the last evaluation) does not appear, so
+    # an empty history naturally yields an empty rule collection.
+    # rule_id -> {"violation_row_count", "evaluation_count",
+    #             "first_sequence", "last_sequence"}
+    by_rule: dict[int, dict[str, Any]] = {}
+    for row in history_rows:
+        violation_rows = row["violation_row_count"]
+        total_violation_rows += violation_rows
+        if previous_violation_rows is None:
+            delta: int | None = None
+        else:
+            delta = violation_rows - previous_violation_rows
+        evaluations.append(
+            {
+                "sequence": row["sequence"],
+                "created_at": row["created_at"],
+                "row_count": row["row_count"],
+                "violation_row_count": violation_rows,
+                "violation_row_count_delta": delta,
+            }
+        )
+        previous_violation_rows = violation_rows
+
+        # The recorded results of one evaluation hold one entry per rule that
+        # ran, ordered by rule id. A rule contributes to its counts exactly
+        # when its result lists violating rows; the violation count sums over
+        # evaluations (the same 0-based row index violating in several
+        # evaluations counts each time). Pass-only results still register the
+        # rule so it gets a zero-count trend row.
+        for result in json.loads(row["results"]):
+            rule_id = result["rule_id"]
+            aggregate = by_rule.setdefault(
+                rule_id,
+                {
+                    "violation_row_count": 0,
+                    "evaluation_count": 0,
+                    "first_sequence": None,
+                    "last_sequence": None,
+                },
+            )
+            violations = result["violations"]
+            if violations:
+                if aggregate["first_sequence"] is None:
+                    aggregate["first_sequence"] = row["sequence"]
+                aggregate["violation_row_count"] += len(violations)
+                aggregate["evaluation_count"] += 1
+                aggregate["last_sequence"] = row["sequence"]
+
+    # Rule names come from the current registration. Rules cannot be deleted
+    # individually (they only disappear with the version itself, which
+    # cascades the evaluations away), so every rule seen above is registered.
+    rule_names = {
+        rule_row["id"]: rule_row["name"]
+        for rule_row in conn.execute(
+            "SELECT id, name FROM quality_rules WHERE version_id = ?",
+            (version_id,),
+        ).fetchall()
+    }
+
+    rules: list[dict] = [
+        {
+            "rule_id": rule_id,
+            "name": rule_names[rule_id],
+            "violation_row_count": aggregate["violation_row_count"],
+            "evaluation_count": aggregate["evaluation_count"],
+            "first_violation_sequence": aggregate["first_sequence"],
+            "last_violation_sequence": aggregate["last_sequence"],
+        }
+        for rule_id, aggregate in sorted(by_rule.items())
+    ]
+    involved_rule_count = sum(
+        1 for aggregate in by_rule.values() if aggregate["evaluation_count"]
+    )
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "evaluations": evaluations,
+        "rules": rules,
+        "totals": {
+            "evaluation_count": len(history_rows),
+            "violation_row_count": total_violation_rows,
+            "rule_count": involved_rule_count,
+        },
     }
 
 

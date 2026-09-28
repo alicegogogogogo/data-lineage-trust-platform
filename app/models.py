@@ -442,6 +442,54 @@ class QualityRuleEvaluationDiffResponse(BaseModel):
     rules: list[QualityRuleEvaluationRuleDiff]
 
 
+# --------------------------------------------------------------------------- #
+# Quality rule evaluation history trend (read-only aggregate)
+# --------------------------------------------------------------------------- #
+
+
+# One point per recorded evaluation, in sequence ascending. The keys reuse the
+# vocabulary of the history summary; ``violation_row_count_delta`` is the
+# change against the previous evaluation and is null (never omitted) on the
+# first one.
+class QualityRuleEvaluationTrendEntry(BaseModel):
+    sequence: int
+    created_at: str
+    row_count: int
+    violation_row_count: int
+    violation_row_count_delta: int | None
+
+
+# One row per rule that appears in the recorded history (it has a result in
+# some evaluation), including rules that always passed and rules later
+# disabled. ``first_violation_sequence`` / ``last_violation_sequence`` are
+# null (never omitted) for such a rule without any recorded violation.
+class QualityRuleEvaluationTrendRule(BaseModel):
+    rule_id: int
+    name: str
+    violation_row_count: int
+    evaluation_count: int
+    first_violation_sequence: int | None
+    last_violation_sequence: int | None
+
+
+# All-version totals of the aggregate: number of recorded evaluations, sum of
+# their violation row counts and the number of rules involved in at least one
+# violation.
+class QualityRuleEvaluationTrendTotals(BaseModel):
+    evaluation_count: int
+    violation_row_count: int
+    rule_count: int
+
+
+# Deterministic whole-history trend: exactly these keys, in this order.
+class QualityRuleEvaluationTrendResponse(BaseModel):
+    dataset: str
+    version: int
+    evaluations: list[QualityRuleEvaluationTrendEntry]
+    rules: list[QualityRuleEvaluationTrendRule]
+    totals: QualityRuleEvaluationTrendTotals
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None
