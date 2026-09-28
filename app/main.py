@@ -21,6 +21,7 @@ from app.models import (
     DatasetCreate,
     DeletionComplianceExportResponse,
     FieldTrajectoryResponse,
+    LineageCoverageResponse,
     LineageCreate,
     LineageCreatedResponse,
     LineageDeletedResponse,
@@ -731,6 +732,54 @@ def get_lineage_source_paths(
     )
     payload = json.dumps(
         result.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only whole-dataset lineage registration coverage check
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that reports, for every schema version at once, how the
+# version's fields are covered by registered lineage mappings: the source ends
+# registered with each field as its target, the distinct-source-dataset count,
+# and linked/unlinked field and mapping counts, plus whole-dataset totals. The
+# path carries only the dataset name; there is no request body or query
+# parameter.
+LINEAGE_COVERAGE_PATH = "/datasets/{dataset_name}/lineage-coverage"
+
+
+@app.get(
+    LINEAGE_COVERAGE_PATH,
+    response_model=LineageCoverageResponse,
+)
+def get_lineage_coverage(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset is known, preserving the same 404 precedence as the other
+    # whole-dataset coverage reads. Recomputed on every read from the
+    # committed lineage graph; no lineage mapping and no impact cache record
+    # is ever written. The body is serialized directly (rather than through
+    # the default JSON response) so the key order is fixed, the whitespace is
+    # compact and the document ends with exactly one newline.
+    coverage = LineageCoverageResponse(
+        **repository.lineage_coverage(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        coverage.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

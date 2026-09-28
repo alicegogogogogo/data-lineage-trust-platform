@@ -240,6 +240,52 @@ class LineageSourcePathsResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only whole-dataset lineage registration coverage check
+# --------------------------------------------------------------------------- #
+
+
+# One field of one version as it appears in the coverage check. ``sources`` is
+# the list of mapping source ends registered with this field as their target,
+# each located by ``dataset``, ``version`` and ``field``; references are
+# deduplicated and sorted by those three keys ascending. A field without a
+# registered source still appears with an empty list, and
+# ``source_dataset_count`` is then zero; otherwise it counts the distinct
+# dataset names among the references, not the number of references.
+class LineageCoverageField(BaseModel):
+    field: str
+    sources: list[LineageSourceRef]
+    source_dataset_count: int
+
+
+# One schema version's coverage summary. Exactly these keys, in this order:
+# the version number, its field list, and the linked-field, unlinked-field and
+# mapping counts. ``mapping_count`` is the sum of the field source-reference
+# counts, and the two field counts sum to the number of fields.
+class LineageCoverageVersion(BaseModel):
+    version: int
+    fields: list[LineageCoverageField]
+    linked_field_count: int
+    unlinked_field_count: int
+    mapping_count: int
+
+
+class LineageCoverageTotals(BaseModel):
+    version_count: int
+    field_count: int
+    linked_field_count: int
+    unlinked_field_count: int
+    mapping_count: int
+
+
+# Deterministic whole-dataset coverage check: exactly these keys, in this
+# order.
+class LineageCoverageResponse(BaseModel):
+    dataset: str
+    versions: list[LineageCoverageVersion]
+    totals: LineageCoverageTotals
+
+
+# --------------------------------------------------------------------------- #
 # Read-only breaking-change compatibility check with downstream impact
 # --------------------------------------------------------------------------- #
 

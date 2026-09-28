@@ -330,6 +330,44 @@ schema version in a different (source) dataset.
   or deleting a lineage mapping invalidates the cached impacts of the
   mapping's source field and of every field that can reach it. Unrelated
   cache entries are preserved.
+- `GET /datasets/{dataset}/lineage-coverage` — read-only whole-dataset check
+  of how the dataset's schema fields are covered by registered lineage
+  mappings, computed fresh on every read (no caching; nothing is written,
+  modified or deleted, and no lineage mapping or impact cache record is
+  touched). The path carries only the dataset name; the request takes no body
+  and no query parameters — any body bytes, including a purely whitespace or
+  single-space body, or any query parameter → `422`; an unknown dataset →
+  `404`, checked before the request shape, with the same 404-before-422
+  precedence as the quality and privacy coverage checks. A dataset without
+  schema versions returns `200` with an empty `versions` array and all-zero
+  totals, never an error. The JSON document is deterministic (fixed key
+  order, compact whitespace, lowercase booleans, exactly one trailing
+  newline; the same data renders byte-identically after a process restart and
+  ordering never depends on the database's natural order):
+
+  ```json
+  {"dataset":"dm_orders","versions":[{"version":1,"fields":[{"field":"id","sources":[{"dataset":"raw_orders","version":1,"field":"order_id"}],"source_dataset_count":1},{"field":"orphan","sources":[],"source_dataset_count":0},{"field":"total","sources":[{"dataset":"raw_orders","version":1,"field":"amount"},{"dataset":"raw_refunds","version":1,"field":"refund_amount"}],"source_dataset_count":2}],"linked_field_count":2,"unlinked_field_count":1,"mapping_count":3}],"totals":{"version_count":1,"field_count":3,"linked_field_count":2,"unlinked_field_count":1,"mapping_count":3}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions` and `totals` in that
+  order. `versions` is ordered by version number ascending and each entry has
+  exactly `version`, `fields`, `linked_field_count`, `unlinked_field_count`
+  and `mapping_count` in that order. `fields` lists every field of the
+  version by field name ascending, including fields without a source. Each
+  field entry has exactly `field`, `sources` and `source_dataset_count` in
+  that order; `sources` is the list of source ends of mappings registered
+  with the field as their target, each item located by exactly `dataset`,
+  `version` and `field`, deduplicated and sorted by those three keys
+  ascending. A field without a source has `sources` set to an empty list and
+  `source_dataset_count` to zero; otherwise `source_dataset_count` is the
+  number of distinct source dataset names among the references, not the
+  number of mappings. `mapping_count` equals the sum of the field
+  source-reference counts of the version, and the linked and unlinked field
+  counts together equal the number of fields of the version. `totals` has
+  exactly `version_count`, `field_count`, `linked_field_count`,
+  `unlinked_field_count` and `mapping_count`, each the sum of the
+  per-version entries, with the two field-kind counts summing to
+  `field_count`.
 
 ### Quality rules
 
