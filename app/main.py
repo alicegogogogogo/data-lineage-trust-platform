@@ -89,6 +89,7 @@ from app.models import (
     RetentionSweepPreviewResponse,
     SensitiveIdentification,
     SensitiveIdentificationCreate,
+    SensitiveIdentificationSummaryResponse,
     SchemaVersion,
     SchemaVersionCreate,
     SnapshotCreate,
@@ -2226,6 +2227,51 @@ def register_masking_suggestions(
             query_keys=tuple(request.query_params.keys()),
         )
     ]
+
+
+# Read-only cross-version summary of the dataset's sensitive-field
+# identifications and their advisory masking suggestions, mounted directly
+# under the dataset (it spans every schema version at once). The path carries
+# only the dataset name; there is no request body or query parameter. The body
+# is serialized directly (rather than through the default JSON response) so
+# the key order is fixed, the whitespace is compact and the document ends with
+# exactly one newline.
+SENSITIVE_IDENTIFICATION_SUMMARY_PATH = (
+    "/datasets/{dataset_name}/sensitive-identification-summary"
+)
+
+
+@app.get(
+    SENSITIVE_IDENTIFICATION_SUMMARY_PATH,
+    response_model=SensitiveIdentificationSummaryResponse,
+)
+def get_sensitive_identification_summary(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only and a single
+    # space included) or query parameters are a 422 validated in the
+    # repository once the path dataset is known, preserving the same 404
+    # precedence as the other dataset-level summary reads. Recomputed on every
+    # read; no identification record is ever written and the advisory
+    # suggestions register no privacy policy, so the identifications,
+    # suggestions and privacy view are unaffected.
+    summary = SensitiveIdentificationSummaryResponse(
+        **repository.sensitive_identification_summary(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        summary.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
 
 
 # --------------------------------------------------------------------------- #

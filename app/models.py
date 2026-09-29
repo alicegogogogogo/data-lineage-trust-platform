@@ -1170,6 +1170,88 @@ class MaskingSuggestionsRegisterRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version sensitive-field identification summary
+# --------------------------------------------------------------------------- #
+
+
+# One identification record as it appears in the summary: the flat locating
+# fields replace the nested ``source`` object of the per-version read. Exactly
+# these keys, in this order.
+class SensitiveIdentificationSummaryItem(BaseModel):
+    id: int
+    field: str
+    field_type: str
+    confidence: Literal["high", "medium", "low", "none"]
+    source_dataset: str
+    source_version: int
+    source_field: str
+    created_at: str
+
+
+# The advisory masking suggestion as it appears in the summary: exactly the
+# same four keys, in the same order, as the read-only suggestions endpoint.
+# ``allowed_roles`` is always the empty list (the suggested masking applies to
+# every role); the collection is an empty array when the version has no
+# suggestion.
+class SensitiveIdentificationSummarySuggestion(BaseModel):
+    field: str
+    classification: MaskingSuggestionClassification
+    masking: PrivacyMasking
+    allowed_roles: list[str]
+
+
+# One version's identification scale. ``max_id`` and the earliest/latest write
+# times are null — the keys are never omitted — when the version has no
+# identification record.
+class SensitiveIdentificationSummaryStats(BaseModel):
+    identification_count: int
+    suggestion_count: int
+    high_count: int
+    medium_count: int
+    low_count: int
+    none_count: int
+    max_id: int | None
+    first_created_at: str | None
+    last_created_at: str | None
+
+
+# One schema version's summary. Exactly these keys, in this order; the record
+# and suggestion lists are empty for a version without records.
+class SensitiveIdentificationSummaryVersion(BaseModel):
+    version: int
+    identifications: list[SensitiveIdentificationSummaryItem]
+    suggestions: list[SensitiveIdentificationSummarySuggestion]
+    stats: SensitiveIdentificationSummaryStats
+
+
+# ``version_count`` is the number of version entries and
+# ``identified_version_count`` the number of them with at least one
+# identification record; the other nine fields mirror the per-version stats in
+# the same order, the six counters being sums and the range values spanning
+# every identification record in the dataset.
+class SensitiveIdentificationSummaryTotals(BaseModel):
+    version_count: int
+    identified_version_count: int
+    identification_count: int
+    suggestion_count: int
+    high_count: int
+    medium_count: int
+    low_count: int
+    none_count: int
+    max_id: int | None
+    first_created_at: str | None
+    last_created_at: str | None
+
+
+# Deterministic whole-dataset identification summary: exactly these keys, in
+# this order.
+class SensitiveIdentificationSummaryResponse(BaseModel):
+    dataset: str
+    versions: list[SensitiveIdentificationSummaryVersion]
+    totals: SensitiveIdentificationSummaryTotals
+
+
+# --------------------------------------------------------------------------- #
 # Read-only cross-version privacy policy coverage check
 # --------------------------------------------------------------------------- #
 

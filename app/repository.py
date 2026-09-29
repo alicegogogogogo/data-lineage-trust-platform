@@ -6202,6 +6202,171 @@ def register_masking_suggestions(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version sensitive-field identification summary
+# --------------------------------------------------------------------------- #
+
+
+def _identification_summary_item(
+    row: sqlite3.Row, dataset_name: str, version_number: int
+) -> dict:
+    """One identification record in the summary's flat source-field shape."""
+    return {
+        "id": row["id"],
+        "field": row["field"],
+        "field_type": row["field_type"],
+        "confidence": row["confidence"],
+        "source_dataset": dataset_name,
+        "source_version": version_number,
+        "source_field": row["field"],
+        "created_at": row["created_at"],
+    }
+
+
+def _identification_summary_stats(
+    identification_rows: list[sqlite3.Row],
+) -> dict:
+    """Counters and ranges over one set of identification records (id ordered).
+
+    The suggestion count is recomputed exactly as the read-only suggestions
+    endpoint computes it: only records with at least one name/sample hit
+    contribute.
+    """
+    stats = {
+        "identification_count": len(identification_rows),
+        "suggestion_count": 0,
+        "high_count": 0,
+        "medium_count": 0,
+        "low_count": 0,
+        "none_count": 0,
+        "max_id": None,
+        "first_created_at": None,
+        "last_created_at": None,
+    }
+    earliest: datetime | None = None
+    latest: datetime | None = None
+    for row in identification_rows:
+        stats[f"{row['confidence']}_count"] += 1
+        if _identification_suggestion(row) is not None:
+            stats["suggestion_count"] += 1
+        identification_id = row["id"]
+        if stats["max_id"] is None or identification_id > stats["max_id"]:
+            stats["max_id"] = identification_id
+        # Timestamps are timezone-bearing ISO-8601 strings, compared the same
+        # way the anomaly summary compares write times; the raw strings are
+        # what the document reports.
+        created_at = datetime.fromisoformat(row["created_at"])
+        if earliest is None or created_at < earliest:
+            earliest = created_at
+            stats["first_created_at"] = row["created_at"]
+        if latest is None or created_at > latest:
+            latest = created_at
+            stats["last_created_at"] = row["created_at"]
+    return stats
+
+
+def sensitive_identification_summary(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset summary of sensitive-field identifications.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry gives the version number, every identification
+    record of the version ordered by id ascending (each in the flat
+    ``source_dataset``/``source_version``/``source_field`` shape), the
+    version's advisory masking suggestions in the same record order (the
+    same recomputation as the read-only suggestions endpoint, with the fixed
+    empty ``allowed_roles`` list, and an empty array when no record hits),
+    and the version's stats: the identification and suggestion counts, the
+    per-confidence counts (``high``/``medium``/``low``/``none``), then the
+    largest record id and the earliest/latest record write times (all null —
+    never omitted — when the version has no identification record).
+
+    ``totals`` reports the number of versions, the number of versions with at
+    least one identification record, and the same nine stats fields: the six
+    counters are the sums of the per-version values, while the maximum id and
+    the earliest/latest times span every identification record in the dataset
+    (null when no record exists anywhere). A dataset without versions yields
+    an empty version list, zero counters and null ranges, never an error.
+
+    The summary is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes an identification record; the suggestions are
+    advisory only and register no privacy policy, so the identifications,
+    masking suggestions and privacy view behave exactly as before. The
+    dataset resolves first (404); any request body bytes
+    (whitespace-only included) or any query parameter is a 422 checked
+    afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body, matching the other dataset-level summary reads.
+    if body:
+        raise RequestInvalidError(
+            "The sensitive identification summary endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The sensitive identification summary endpoint does not accept "
+            "query parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    identified_count = 0
+    totals_rows: list[sqlite3.Row] = []
+    for version_row in version_rows:
+        version_id = version_row["id"]
+        identification_rows = conn.execute(
+            "SELECT * FROM sensitive_identifications WHERE version_id = ? "
+            "ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+
+        identifications = [
+            _identification_summary_item(
+                row, dataset["name"], version_row["version"]
+            )
+            for row in identification_rows
+        ]
+        suggestions: list[dict] = []
+        for row in identification_rows:
+            suggestion = _identification_suggestion(row)
+            if suggestion is not None:
+                suggestions.append(suggestion)
+
+        if identification_rows:
+            identified_count += 1
+        totals_rows.extend(identification_rows)
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "identifications": identifications,
+                "suggestions": suggestions,
+                "stats": _identification_summary_stats(identification_rows),
+            }
+        )
+
+    totals_stats = _identification_summary_stats(totals_rows)
+    totals = {
+        "version_count": len(versions),
+        "identified_version_count": identified_count,
+        **totals_stats,
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
 # Read-only cross-version privacy policy coverage check
 # --------------------------------------------------------------------------- #
 
