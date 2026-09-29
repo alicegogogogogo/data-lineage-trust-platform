@@ -3898,6 +3898,151 @@ def quality_rule_coverage(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version quality anomaly scale summary
+# --------------------------------------------------------------------------- #
+
+
+def _anomaly_config_thresholds(row: sqlite3.Row | None) -> dict:
+    """The three registered thresholds, all null (never omitted) with no row."""
+    if row is None:
+        return {
+            "consecutive_worsening_steps": None,
+            "violation_row_limit": None,
+            "rule_violation_limit": None,
+        }
+    return {
+        "consecutive_worsening_steps": row["consecutive_worsening_steps"],
+        "violation_row_limit": row["violation_row_limit"],
+        "rule_violation_limit": row["rule_violation_limit"],
+    }
+
+
+def _anomaly_stats(anomaly_rows: list[sqlite3.Row]) -> dict:
+    """Counters and ranges over one version's anomaly records (id ordered)."""
+    stats = {
+        "row_limit_count": 0,
+        "rule_limit_count": 0,
+        "trend_count": 0,
+        "anomaly_count": len(anomaly_rows),
+        "max_sequence": None,
+        "first_created_at": None,
+        "last_created_at": None,
+    }
+    earliest: datetime | None = None
+    latest: datetime | None = None
+    for row in anomaly_rows:
+        stats[f"{row['kind']}_count"] += 1
+        sequence = row["sequence"]
+        if stats["max_sequence"] is None or sequence > stats["max_sequence"]:
+            stats["max_sequence"] = sequence
+        # Timestamps are timezone-bearing ISO-8601 strings, compared the same
+        # way the point-in-time gate/evaluation reads compare write times; the
+        # raw strings are what the document reports.
+        created_at = datetime.fromisoformat(row["created_at"])
+        if earliest is None or created_at < earliest:
+            earliest = created_at
+            stats["first_created_at"] = row["created_at"]
+        if latest is None or created_at > latest:
+            latest = created_at
+            stats["last_created_at"] = row["created_at"]
+    return stats
+
+
+def quality_anomaly_summary(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset summary of the quality anomaly scale.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry gives the version number, its three registered
+    detection thresholds (all null — the keys are never omitted — when no
+    config is registered), every anomaly record still stored for the version
+    ordered by id ascending (an empty list when there are none) and the
+    version's stats: the counts of ``row_limit``, ``rule_limit`` and ``trend``
+    records and their total, then the largest record sequence and the
+    earliest and latest record write times (all null — never omitted — when
+    the version has no record).
+
+    ``totals`` reports the number of versions, the number of versions with a
+    registered config, and the same seven stats fields: the four counters
+    are the sums of the per-version values, while the maximum sequence and
+    the earliest/latest times span every record that still exists in the
+    dataset (null when no record exists anywhere). A dataset without
+    versions yields an empty version list, zero counters and null ranges,
+    never an error.
+
+    The summary is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes a config, an anomaly record or an evaluation.
+    Like the quality gate export, the dataset resolves first (404); any
+    request body bytes (whitespace-only included) or any query parameter is a
+    422 checked afterwards.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body, matching the quality gate export.
+    if body:
+        raise RequestInvalidError(
+            "The quality anomaly summary endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The quality anomaly summary endpoint does not accept query parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    configured_count = 0
+    totals_rows: list[sqlite3.Row] = []
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        config_row = conn.execute(
+            "SELECT consecutive_worsening_steps, violation_row_limit, "
+            "rule_violation_limit FROM quality_anomaly_detection_configs "
+            "WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if config_row is not None:
+            configured_count += 1
+
+        anomaly_rows = conn.execute(
+            "SELECT * FROM quality_anomaly_records WHERE version_id = ? "
+            "ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "config": _anomaly_config_thresholds(config_row),
+                "anomalies": [
+                    _anomaly_row_to_dict(row) for row in anomaly_rows
+                ],
+                "stats": _anomaly_stats(anomaly_rows),
+            }
+        )
+        totals_rows.extend(anomaly_rows)
+
+    totals_stats = _anomaly_stats(totals_rows)
+    totals = {
+        "version_count": len(versions),
+        "configured_version_count": configured_count,
+        **totals_stats,
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 

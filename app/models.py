@@ -751,6 +751,69 @@ class QualityRuleCoverageResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version quality anomaly scale summary
+# --------------------------------------------------------------------------- #
+
+
+# The three registered thresholds of one version's anomaly detection config.
+# When no config is registered every value is null — the keys are never
+# omitted.
+class QualityAnomalySummaryConfig(BaseModel):
+    consecutive_worsening_steps: int | None
+    violation_row_limit: int | None
+    rule_violation_limit: int | None
+
+
+# One version's anomaly scale: the four kind/total counters followed by the
+# largest record sequence and the earliest and latest record times; the range
+# values are null — the keys are never omitted — when the version has no
+# anomaly record.
+class QualityAnomalySummaryStats(BaseModel):
+    row_limit_count: int
+    rule_limit_count: int
+    trend_count: int
+    anomaly_count: int
+    max_sequence: int | None
+    first_created_at: str | None
+    last_created_at: str | None
+
+
+# One schema version's summary. Exactly these keys, in this order; ``config``
+# is all-null when no detection config is registered and ``anomalies`` is an
+# empty list for a version without records.
+class QualityAnomalySummaryVersion(BaseModel):
+    version: int
+    config: QualityAnomalySummaryConfig
+    anomalies: list[QualityAnomalyRecord]
+    stats: QualityAnomalySummaryStats
+
+
+# ``version_count`` is the number of version entries and
+# ``configured_version_count`` the number of them with a registered config;
+# the other seven fields mirror the per-version stats in the same order, the
+# four counters being sums of the per-version values and the range values
+# spanning every record that still exists in the dataset.
+class QualityAnomalySummaryTotals(BaseModel):
+    version_count: int
+    configured_version_count: int
+    row_limit_count: int
+    rule_limit_count: int
+    trend_count: int
+    anomaly_count: int
+    max_sequence: int | None
+    first_created_at: str | None
+    last_created_at: str | None
+
+
+# Deterministic whole-dataset anomaly scale summary: exactly these keys, in
+# this order.
+class QualityAnomalySummaryResponse(BaseModel):
+    dataset: str
+    versions: list[QualityAnomalySummaryVersion]
+    totals: QualityAnomalySummaryTotals
+
+
+# --------------------------------------------------------------------------- #
 # Privacy policies
 # --------------------------------------------------------------------------- #
 

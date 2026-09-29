@@ -80,6 +80,7 @@ from app.models import (
     QualityGateResponse,
     QualityGateExportResponse,
     QualityRuleCoverageResponse,
+    QualityAnomalySummaryResponse,
     RetentionPolicy,
     RetentionPolicyCreate,
     RetentionException,
@@ -1241,6 +1242,52 @@ def get_quality_rule_coverage(
     )
     payload = json.dumps(
         coverage.model_dump(mode="json"),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return Response(content=payload + "\n", media_type="application/json")
+
+
+# --------------------------------------------------------------------------- #
+# Read-only cross-version quality anomaly scale summary
+# --------------------------------------------------------------------------- #
+
+
+# A dataset-level read that reports the anomaly scale of every schema version
+# at once: each version's registered thresholds, its anomaly records and the
+# per-version counters/ranges, with dataset-wide sums and ranges in totals.
+# The path carries only the dataset name; there is no request body or query
+# parameter.
+QUALITY_ANOMALY_SUMMARY_PATH = "/datasets/{dataset_name}/quality-anomaly-summary"
+
+
+@app.get(
+    QUALITY_ANOMALY_SUMMARY_PATH,
+    response_model=QualityAnomalySummaryResponse,
+)
+def get_quality_anomaly_summary(
+    request: Request,
+    dataset_name: str,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> Response:
+    # Read-only and parameterless; any body bytes (whitespace-only included)
+    # or query parameters are a 422 validated in the repository once the path
+    # dataset is known, preserving the same 404 precedence as the quality gate
+    # export. Recomputed on every read; no config, anomaly record or
+    # evaluation is ever written. The body is serialized directly (rather
+    # than through the default JSON response) so the key order is fixed, the
+    # whitespace is compact and the document ends with exactly one newline.
+    summary = QualityAnomalySummaryResponse(
+        **repository.quality_anomaly_summary(
+            conn,
+            dataset_name,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+    payload = json.dumps(
+        summary.model_dump(mode="json"),
         separators=(",", ":"),
         ensure_ascii=False,
     )

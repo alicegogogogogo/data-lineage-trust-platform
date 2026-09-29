@@ -693,6 +693,46 @@ recorded for rules since disabled still count).
   `version_count`, `field_count`, `enabled_count`, `disabled_count` and
   `unregistered_count`: each is the sum of the per-version entries, and the
   field count equals the sum of the three per-state counts.
+- `GET /datasets/{dataset}/quality-anomaly-summary` — read-only cross-version
+  summary of the scale of quality anomalies, computed fresh on every read (no
+  caching; nothing is written, modified or deleted, and no config, anomaly
+  record or evaluation history is touched). The path carries only the
+  dataset name; the request takes no body and no query parameters — any body
+  bytes, including a purely whitespace or single-space body, or any query
+  parameter → `422`; an unknown dataset → `404`, checked before the request
+  shape, with the same 404-before-422 precedence as the quality gate export.
+  A dataset without schema versions returns `200` with an empty `versions`
+  array, zero counters and null ranges, never an error. The JSON document is
+  deterministic (fixed key order, compact whitespace, exactly one trailing
+  newline; the same data renders byte-identically after a process restart and
+  ordering never depends on the database's natural order):
+
+  ```json
+  {"dataset":"orders","versions":[{"version":1,"config":{"consecutive_worsening_steps":2,"violation_row_limit":0,"rule_violation_limit":1000},"anomalies":[{"id":1,"kind":"row_limit","sequence":1,"rule_id":null,"violation_count":1,"created_at":"2026-09-29T16:27:18.012206+00:00"}],"stats":{"row_limit_count":1,"rule_limit_count":0,"trend_count":0,"anomaly_count":1,"max_sequence":1,"first_created_at":"2026-09-29T16:27:18.012206+00:00","last_created_at":"2026-09-29T16:27:18.012206+00:00"}},{"version":2,"config":{"consecutive_worsening_steps":null,"violation_row_limit":null,"rule_violation_limit":null},"anomalies":[],"stats":{"row_limit_count":0,"rule_limit_count":0,"trend_count":0,"anomaly_count":0,"max_sequence":null,"first_created_at":null,"last_created_at":null}}],"totals":{"version_count":2,"configured_version_count":1,"row_limit_count":1,"rule_limit_count":0,"trend_count":0,"anomaly_count":1,"max_sequence":1,"first_created_at":"2026-09-29T16:27:18.012206+00:00","last_created_at":"2026-09-29T16:27:18.012206+00:00"}}
+  ```
+
+  The top-level keys are exactly `dataset`, `versions` and `totals` in that
+  order. `versions` is ordered by version number ascending and each entry has
+  exactly `version`, `config`, `anomalies` and `stats` in that order.
+  `config` holds exactly the three registered thresholds
+  (`consecutive_worsening_steps`, `violation_row_limit`,
+  `rule_violation_limit`); when no config is registered all three are `null`
+  — the keys are never omitted. `anomalies` lists every anomaly record of the
+  version still stored, ordered by `id` ascending (an empty array for a
+  version without records); each record has exactly `id`, `kind`,
+  `sequence`, `rule_id`, `violation_count` and `created_at`, where `kind` is
+  one of `row_limit`, `rule_limit` and `trend` and `rule_id` is `null`
+  (never omitted) except on `rule_limit` records. `stats` gives exactly
+  `row_limit_count`, `rule_limit_count`, `trend_count`, `anomaly_count`,
+  `max_sequence`, `first_created_at` and `last_created_at`: the four
+  counters (per-kind counts and their total), the largest record sequence and
+  the earliest/latest record write times; the last three are `null` — never
+  omitted — when the version has no record. `totals` has exactly
+  `version_count`, `configured_version_count` and the same seven stats keys
+  in the same order: the counters are the sums of the per-version values,
+  while the maximum sequence and the earliest/latest times span every record
+  that still exists in the whole dataset (null when no record exists
+  anywhere).
 
 ### Privacy policies
 
