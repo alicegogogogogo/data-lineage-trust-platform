@@ -1082,6 +1082,65 @@ stable ids) persist across restarts.
   records and field definitions; it never writes or auto-refreshes an
   identification, and the read-only suggestions endpoint stays unchanged.
 
+#### Whole-dataset identification summary
+
+- `GET /datasets/{dataset}/sensitive-identification-summary` — read-only
+  cross-version summary of the dataset's sensitive identifications, computed
+  fresh on every read (no caching; nothing is written, modified or deleted,
+  and no identification record is touched). It is mounted under the dataset
+  resource rather than a version and accepts GET only. The path carries only
+  the dataset name; the request takes no body, no query parameters and no
+  other request control — any body bytes, including a purely whitespace or
+  single-space body, or any query parameter → `422`; an unknown dataset →
+  `404`, checked before the request shape, with the same 404-before-422
+  precedence as the other cross-version summaries. A dataset without schema
+  versions returns `200` with an empty `versions` array and all-zero/null
+  totals, never an error. The suggestions are the same read-time
+  recomputation as the read-only suggestions endpoint; the summary never
+  registers a privacy policy, and identification, masking suggestion and
+  privacy view behavior are otherwise unchanged. The JSON document is
+  deterministic (fixed key order, compact whitespace, lowercase booleans,
+  exactly one trailing newline; the same data renders byte-identically after
+  a process restart and ordering never depends on the database's natural
+  order).
+
+  The top-level keys are exactly `dataset`, `versions` and `totals` in that
+  order. `versions` is ordered by version number ascending and each entry has
+  exactly `version`, `identifications`, `suggestions` and `stats` in that
+  order; a version without identification records keeps empty
+  `identifications` and `suggestions` arrays and the zero/null stats rather
+  than being omitted.
+
+  - `identifications` lists the version's records ordered by record `id`
+    ascending; each entry has exactly `id`, `field`, `field_type`,
+    `confidence`, `source_dataset`, `source_version`, `source_field` and
+    `created_at` in that order (the source is flattened, and `evidence` is
+    not part of the summary).
+  - `suggestions` lists the advisory masking candidates in identification
+    record `id` ascending order, exactly as the read-only suggestions
+    endpoint recomputes them (a record whose name and samples both missed
+    does not appear); each candidate has exactly `field`, `classification`,
+    `masking` and `allowed_roles` in that order, and `allowed_roles` is
+    always an empty list, including when the version has no suggestions.
+  - `stats` has exactly `identification_count`, `suggestion_count`,
+    `high_count`, `medium_count`, `low_count`, `none_count`, `max_id`,
+    `first_created_at` and `last_created_at` in that order: the four
+    confidence counters partition the version's records, and `max_id` and
+    the earliest/latest write times are `null` for a version without
+    records — the keys are never omitted. Same-instant write times are
+    ordered by record id ascending.
+
+  `totals` has exactly `version_count`, `identified_version_count`,
+  `identification_count`, `suggestion_count`, `high_count`, `medium_count`,
+  `low_count`, `none_count`, `max_id`, `first_created_at` and
+  `last_created_at` in that order: `version_count` counts every schema
+  version and `identified_version_count` the versions with at least one
+  identification record; every other counter is the sum of the matching
+  per-version values, while `max_id` and the time range are taken over every
+  identification record of the whole dataset (all `null` when no record
+  exists). Errors keep the stable `{"error", "detail"}` shape and never
+  expose SQL, stack traces or internal objects.
+
 ### Row snapshots
 
 A row snapshot persistently records the rows of a schema version at one point in

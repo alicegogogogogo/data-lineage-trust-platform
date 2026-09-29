@@ -6202,6 +6202,205 @@ def register_masking_suggestions(
 
 
 # --------------------------------------------------------------------------- #
+# Read-only cross-version sensitive identification summary
+# --------------------------------------------------------------------------- #
+
+
+# Fixed confidence order shared by the per-version stats and the whole-dataset
+# totals; every identification record's confidence is exactly one of these.
+_SUMMARY_CONFIDENCE_KEYS: tuple[str, ...] = ("high", "medium", "low", "none")
+
+
+def export_dataset_sensitive_identifications(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only whole-dataset summary of the sensitive identifications.
+
+    One entry per schema version of the dataset, ordered by version number
+    ascending. Each entry lists the version's identification records by id
+    ascending — each carrying its id, field, declared field type and
+    confidence, the source flattened into its dataset, version and field, and
+    the write time (no evidence) — together with the advisory masking
+    suggestions recomputed from exactly those records in the same record-id
+    order (each with ``allowed_roles`` as its fourth key, an empty list even
+    when the version has no suggestions). ``stats`` gives the identification
+    and suggestion counts, the high/medium/low/none confidence distribution,
+    the maximum record id and the earliest and latest write times (the id and
+    the time range are ``None`` for a version without records, but the keys
+    are never omitted).
+
+    ``totals`` covers the version count, the count of versions with at least
+    one record, the sums of every per-version counter and the overall maximum
+    record id and time range over every identification record of the whole
+    dataset (all ``None`` when none exists). A dataset without versions
+    yields an empty version list, zero counters and ``None`` extrema, never
+    an error.
+
+    The summary is recomputed on every read: it caches nothing and never
+    writes, modifies or deletes an identification record; the suggestions are
+    the same read-time recomputation as the read-only suggestions endpoint
+    and never register a privacy policy. The dataset resolves first (404);
+    any request body bytes (a purely whitespace or single-space body
+    included) or any query parameter is a 422 checked afterwards, matching
+    the snapshot scale summary.
+    """
+    dataset = require_dataset(conn, dataset_name)
+
+    # Any body bytes are rejected, including a purely whitespace or
+    # single-space body; ``if body`` (rather than a stripped check) keeps
+    # those a 422, matching the cross-version summary reads.
+    if body:
+        raise RequestInvalidError(
+            "The sensitive identification summary endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The sensitive identification summary endpoint does not accept "
+            "query parameters"
+        )
+
+    version_rows = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? ORDER BY version ASC",
+        (dataset["id"],),
+    ).fetchall()
+
+    versions: list[dict] = []
+    totals_distribution = {key: 0 for key in _SUMMARY_CONFIDENCE_KEYS}
+    totals_identification_count = 0
+    totals_suggestion_count = 0
+    identified_version_count = 0
+    overall_max_id: int | None = None
+    # (parsed write time, record id, stored write time) for the whole-dataset
+    # time range; the id breaks same-instant ties ascending.
+    overall_time_keys: list[tuple[datetime, int, str]] = []
+
+    for version_row in version_rows:
+        version_id = version_row["id"]
+
+        # Explicit id ordering keeps both lists independent of the database's
+        # natural row order; the suggestions follow this same record order.
+        rows = conn.execute(
+            "SELECT * FROM sensitive_identifications "
+            "WHERE version_id = ? ORDER BY id ASC",
+            (version_id,),
+        ).fetchall()
+
+        identifications: list[dict] = []
+        suggestions: list[dict] = []
+        distribution = {key: 0 for key in _SUMMARY_CONFIDENCE_KEYS}
+        time_keys: list[tuple[datetime, int, str]] = []
+
+        for row in rows:
+            identifications.append(
+                {
+                    "id": row["id"],
+                    "field": row["field"],
+                    "field_type": row["field_type"],
+                    "confidence": row["confidence"],
+                    "source_dataset": dataset["name"],
+                    "source_version": version_row["version"],
+                    "source_field": row["field"],
+                    "created_at": row["created_at"],
+                }
+            )
+            distribution[row["confidence"]] += 1
+            time_keys.append(
+                (
+                    datetime.fromisoformat(row["created_at"]),
+                    row["id"],
+                    row["created_at"],
+                )
+            )
+
+            # The same read-time recomputation as the read-only suggestions
+            # endpoint: only a record with at least one name/sample hit
+            # contributes, and the summary never registers its candidate.
+            suggestion = _identification_suggestion(row)
+            if suggestion is not None:
+                suggestions.append(
+                    {
+                        "field": suggestion["field"],
+                        "classification": suggestion["classification"],
+                        "masking": suggestion["masking"],
+                        "allowed_roles": [],
+                    }
+                )
+
+        if rows:
+            identified_version_count += 1
+            stats = {
+                "identification_count": len(rows),
+                "suggestion_count": len(suggestions),
+                "high_count": distribution["high"],
+                "medium_count": distribution["medium"],
+                "low_count": distribution["low"],
+                "none_count": distribution["none"],
+                "max_id": rows[-1]["id"],
+                "first_created_at": min(time_keys)[2],
+                "last_created_at": max(time_keys)[2],
+            }
+        else:
+            stats = {
+                "identification_count": 0,
+                "suggestion_count": 0,
+                "high_count": 0,
+                "medium_count": 0,
+                "low_count": 0,
+                "none_count": 0,
+                "max_id": None,
+                "first_created_at": None,
+                "last_created_at": None,
+            }
+
+        versions.append(
+            {
+                "version": version_row["version"],
+                "identifications": identifications,
+                "suggestions": suggestions,
+                "stats": stats,
+            }
+        )
+
+        totals_identification_count += len(rows)
+        totals_suggestion_count += len(suggestions)
+        for key in _SUMMARY_CONFIDENCE_KEYS:
+            totals_distribution[key] += distribution[key]
+        if rows:
+            version_max_id = rows[-1]["id"]
+            overall_max_id = (
+                version_max_id
+                if overall_max_id is None
+                else max(overall_max_id, version_max_id)
+            )
+        overall_time_keys.extend(time_keys)
+
+    totals = {
+        "version_count": len(versions),
+        "identified_version_count": identified_version_count,
+        "identification_count": totals_identification_count,
+        "suggestion_count": totals_suggestion_count,
+        "high_count": totals_distribution["high"],
+        "medium_count": totals_distribution["medium"],
+        "low_count": totals_distribution["low"],
+        "none_count": totals_distribution["none"],
+        "max_id": overall_max_id,
+        "first_created_at": (
+            min(overall_time_keys)[2] if overall_time_keys else None
+        ),
+        "last_created_at": (
+            max(overall_time_keys)[2] if overall_time_keys else None
+        ),
+    }
+    return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
 # Read-only cross-version privacy policy coverage check
 # --------------------------------------------------------------------------- #
 
