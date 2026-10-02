@@ -11001,3 +11001,431 @@ def get_processing_blocker_summary(
         totals[key] = sum(version[key] for version in versions)
 
     return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
+# Processing run snapshot bindings (per-run, append-only evidence chain)
+# --------------------------------------------------------------------------- #
+
+
+# Per-run append serialization, using the same dict-of-locks idiom as the
+# run audit-record chain. The two chains are independent (separate tables and
+# sequence counters), so they use separate locks.
+_snapshot_binding_append_locks: dict[int, threading.Lock] = {}
+_snapshot_binding_append_locks_guard = threading.Lock()
+
+_SNAPSHOT_BINDING_APPEND_MAX_ATTEMPTS = 100
+
+
+def _snapshot_binding_append_lock(run_id: int) -> threading.Lock:
+    with _snapshot_binding_append_locks_guard:
+        lock = _snapshot_binding_append_locks.get(run_id)
+        if lock is None:
+            lock = threading.Lock()
+            _snapshot_binding_append_locks[run_id] = lock
+        return lock
+
+
+# Fields covered by the evidence hash: keys are sorted by Unicode code point,
+# compact text, non-ASCII unescaped, UTF-8 encoded and SHA-256 digested to hex.
+# ``id``, ``created_at`` and ``evidence_hash`` itself are excluded;
+# ``previous_hash`` links each binding to the preceding one of the same run.
+SNAPSHOT_BINDING_EVIDENCE_FIELDS = (
+    "dataset",
+    "previous_hash",
+    "role",
+    "run_status",
+    "sequence",
+    "snapshot_id",
+    "version",
+)
+
+
+def _snapshot_binding_evidence_hash(record: dict[str, Any]) -> str:
+    payload = {field: record[field] for field in SNAPSHOT_BINDING_EVIDENCE_FIELDS}
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _snapshot_binding_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "sequence": row["sequence"],
+        "role": row["role"],
+        "dataset": row["dataset"],
+        "version": row["version"],
+        "snapshot_id": row["snapshot_id"],
+        "run_status": row["run_status"],
+        "previous_hash": row["previous_hash"],
+        "evidence_hash": row["evidence_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+def _find_duplicate_snapshot_binding(
+    conn: sqlite3.Connection, run_id: int, role: str, snapshot_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT id FROM processing_run_snapshot_bindings "
+        "WHERE run_id = ? AND role = ? AND snapshot_id = ?",
+        (run_id, role, snapshot_id),
+    ).fetchone()
+
+
+_SNAPSHOT_BINDING_BODY_FIELDS = frozenset({"role", "version", "snapshot_id"})
+
+
+def _parse_snapshot_binding_body(
+    body: bytes,
+) -> tuple[str, int, int]:
+    """Validate and parse a raw snapshot-binding creation body.
+
+    The body must be a JSON object carrying exactly ``role`` (``input`` or
+    ``output``), ``version`` (an integer) and ``snapshot_id`` (an integer).
+    Every structural problem — empty/whitespace body, malformed JSON, a
+    non-object payload, a missing or extra field, a wrongly typed value
+    (booleans are not integers) or an illegal role — is a 422. Existence of the
+    named version/snapshot is resolved later by the caller, where it is a 404.
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    extra_keys = sorted(set(payload) - _SNAPSHOT_BINDING_BODY_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra_keys))
+    missing = sorted(_SNAPSHOT_BINDING_BODY_FIELDS - set(payload))
+    if missing:
+        raise RequestInvalidError(
+            "Request body is incomplete: missing field(s) " + ", ".join(missing)
+        )
+
+    role = payload["role"]
+    if not isinstance(role, str):
+        raise RequestInvalidError("'role' must be a string")
+    if role not in ("input", "output"):
+        raise RequestInvalidError("'role' must be 'input' or 'output'")
+
+    binding_version = payload["version"]
+    # bool is a subclass of int; a boolean is never a version number here.
+    if isinstance(binding_version, bool) or not isinstance(binding_version, int):
+        raise RequestInvalidError("'version' must be an integer")
+
+    snapshot_id = payload["snapshot_id"]
+    if isinstance(snapshot_id, bool) or not isinstance(snapshot_id, int):
+        raise RequestInvalidError("'snapshot_id' must be an integer")
+
+    return role, binding_version, snapshot_id
+
+
+def create_snapshot_binding(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Bind one existing, non-deleted snapshot of the path dataset to a run.
+
+    Path precedence mirrors appending an audit record: the path dataset,
+    version and task must exist (404); the body shape and any query parameter
+    are then rejected (422); the run itself must exist (404) and belong to the
+    path task (422). Only afterwards is the body version resolved in the same
+    dataset (404) and the snapshot looked up under it — a missing or
+    confirmed-deleted snapshot is a 404. Binding the same snapshot to the run
+    under the same role twice is a 409. Every rejection leaves both the
+    binding chain and the run's audit-record chain untouched.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    path_version_row = _require_schema_version(conn, dataset, version_number)
+    task_row = _require_task(
+        conn, path_version_row, dataset_name, version_number, task_id
+    )
+
+    role, binding_version, snapshot_id = _parse_snapshot_binding_body(body)
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot binding endpoint does not accept query parameters"
+        )
+
+    run_row = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if run_row is None:
+        raise NotFoundError(f"Processing task run {run_id} does not exist")
+    if run_row["task_id"] != task_row["id"]:
+        raise RequestInvalidError(
+            f"Processing task run {run_id} does not belong to task {task_id} "
+            f"in version {version_number} of dataset '{dataset_name}'"
+        )
+
+    # The bound snapshot may belong to another version of the same dataset;
+    # that version must exist and the snapshot must still be stored (a
+    # confirmed deletion removes the snapshots row, so one scoped lookup covers
+    # existence, dataset ownership and the not-deleted requirement).
+    binding_version_row = _require_schema_version(
+        conn, dataset, binding_version
+    )
+    snapshot_row = _get_scoped_snapshot_row(
+        conn, binding_version_row["id"], snapshot_id
+    )
+    if snapshot_row is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{binding_version} of dataset '{dataset_name}'"
+        )
+
+    # Per-run lock makes read-tail -> append atomic within this process;
+    # UNIQUE(run_id, sequence) is the hard cross-process guard, and
+    # UNIQUE(run_id, role, snapshot_id) turns a repeated binding into a 409.
+    with _snapshot_binding_append_lock(run_id):
+        for attempt in range(_SNAPSHOT_BINDING_APPEND_MAX_ATTEMPTS):
+            duplicate = _find_duplicate_snapshot_binding(
+                conn, run_id, role, snapshot_id
+            )
+            if duplicate is not None:
+                # Checked (and rolled back, if needed) before any insert so a
+                # rejection writes nothing.
+                raise ConflictError(
+                    f"Snapshot {snapshot_id} is already bound to run {run_id} "
+                    f"as '{role}'"
+                )
+
+            run_status = conn.execute(
+                "SELECT status FROM processing_task_runs WHERE id = ?", (run_id,)
+            ).fetchone()["status"]
+            tail = conn.execute(
+                "SELECT sequence, evidence_hash "
+                "FROM processing_run_snapshot_bindings "
+                "WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if tail is None:
+                sequence = 1
+                previous_hash = None
+            else:
+                sequence = tail["sequence"] + 1
+                previous_hash = tail["evidence_hash"]
+
+            record = {
+                "sequence": sequence,
+                "role": role,
+                "dataset": dataset["name"],
+                "version": binding_version,
+                "snapshot_id": snapshot_id,
+                "run_status": run_status,
+                "previous_hash": previous_hash,
+            }
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO processing_run_snapshot_bindings ("
+                    "run_id, sequence, role, dataset, version, snapshot_id, "
+                    "run_status, previous_hash, evidence_hash, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        sequence,
+                        role,
+                        dataset["name"],
+                        binding_version,
+                        snapshot_id,
+                        run_status,
+                        previous_hash,
+                        _snapshot_binding_evidence_hash(record),
+                        utc_now_iso(),
+                    ),
+                )
+                break
+            except sqlite3.IntegrityError:
+                # A cross-process writer either repeated the (role, snapshot)
+                # binding (409) or took the same sequence first (re-read the
+                # tail and retry without gaps or reused numbers).
+                if _find_duplicate_snapshot_binding(
+                    conn, run_id, role, snapshot_id
+                ) is not None:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"Snapshot {snapshot_id} is already bound to run "
+                        f"{run_id} as '{role}'"
+                    )
+                if attempt + 1 == _SNAPSHOT_BINDING_APPEND_MAX_ATTEMPTS:
+                    conn.rollback()
+                    raise ConflictError(
+                        "Too many concurrent snapshot-binding writes; retry "
+                        "the request"
+                    )
+                conn.rollback()
+                continue
+
+    stored = conn.execute(
+        "SELECT * FROM processing_run_snapshot_bindings WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _snapshot_binding_row_to_dict(stored)
+
+
+def list_snapshot_bindings(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Return every snapshot binding of a run in ascending sequence order.
+
+    The path run resolves first (unknown resources 404, a run owned by another
+    task 422); only afterwards are any body bytes (whitespace-only included) or
+    query parameters rejected as 422. The read is strictly read-only.
+    """
+    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+
+    if body:
+        raise RequestInvalidError(
+            "The snapshot bindings endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot bindings endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM processing_run_snapshot_bindings WHERE run_id = ? "
+        "ORDER BY sequence ASC",
+        (run_id,),
+    ).fetchall()
+    return [_snapshot_binding_row_to_dict(row) for row in rows]
+
+
+def _snapshot_binding_still_exists(
+    conn: sqlite3.Connection, dataset: str, version: int, snapshot_id: int
+) -> bool:
+    """Whether the bound snapshot is currently stored.
+
+    Bindings outlive a confirmed snapshot deletion (the snapshot link is a
+    plain integer), so a later deletion makes this false and verification
+    reports ``snapshot_deleted`` while retaining the record.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM snapshots AS s "
+        "JOIN schema_versions AS v ON s.version_id = v.id "
+        "JOIN datasets AS d ON v.dataset_id = d.id "
+        "WHERE d.name = ? AND v.version = ? AND s.id = ?",
+        (dataset, version, snapshot_id),
+    ).fetchone()
+    return row is not None
+
+
+def verify_snapshot_binding_chain(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Read-only verification of a run's whole snapshot-binding chain.
+
+    Recomputed fresh on every read: sequences must run continuously from 1,
+    the first ``previous_hash`` must be null and every later one equal the
+    preceding record's ``evidence_hash``, every ``evidence_hash`` must match
+    the canonical-JSON digest, and every bound snapshot must still exist. Each
+    failure contributes one problem entry (several can apply to one binding),
+    sorted by sequence then code; an intact chain (including an empty one,
+    checked_count 0) reports ``valid`` true as a normal 200. Shape checks
+    (body/query) run only after the path run resolves.
+    """
+    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+
+    if body:
+        raise RequestInvalidError(
+            "The snapshot binding verification endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot binding verification endpoint does not accept query "
+            "parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM processing_run_snapshot_bindings WHERE run_id = ? "
+        "ORDER BY sequence ASC",
+        (run_id,),
+    ).fetchall()
+
+    problems: list[dict[str, Any]] = []
+    valid = True
+    expected_sequence = 1
+    previous_hash: str | None = None
+    for row in rows:
+        binding = _snapshot_binding_row_to_dict(row)
+        if binding["sequence"] != expected_sequence:
+            valid = False
+            problems.append(
+                {
+                    "sequence": binding["sequence"],
+                    "binding_id": binding["id"],
+                    "code": "sequence_gap",
+                }
+            )
+        if binding["previous_hash"] != previous_hash:
+            valid = False
+            problems.append(
+                {
+                    "sequence": binding["sequence"],
+                    "binding_id": binding["id"],
+                    "code": "previous_hash_mismatch",
+                }
+            )
+        if _snapshot_binding_evidence_hash(binding) != binding["evidence_hash"]:
+            valid = False
+            problems.append(
+                {
+                    "sequence": binding["sequence"],
+                    "binding_id": binding["id"],
+                    "code": "hash_mismatch",
+                }
+            )
+        if not _snapshot_binding_still_exists(
+            conn,
+            binding["dataset"],
+            binding["version"],
+            binding["snapshot_id"],
+        ):
+            valid = False
+            problems.append(
+                {
+                    "sequence": binding["sequence"],
+                    "binding_id": binding["id"],
+                    "code": "snapshot_deleted",
+                }
+            )
+        previous_hash = binding["evidence_hash"]
+        expected_sequence += 1
+
+    problems.sort(key=lambda problem: (problem["sequence"], problem["code"]))
+
+    return {
+        "dataset": dataset_name,
+        "version": version_number,
+        "task_id": task_id,
+        "run_id": run_id,
+        "valid": valid,
+        "checked_count": len(rows),
+        "problems": problems,
+    }

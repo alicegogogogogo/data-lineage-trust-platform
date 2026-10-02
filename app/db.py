@@ -339,6 +339,32 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (run_id, sequence)
     )
     """,
+    # Snapshot bindings are the per-run evidence chain of the snapshots a run
+    # reads (role 'input') and writes (role 'output'). Records are append-only
+    # and numbered from 1 per run; a run may bind several snapshots, but the
+    # same snapshot can be bound at most once per role. The snapshot link is a
+    # plain integer (mirroring snapshot_deletion_proofs): the binding record is
+    # retained after a later confirmed deletion of the snapshot, at which point
+    # verification flags snapshot_deleted instead of dropping the record.
+    """
+    CREATE TABLE IF NOT EXISTS processing_run_snapshot_bindings (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id      INTEGER NOT NULL
+                    REFERENCES processing_task_runs(id) ON DELETE CASCADE,
+        sequence    INTEGER NOT NULL CHECK (sequence >= 1),
+        role        TEXT NOT NULL CHECK (role IN ('input', 'output')),
+        dataset     TEXT NOT NULL,
+        version     INTEGER NOT NULL,
+        snapshot_id INTEGER NOT NULL,
+        run_status  TEXT NOT NULL
+                    CHECK (run_status IN ('running', 'succeeded', 'failed')),
+        previous_hash TEXT,
+        evidence_hash TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        UNIQUE (run_id, sequence),
+        UNIQUE (run_id, role, snapshot_id)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS retention_policies (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -475,6 +501,24 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON processing_task_audit_records
     BEGIN
         SELECT RAISE(ABORT, 'processing task audit records are immutable');
+    END
+    """,
+    # Run snapshot bindings are an append-only evidence chain as well: the
+    # database itself refuses updates and deletes (a confirmed snapshot
+    # deletion leaves the binding record untouched) so the binding history
+    # cannot be rewritten.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_run_snapshot_bindings_no_update
+    BEFORE UPDATE ON processing_run_snapshot_bindings
+    BEGIN
+        SELECT RAISE(ABORT, 'processing run snapshot bindings are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_run_snapshot_bindings_no_delete
+    BEFORE DELETE ON processing_run_snapshot_bindings
+    BEGIN
+        SELECT RAISE(ABORT, 'processing run snapshot bindings are immutable');
     END
     """,
     # Evaluation history is append-only as well: the database itself refuses

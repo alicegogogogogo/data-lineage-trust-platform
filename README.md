@@ -1918,3 +1918,53 @@ from every stored field except `id`, `created_at` and `evidence_hash` itself
 (`event`, `input_summary`, `result_summary`, `sequence`, `run_status`,
 `previous_hash`): keys are sorted by Unicode code point, no insignificant
 whitespace is emitted and the text is UTF-8 encoded.
+
+### Processing run snapshot bindings (append-only evidence chain)
+
+Every run carries an independent, tamper-evident chain of snapshot bindings:
+evidence that a run read (`role` `input`) or produced (`role` `output`) a
+particular persisted snapshot. Records are append-only (the database rejects
+updates and deletes, and there are no per-binding HTTP routes), numbered from
+`1` per run and linked through SHA-256 evidence hashes. They persist across
+restarts.
+
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/runs/{run_id}/snapshot-bindings`
+  — bind a snapshot. The body contains exactly `role`, `version` and
+  `snapshot_id`: `{"role": "input", "version": 1, "snapshot_id": 4}`. `role`
+  is `input` or `output`; the snapshot must belong to the path dataset (the
+  body `version` may differ from the path version) and must still be stored —
+  a snapshot that does not exist or was confirmed deleted is a `404`. A run may
+  bind several snapshots, but the same snapshot binds at most once per role; a
+  repeated `role`+`snapshot_id` is a `409`. Returns `201` with `id`,
+  `sequence` (continuous from `1` within the run), `role`, `dataset`,
+  `version`, `snapshot_id`, `run_status` (the run's status at write time),
+  `previous_hash` (`null` for the first binding, otherwise the previous
+  binding's `evidence_hash`), `evidence_hash` and `created_at`. The path
+  dataset/version/task resolve first (unknown → `404`); a missing, extra or
+  wrongly typed body field, an illegal `role`, any query parameter, a run that
+  does not exist (`404`) or one that belongs to another task (`422`) follow.
+  Every rejection writes nothing and leaves the run's audit-record chain
+  unchanged; concurrent appends never reuse or skip a sequence.
+- `GET .../runs/{run_id}/snapshot-bindings` — list the run's bindings in
+  ascending `sequence` order together with the binding total as
+  `checked_count` on verification. Same `404`/`422` path rules; any request
+  body bytes (whitespace-only included) or query parameter → `422`.
+- `GET .../runs/{run_id}/snapshot-bindings/verify` — verify the whole chain.
+  Returns `{"dataset", "version", "task_id", "run_id", "valid",
+  "checked_count", "problems"}`. It recomputes every `evidence_hash`, checks
+  that `sequence` values are continuous from `1`, that the first
+  `previous_hash` is `null` and every later one equals the preceding binding's
+  `evidence_hash`, and that every bound snapshot still exists. Each failure
+  contributes one problem — `sequence_gap`, `previous_hash_mismatch`,
+  `hash_mismatch` or `snapshot_deleted` — each item being
+  `{"sequence", "binding_id", "code"}`, sorted by `sequence` then `code`. A
+  snapshot confirmed deleted after it was bound does not remove or change the
+  record: the binding stays listed and the chain reports `valid` `false` with a
+  `snapshot_deleted` problem; an empty chain is valid with `checked_count` `0`.
+  Same body/query `422` and path `404`/`422` rules as the list; nothing is
+  written.
+
+`evidence_hash` is the hexadecimal SHA-256 of a canonical JSON document built
+from `sequence`, `role`, `dataset`, `version`, `snapshot_id`, `run_status` and
+`previous_hash`: keys are sorted by Unicode code point, compact whitespace,
+non-ASCII unescaped, UTF-8 encoded.
