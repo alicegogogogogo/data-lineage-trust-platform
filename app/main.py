@@ -52,6 +52,13 @@ from app.models import (
     PrivacyViewResponse,
     ProcessingRunCancel,
     ProcessingRunFinish,
+    ProcessingLeaseDispatchRequest,
+    ProcessingLeaseDispatchResponse,
+    ProcessingLeaseHeartbeatRequest,
+    ProcessingLeaseCompleteRequest,
+    ProcessingLeaseReclaimRequest,
+    ProcessingLeaseReclaimResponse,
+    ProcessingLeasedRun,
     ProcessingRunBatchCompleteRequest,
     ProcessingRunBatchCompleteResponse,
     ProcessingTask,
@@ -3241,6 +3248,121 @@ def batch_complete_processing_task_runs(
             dataset_name,
             version,
             [item.model_dump(exclude_unset=True) for item in payload.runs],
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+# The literal "lease-dispatch" and "reclaim-leases" segments must not be parsed
+# as a task id (mirrors "dispatch" and "batch-complete"); likewise the literal
+# "runs" segment of the lease heartbeat/complete addresses never collides with
+# the "/{task_id}" routes because a task id is an integer.
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/lease-dispatch",
+    response_model=ProcessingLeaseDispatchResponse,
+    status_code=201,
+)
+def lease_dispatch_processing_tasks(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    payload: ProcessingLeaseDispatchRequest,
+    conn=Depends(get_db),
+) -> ProcessingLeaseDispatchResponse:
+    # Selection and eligibility mirror the plain dispatch; every started run
+    # additionally carries a lease (unique lease id, worker id and expiry at
+    # the request time plus lease_seconds). Any query parameter is a 422
+    # checked in the repository after the path resolves.
+    return ProcessingLeaseDispatchResponse(
+        **repository.lease_dispatch_processing_tasks(
+            conn,
+            dataset_name,
+            version,
+            payload.worker_id,
+            payload.lease_seconds,
+            payload.limit,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/reclaim-leases",
+    response_model=ProcessingLeaseReclaimResponse,
+)
+def reclaim_processing_task_leases(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    payload: ProcessingLeaseReclaimRequest,
+    conn=Depends(get_db),
+) -> ProcessingLeaseReclaimResponse:
+    # The body carries only the timezone-bearing 'as_of' instant; it is parsed
+    # in the repository (after the path dataset/version resolves) so a
+    # malformed or timezone-less value stays a 422 with zero writes.
+    return ProcessingLeaseReclaimResponse(
+        **repository.reclaim_processing_task_leases(
+            conn,
+            dataset_name,
+            version,
+            payload.as_of,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/runs/{{run_id}}/lease-heartbeat",
+    response_model=ProcessingLeasedRun,
+)
+def heartbeat_processing_task_lease(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    run_id: int,
+    payload: ProcessingLeaseHeartbeatRequest,
+    conn=Depends(get_db),
+) -> ProcessingLeasedRun:
+    # Only the non-expired holder of the run's lease may extend it; an unknown
+    # path object is a 404 and an invalid, expired, ended or foreign lease is
+    # a 409, all validated in the repository with zero writes on rejection.
+    return ProcessingLeasedRun(
+        **repository.heartbeat_processing_task_lease(
+            conn,
+            dataset_name,
+            version,
+            run_id,
+            payload.lease_id,
+            payload.lease_seconds,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/runs/{{run_id}}/lease-complete",
+    response_model=ProcessingLeasedRun,
+)
+def complete_processing_task_lease(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    run_id: int,
+    payload: ProcessingLeaseCompleteRequest,
+    conn=Depends(get_db),
+) -> ProcessingLeasedRun:
+    # Result semantics mirror the plain finish endpoint, plus the lease proof:
+    # only the non-expired holder may write the terminal state. An unknown
+    # path object is a 404; a lease conflict is a 409 with zero writes.
+    return ProcessingLeasedRun(
+        **repository.complete_processing_task_lease(
+            conn,
+            dataset_name,
+            version,
+            run_id,
+            payload.lease_id,
+            payload.status,
+            payload.error,
             query_keys=tuple(request.query_params.keys()),
         )
     )

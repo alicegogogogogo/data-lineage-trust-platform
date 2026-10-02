@@ -1852,6 +1852,83 @@ class ProcessingTaskDependenciesUpdate(BaseModel):
     )
 
 
+# --------------------------------------------------------------------------- #
+# Lease-based task dispatch
+# --------------------------------------------------------------------------- #
+
+
+class ProcessingLeaseDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: StrictStr = Field(
+        min_length=1,
+        description="Identifier of the leasing worker; non-empty after trimming",
+    )
+    lease_seconds: StrictInt = Field(
+        ge=1, description="Lease duration in seconds; a positive integer"
+    )
+    # Non-optional with a default: omission yields 1, while an explicit null is
+    # rejected like any other non-integer (mirrors the plain dispatch limit).
+    limit: StrictInt = Field(
+        default=1,
+        ge=1,
+        description="Maximum number of tasks to lease; defaults to 1 when omitted",
+    )
+
+
+class ProcessingLeasedRun(BaseModel):
+    id: int
+    task_id: int
+    attempt: int
+    status: Literal["running", "succeeded", "failed"]
+    started_at: str
+    finished_at: str | None
+    error: str | None
+    lease_id: str | None
+    worker_id: str | None
+    lease_expires_at: str | None
+
+
+class ProcessingLeaseDispatchResponse(BaseModel):
+    dataset: str
+    version: int
+    runs: list[ProcessingLeasedRun]
+
+
+class ProcessingLeaseHeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_id: StrictStr = Field(description="Lease the caller claims to hold")
+    lease_seconds: StrictInt = Field(
+        ge=1, description="Lease extension in seconds; a positive integer"
+    )
+
+
+class ProcessingLeaseCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_id: StrictStr = Field(description="Lease the caller claims to hold")
+    status: Literal["succeeded", "failed"]
+    error: StrictStr | None = None
+
+
+class ProcessingLeaseReclaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Parsed and timezone-checked in the repository (after the path resolves)
+    # so an unknown dataset/version keeps its 404 precedence.
+    as_of: StrictStr = Field(
+        description="ISO-8601 date-time with timezone; leases expired at this "
+        "instant are reclaimed"
+    )
+
+
+class ProcessingLeaseReclaimResponse(BaseModel):
+    dataset: str
+    version: int
+    runs: list[ProcessingLeasedRun]
+
+
 ScheduleState = Literal[
     "running", "succeeded", "retryable", "exhausted", "ready", "blocked",
     "upstream_failed",

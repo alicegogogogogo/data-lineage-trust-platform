@@ -12,6 +12,7 @@ from collections import Counter, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from app.db import db_session
 from app.errors import ConflictError, NotFoundError, RequestInvalidError
@@ -9621,25 +9622,55 @@ def get_processing_task(
 
 
 def _insert_task_run(
-    conn: sqlite3.Connection, task_id: int, attempt: int
+    conn: sqlite3.Connection,
+    task_id: int,
+    attempt: int,
+    *,
+    started_at: str | None = None,
+    lease: tuple[str, str, str] | None = None,
 ) -> sqlite3.Row:
     """Insert one ``running`` run and return its stored row.
 
     The UNIQUE(task_id, attempt) constraint is the hard guard against a
     duplicate attempt created by a competing transaction (the dispatch
-    endpoint or a concurrent single-task start).
+    endpoint or a concurrent single-task start). ``lease`` carries the
+    (lease_id, worker_id, lease_expires_at) triple of a leased start; the
+    lease-free entry points omit it and the columns stay NULL.
     """
-    cursor = conn.execute(
-        "INSERT INTO processing_task_runs (task_id, attempt, status, started_at) "
-        "VALUES (?, ?, 'running', ?)",
-        (task_id, attempt, utc_now_iso()),
-    )
+    if lease is None:
+        cursor = conn.execute(
+            "INSERT INTO processing_task_runs (task_id, attempt, status, started_at) "
+            "VALUES (?, ?, 'running', ?)",
+            (task_id, attempt, started_at or utc_now_iso()),
+        )
+    else:
+        lease_id, worker_id, lease_expires_at = lease
+        cursor = conn.execute(
+            "INSERT INTO processing_task_runs ("
+            "task_id, attempt, status, started_at, lease_id, worker_id, "
+            "lease_expires_at"
+            ") VALUES (?, ?, 'running', ?, ?, ?, ?)",
+            (
+                task_id,
+                attempt,
+                started_at or utc_now_iso(),
+                lease_id,
+                worker_id,
+                lease_expires_at,
+            ),
+        )
     return conn.execute(
         "SELECT * FROM processing_task_runs WHERE id = ?", (cursor.lastrowid,)
     ).fetchone()
 
 
-def _start_task_run(conn: sqlite3.Connection, task_row: sqlite3.Row) -> dict:
+def _start_task_run(
+    conn: sqlite3.Connection,
+    task_row: sqlite3.Row,
+    *,
+    started_at: str | None = None,
+    lease: tuple[str, str, str] | None = None,
+) -> dict:
     """Flip one eligible task to ``running`` and create its next attempt.
 
     The conditional UPDATE re-checks status and attempt budget against the
@@ -9660,7 +9691,11 @@ def _start_task_run(conn: sqlite3.Connection, task_row: sqlite3.Row) -> dict:
         raise ConflictError(
             f"Processing task {task_row['id']} was started concurrently"
         )
-    return _run_row_to_dict(_insert_task_run(conn, task_row["id"], attempt))
+    return _run_row_to_dict(
+        _insert_task_run(
+            conn, task_row["id"], attempt, started_at=started_at, lease=lease
+        )
+    )
 
 
 def create_task_run(
@@ -10125,6 +10160,364 @@ def batch_complete_task_runs(
         "dataset": dataset["name"],
         "version": version_row["version"],
         "runs": completed,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Lease-based task dispatch, heartbeat, completion and reclamation
+# --------------------------------------------------------------------------- #
+
+
+def _leased_run_row_to_dict(row: sqlite3.Row) -> dict:
+    """Run fields plus the lease triple; NULL lease columns stay None."""
+    result = _run_row_to_dict(row)
+    result["lease_id"] = row["lease_id"]
+    result["worker_id"] = row["worker_id"]
+    result["lease_expires_at"] = row["lease_expires_at"]
+    return result
+
+
+def _require_version_run(
+    conn: sqlite3.Connection,
+    version_row: sqlite3.Row,
+    dataset_name: str,
+    version_number: int,
+    run_id: int,
+) -> sqlite3.Row:
+    """The run scoped to the path version; runs of other versions are 404."""
+    row = conn.execute(
+        "SELECT r.* FROM processing_task_runs r "
+        "JOIN processing_tasks t ON t.id = r.task_id "
+        "WHERE r.id = ? AND t.version_id = ?",
+        (run_id, version_row["id"]),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"Processing task run {run_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    return row
+
+
+def _require_active_lease(run_row: sqlite3.Row, lease_id: str) -> None:
+    """The 409 checks shared by heartbeat and lease-complete.
+
+    Only the non-expired holder of a still-running run's lease may act on it:
+    an ended run, a lease id that does not match the run's lease (unknown,
+    missing or another worker's) and an expired lease are all conflicts and
+    write nothing.
+    """
+    if run_row["status"] != "running":
+        raise ConflictError(
+            f"Processing task run {run_row['id']} is already "
+            f"'{run_row['status']}'; its lease has ended"
+        )
+    if run_row["lease_id"] is None or run_row["lease_id"] != lease_id:
+        raise ConflictError(
+            f"Processing task run {run_row['id']} is not held by the "
+            "presented lease"
+        )
+    expires_at = datetime.fromisoformat(run_row["lease_expires_at"])
+    if expires_at <= datetime.now(timezone.utc):
+        raise ConflictError(
+            f"The lease of processing task run {run_row['id']} has expired"
+        )
+
+
+def _parse_lease_as_of(raw: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise RequestInvalidError(
+            "Field 'as_of' must be an ISO-8601 date-time"
+        ) from exc
+    # A trailing timezone designator (offset or 'Z') is mandatory.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RequestInvalidError("Field 'as_of' must include a timezone")
+    return parsed
+
+
+def lease_dispatch_processing_tasks(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    worker_id: str,
+    lease_seconds: int,
+    limit: int,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Lease-start up to ``limit`` startable tasks of one version atomically.
+
+    Eligibility and selection mirror the plain dispatch (``pending`` or
+    ``failed`` with attempts left, every direct dependency ``succeeded``, task
+    id ascending, no same-request chaining); each started run additionally
+    carries a freshly generated lease id (unique within the dataset), the
+    worker id and the expiry — exactly the request time plus ``lease_seconds``
+    — so a later heartbeat or completion must prove lease ownership.
+
+    The process lock and ``BEGIN IMMEDIATE`` serialize against every other
+    start/finish/cancel; the conditional UPDATE and UNIQUE(task_id, attempt)
+    remain the hard guards, so concurrent lease dispatches neither duplicate
+    nor skip attempts and a task never has two running runs.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+
+            clean_worker_id = worker_id.strip()
+            if not clean_worker_id:
+                raise RequestInvalidError("Worker id must not be empty")
+            if query_keys:
+                raise RequestInvalidError(
+                    "The lease-dispatch endpoint does not accept query parameters"
+                )
+
+            # One request timestamp for the whole batch: every lease expires
+            # exactly lease_seconds after the request instant.
+            requested_at = datetime.now(timezone.utc)
+            started_at = requested_at.isoformat()
+            lease_expires_at = (
+                requested_at + timedelta(seconds=lease_seconds)
+            ).isoformat()
+
+            rows = _version_task_rows(conn, version_row["id"])
+            statuses: dict[int, str] = {row["id"]: row["status"] for row in rows}
+            started: list[dict] = []
+            for row in rows:
+                if len(started) >= limit:
+                    break
+                if row["status"] not in ("pending", "failed"):
+                    continue
+                if row["attempt_count"] >= row["max_attempts"]:
+                    continue
+                dependencies = json.loads(row["depends_on"])
+                if any(statuses.get(dep_id) != "succeeded" for dep_id in dependencies):
+                    continue
+                lease = (uuid4().hex, clean_worker_id, lease_expires_at)
+                run = _start_task_run(
+                    conn, row, started_at=started_at, lease=lease
+                )
+                stored = conn.execute(
+                    "SELECT * FROM processing_task_runs WHERE id = ?", (run["id"],)
+                ).fetchone()
+                started.append(_leased_run_row_to_dict(stored))
+                statuses[row["id"]] = "running"
+        except BaseException:
+            conn.rollback()
+            raise
+
+    started.sort(key=lambda run: run["task_id"])
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "runs": started,
+    }
+
+
+def heartbeat_processing_task_lease(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    run_id: int,
+    lease_id: str,
+    lease_seconds: int,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Extend a running run's lease; only its non-expired holder may renew.
+
+    The new expiry is the request time plus ``lease_seconds``. An unknown
+    path object is a 404; an ended run, an unknown/expired/foreign lease id
+    is a 409 and writes nothing. The conditional update is the hard
+    single-winner guard against a concurrent terminal transition or reclaim.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            if query_keys:
+                raise RequestInvalidError(
+                    "The lease heartbeat endpoint does not accept query parameters"
+                )
+            run_row = _require_version_run(
+                conn, version_row, dataset_name, version_number, run_id
+            )
+            _require_active_lease(run_row, lease_id)
+
+            new_expires_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+            ).isoformat()
+            cursor = conn.execute(
+                "UPDATE processing_task_runs SET lease_expires_at = ? "
+                "WHERE id = ? AND status = 'running' AND lease_id = ?",
+                (new_expires_at, run_row["id"], lease_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    f"The lease of processing task run {run_id} was modified "
+                    "concurrently"
+                )
+            updated = conn.execute(
+                "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
+            ).fetchone()
+            return _leased_run_row_to_dict(updated)
+        except BaseException:
+            conn.rollback()
+            raise
+
+
+def complete_processing_task_lease(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    run_id: int,
+    lease_id: str,
+    status: str,
+    error: str | None,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Finish a leased run; only its non-expired lease holder may write.
+
+    Result semantics mirror the plain finish endpoint exactly (a success must
+    not carry an error, a failure requires a non-empty one) with the lease
+    proof added: the run must still be running, the presented lease id must
+    be the run's active lease and the lease must not have expired — every
+    violation is a 409 and writes nothing. On success the run and its task
+    move to the terminal status atomically; the lease triple stays on the row
+    as part of the run's record.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            if query_keys:
+                raise RequestInvalidError(
+                    "The lease-complete endpoint does not accept query parameters"
+                )
+
+            if status == "succeeded":
+                if error is not None:
+                    raise RequestInvalidError(
+                        "A successful run must not carry an error message"
+                    )
+            else:
+                if error is None or not error.strip():
+                    raise RequestInvalidError(
+                        "A failed run requires a non-empty error message"
+                    )
+
+            run_row = _require_version_run(
+                conn, version_row, dataset_name, version_number, run_id
+            )
+            _require_active_lease(run_row, lease_id)
+
+            # The conditional write is the hard guard against a concurrent
+            # finish, cancel or reclaim: it matches only while the run is
+            # still 'running', so exactly one transition commits.
+            cursor = conn.execute(
+                "UPDATE processing_task_runs SET status = ?, finished_at = ?, "
+                "error = ? WHERE id = ? AND status = 'running'",
+                (status, utc_now_iso(), error, run_row["id"]),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    f"Processing task run {run_id} was finished concurrently"
+                )
+            conn.execute(
+                "UPDATE processing_tasks SET status = ? WHERE id = ?",
+                (status, run_row["task_id"]),
+            )
+            updated = conn.execute(
+                "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
+            ).fetchone()
+            return _leased_run_row_to_dict(updated)
+        except BaseException:
+            conn.rollback()
+            raise
+
+
+def reclaim_processing_task_leases(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    as_of: str,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Fail every still-running run of the version whose lease expired by ``as_of``.
+
+    The cutoff is a timezone-bearing ISO-8601 instant (anything else is a 422
+    after the path resolves, and nothing is written). Each expired run moves
+    to ``failed`` with the fixed error 'lease expired' together with its task,
+    atomically in one transaction; a task with attempts left stays
+    dispatchable, an exhausted one is not. Runs without a lease (started
+    through the lease-free entry points) never expire and are untouched, as
+    are runs whose lease is still valid — so a repeated reclaim changes
+    nothing. The result runs are ordered by run id ascending.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            if query_keys:
+                raise RequestInvalidError(
+                    "The reclaim-leases endpoint does not accept query parameters"
+                )
+            cutoff = _parse_lease_as_of(as_of)
+
+            rows = conn.execute(
+                "SELECT r.* FROM processing_task_runs r "
+                "JOIN processing_tasks t ON t.id = r.task_id "
+                "WHERE t.version_id = ? AND r.status = 'running' "
+                "AND r.lease_expires_at IS NOT NULL "
+                "ORDER BY r.id",
+                (version_row["id"],),
+            ).fetchall()
+            # Compare parsed instants so any offset in the stored or requested
+            # timestamps is honored.
+            expired = [
+                row
+                for row in rows
+                if datetime.fromisoformat(row["lease_expires_at"]) <= cutoff
+            ]
+
+            finished_at = utc_now_iso()
+            reclaimed: list[dict] = []
+            for row in expired:
+                cursor = conn.execute(
+                    "UPDATE processing_task_runs SET status = 'failed', "
+                    "finished_at = ?, error = 'lease expired' "
+                    "WHERE id = ? AND status = 'running'",
+                    (finished_at, row["id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError(
+                        f"Processing task run {row['id']} was finished "
+                        "concurrently"
+                    )
+                conn.execute(
+                    "UPDATE processing_tasks SET status = 'failed' WHERE id = ?",
+                    (row["task_id"],),
+                )
+                updated = conn.execute(
+                    "SELECT * FROM processing_task_runs WHERE id = ?", (row["id"],)
+                ).fetchone()
+                reclaimed.append(_leased_run_row_to_dict(updated))
+        except BaseException:
+            conn.rollback()
+            raise
+
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "runs": reclaimed,
     }
 
 

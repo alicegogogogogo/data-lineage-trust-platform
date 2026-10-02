@@ -1769,6 +1769,55 @@ run records one attempt. Tasks and runs are persisted across restarts.
   starts and batch dispatch: exactly one racing operation performs the state
   transition and the others receive `409`, so no run is left `running` with a
   half-written `finished_at`.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/lease-dispatch` —
+  leased worker claim. Body: `{"worker_id": "<non-empty>", "lease_seconds":
+  <positive integer>, "limit": <optional positive integer, default 1>}`.
+  Selection and eligibility mirror the plain `dispatch` (task id ascending,
+  `pending` or `failed` with attempts left, all dependencies `succeeded` at
+  selection time, no same-request chaining); within a single transaction up to
+  `limit` startable tasks get their next-attempt `running` run, each carrying
+  `lease_id` (unique within the dataset), `worker_id` and `lease_expires_at`
+  (exactly the request time plus `lease_seconds`). Returns `201` with
+  `{"dataset", "version", "runs"}` (empty `runs` when nothing is startable);
+  each run has the usual run fields plus the three lease fields. Concurrent
+  lease dispatches (and interleavings with the lease-free starts) never
+  duplicate or skip an attempt and never leave two running runs of one task.
+  Unknown dataset/version → `404`; a missing/blank/non-string `worker_id`, a
+  non-integer (including boolean) or non-positive `lease_seconds`/`limit`,
+  extra body fields or any query parameter → `422` and nothing is written.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/runs/{run_id}/lease-heartbeat` —
+  extend a running run's lease. Body contains only `lease_id` and
+  `lease_seconds` (a positive integer); the new `lease_expires_at` is the
+  request time plus `lease_seconds`. Only the non-expired holder of the run's
+  lease may renew: an ended run, a lease id that does not match the run's
+  active lease (unknown, missing or another worker's) or an already expired
+  lease → `409` and nothing is written. Unknown dataset/version/run → `404`
+  (a run of another dataset/version is out of scope); invalid body fields or
+  any query parameter → `422`. Returns the run with its lease fields.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/runs/{run_id}/lease-complete` —
+  finish a leased run. Body contains only `lease_id`, `status`
+  (`succeeded`/`failed`) and the same `error` rules as the plain finish
+  endpoint (a success must not carry one, a failure requires a non-empty one).
+  Only the non-expired lease holder may write the terminal state: an ended
+  run, a mismatched or expired lease → `409` and nothing is written. On
+  success the run gets `finished_at` and its terminal status and the task
+  moves to the same status atomically (a `failed` task stays retryable while
+  attempts remain); the lease triple stays on the run as part of its record.
+  Unknown dataset/version/run → `404`; invalid body fields or any query
+  parameter → `422`. Returns the run with its lease fields.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/reclaim-leases` —
+  fail every still-`running` run of the version whose lease expired by a given
+  instant. Body contains only `as_of`, an ISO-8601 date-time with a timezone.
+  Each expired run atomically becomes `failed` with `finished_at` written and
+  `error` fixed to `lease expired`, and its task moves to `failed`: with
+  attempts left the task stays dispatchable, once exhausted it is not. Runs
+  without a lease (started through the lease-free entry points) never expire
+  and are untouched, as are runs whose lease is still valid, so a repeated
+  reclaim changes nothing. Returns `{"dataset", "version", "runs"}` with the
+  reclaimed runs sorted by run id ascending, each carrying the run and lease
+  fields. Unknown dataset/version → `404`; a missing/malformed/timezone-less
+  `as_of`, extra body fields or any query parameter → `422` and nothing is
+  written.
 - `PUT /datasets/{dataset}/versions/{version}/processing-tasks/{task_id}/dependencies` —
   atomically replace the task's dependency list. Body contains only
   `{"depends_on": [<task id>, ...]}` (the array may be empty); the ids must

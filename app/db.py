@@ -319,8 +319,18 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         started_at  TEXT NOT NULL,
         finished_at TEXT,
         error       TEXT,
+        lease_id    TEXT,
+        worker_id   TEXT,
+        lease_expires_at TEXT,
         UNIQUE (task_id, attempt)
     )
+    """,
+    # Lease ids of leased runs are unique within a dataset (in practice across
+    # the whole table); runs started through the lease-free entry points carry
+    # no lease and stay NULL, which the partial index ignores.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_task_runs_lease_id
+    ON processing_task_runs (lease_id) WHERE lease_id IS NOT NULL
     """,
     """
     CREATE TABLE IF NOT EXISTS processing_task_audit_records (
@@ -659,6 +669,31 @@ def _migrate_snapshot_content_hash(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_processing_run_lease_columns(conn: sqlite3.Connection) -> None:
+    """Add the lease columns to pre-existing processing run tables.
+
+    Databases created before lease-based dispatch existed are upgraded in
+    place: the three nullable columns are added (idempotently) and every run
+    recorded earlier simply carries no lease, so the lease-free entry points
+    keep their exact behavior for them. Runs before the schema statements so
+    the lease-id unique index can be created right after.
+    """
+    table = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'processing_task_runs'"
+    ).fetchone()
+    if table is None:
+        return
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(processing_task_runs)")
+    }
+    for column in ("lease_id", "worker_id", "lease_expires_at"):
+        if column not in columns:
+            conn.execute(
+                f"ALTER TABLE processing_task_runs ADD COLUMN {column} TEXT"
+            )
+
+
 def database_path() -> Path:
     return Path(os.environ.get("DATA_LINEAGE_DB", DEFAULT_DB_PATH))
 
@@ -670,7 +705,9 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     # Schema creation is idempotent and committed independently, so every
-    # request works against an initialized database file.
+    # request works against an initialized database file. The lease-column
+    # migration runs first so the lease-id index below always finds its column.
+    _migrate_processing_run_lease_columns(conn)
     for statement in SCHEMA_STATEMENTS:
         conn.execute(statement)
     _migrate_snapshot_content_hash(conn)
