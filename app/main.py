@@ -92,6 +92,8 @@ from app.models import (
     SensitiveIdentificationSummaryResponse,
     SchemaVersion,
     SchemaVersionCreate,
+    SnapshotBinding,
+    SnapshotBindingVerifyResponse,
     SnapshotCreate,
     SnapshotDeletionProof,
     SnapshotDeletionProofChainVerifyResponse,
@@ -3408,5 +3410,95 @@ def list_audit_records(
         AuditRecord(**record)
         for record in repository.list_audit_records(
             conn, dataset_name, version, task_id, run_id
+        )
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Processing run snapshot evidence bindings (append-only proof chain)
+# --------------------------------------------------------------------------- #
+
+
+SNAPSHOT_BINDINGS_PATH = (
+    f"{PROCESSING_TASKS_PATH}/{{task_id}}/runs/{{run_id}}/snapshot-bindings"
+)
+
+
+@app.post(SNAPSHOT_BINDINGS_PATH, response_model=SnapshotBinding, status_code=201)
+def create_snapshot_binding(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    run_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> SnapshotBinding:
+    # The body is parsed in the repository (raw bytes rather than a Pydantic
+    # model) so the 404-before-422 precedence is exact: the path
+    # dataset/version/task resolves first, then the body/query shape (422),
+    # then the run (404/422) and finally the body's version/snapshot (404).
+    return SnapshotBinding(
+        **repository.create_snapshot_binding(
+            conn,
+            dataset_name,
+            version,
+            task_id,
+            run_id,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+# Declared alongside the collection: the literal "verify" segment is a full
+# segment past the collection and therefore never mistaken for a binding id
+# (there is no per-binding route).
+@app.get(
+    f"{SNAPSHOT_BINDINGS_PATH}/verify",
+    response_model=SnapshotBindingVerifyResponse,
+)
+def verify_run_snapshot_bindings(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    run_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> SnapshotBindingVerifyResponse:
+    return SnapshotBindingVerifyResponse(
+        **repository.verify_snapshot_bindings(
+            conn,
+            dataset_name,
+            version,
+            task_id,
+            run_id,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.get(SNAPSHOT_BINDINGS_PATH, response_model=list[SnapshotBinding])
+def list_snapshot_bindings(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    task_id: int,
+    run_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> list[SnapshotBinding]:
+    return [
+        SnapshotBinding(**binding)
+        for binding in repository.list_snapshot_bindings(
+            conn,
+            dataset_name,
+            version,
+            task_id,
+            run_id,
+            body=body,
+            query_keys=tuple(request.query_params.keys()),
         )
     ]

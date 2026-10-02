@@ -1904,6 +1904,50 @@ class AuditChainVerifyResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Processing run snapshot evidence bindings
+# --------------------------------------------------------------------------- #
+
+
+class SnapshotBinding(BaseModel):
+    id: int
+    sequence: int
+    role: Literal["input", "output"]
+    dataset: str
+    version: int
+    snapshot_id: int
+    run_status: Literal["running", "succeeded", "failed"]
+    previous_hash: str | None
+    evidence_hash: str
+    created_at: str
+
+
+# Sorted by (sequence, code) in the verify response; ``binding_id`` is the
+# offending binding's id (never omitted).
+SnapshotBindingProblemCode = Literal[
+    "sequence_gap",
+    "previous_hash_mismatch",
+    "hash_mismatch",
+    "snapshot_deleted",
+]
+
+
+class SnapshotBindingVerifyProblem(BaseModel):
+    sequence: int
+    binding_id: int
+    code: SnapshotBindingProblemCode
+
+
+class SnapshotBindingVerifyResponse(BaseModel):
+    dataset: str
+    version: int
+    task_id: int
+    run_id: int
+    valid: bool
+    checked_count: int
+    problems: list[SnapshotBindingVerifyProblem]
+
+
+# --------------------------------------------------------------------------- #
 # Read-only per-version processing audit report
 # --------------------------------------------------------------------------- #
 

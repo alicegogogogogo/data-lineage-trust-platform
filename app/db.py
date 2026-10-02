@@ -339,6 +339,32 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (run_id, sequence)
     )
     """,
+    # Snapshot evidence bindings of one processing run: each record pins one
+    # snapshot of the run's dataset to the run as 'input' or 'output'. The
+    # chain mirrors the audit-record chain (per-run sequences from 1, hashed
+    # links), while the referenced snapshot must stay independently deletable:
+    # like snapshot_deletion_requests, the snapshot link is a plain integer
+    # instead of a cascading foreign key, so a binding survives the deletion
+    # it later reports through verify's snapshot_deleted problem.
+    """
+    CREATE TABLE IF NOT EXISTS processing_run_snapshot_bindings (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id        INTEGER NOT NULL
+                      REFERENCES processing_task_runs(id) ON DELETE CASCADE,
+        sequence      INTEGER NOT NULL CHECK (sequence >= 1),
+        role          TEXT NOT NULL CHECK (role IN ('input', 'output')),
+        dataset       TEXT NOT NULL,
+        version       INTEGER NOT NULL,
+        snapshot_id   INTEGER NOT NULL,
+        run_status    TEXT NOT NULL
+                      CHECK (run_status IN ('running', 'succeeded', 'failed')),
+        previous_hash TEXT,
+        evidence_hash TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        UNIQUE (run_id, sequence),
+        UNIQUE (run_id, role, snapshot_id)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS retention_policies (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -475,6 +501,25 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     BEFORE DELETE ON processing_task_audit_records
     BEGIN
         SELECT RAISE(ABORT, 'processing task audit records are immutable');
+    END
+    """,
+    # Run snapshot bindings are an append-only evidence chain as well: the
+    # database itself refuses updates and deletes so the binding history (and
+    # its hash links) cannot be rewritten. Deleting the referenced snapshot
+    # never touches a binding — the snapshot link is a plain integer on
+    # purpose.
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_run_snapshot_bindings_no_update
+    BEFORE UPDATE ON processing_run_snapshot_bindings
+    BEGIN
+        SELECT RAISE(ABORT, 'processing run snapshot bindings are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_run_snapshot_bindings_no_delete
+    BEFORE DELETE ON processing_run_snapshot_bindings
+    BEGIN
+        SELECT RAISE(ABORT, 'processing run snapshot bindings are immutable');
     END
     """,
     # Evaluation history is append-only as well: the database itself refuses

@@ -11001,3 +11001,414 @@ def get_processing_blocker_summary(
         totals[key] = sum(version[key] for version in versions)
 
     return {"dataset": dataset["name"], "versions": versions, "totals": totals}
+
+
+# --------------------------------------------------------------------------- #
+# Processing run snapshot evidence bindings (append-only proof chain)
+# --------------------------------------------------------------------------- #
+
+
+_binding_append_locks_guard = threading.Lock()
+_binding_append_locks: dict[int, threading.Lock] = {}
+_BINDING_APPEND_MAX_ATTEMPTS = 100
+
+
+def _binding_append_lock(run_id: int) -> threading.Lock:
+    with _binding_append_locks_guard:
+        lock = _binding_append_locks.get(run_id)
+        if lock is None:
+            lock = threading.Lock()
+            _binding_append_locks[run_id] = lock
+        return lock
+
+
+SNAPSHOT_BINDING_EVIDENCE_FIELDS = (
+    "dataset",
+    "previous_hash",
+    "role",
+    "run_status",
+    "sequence",
+    "snapshot_id",
+    "version",
+)
+
+
+def _binding_evidence_hash(record: dict[str, Any]) -> str:
+    """SHA-256 over the canonical JSON of every hashed binding field.
+
+    Keys are sorted by Unicode code point, no whitespace is emitted and the
+    text is UTF-8 encoded (non-ASCII characters are not escaped). ``id``,
+    ``created_at`` and ``evidence_hash`` itself are excluded.
+    """
+    payload = {field: record[field] for field in SNAPSHOT_BINDING_EVIDENCE_FIELDS}
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _binding_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "sequence": row["sequence"],
+        "role": row["role"],
+        "dataset": row["dataset"],
+        "version": row["version"],
+        "snapshot_id": row["snapshot_id"],
+        "run_status": row["run_status"],
+        "previous_hash": row["previous_hash"],
+        "evidence_hash": row["evidence_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+_SNAPSHOT_BINDING_FIELDS = {"role", "version", "snapshot_id"}
+
+
+def _parse_snapshot_binding_body(body: bytes) -> tuple[str, int, int]:
+    """Strictly parse a snapshot-binding request body into (role, version, id).
+
+    Every shape problem is a 422: an empty or whitespace-only body, malformed
+    JSON, a non-object payload, a missing or extra field, a non-string/illegal
+    ``role`` (exactly ``input`` or ``output``, no trimming) and a non-integer
+    (boolean included) ``version``/``snapshot_id``.
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    extra_keys = sorted(set(payload) - _SNAPSHOT_BINDING_FIELDS)
+    if extra_keys:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra_keys))
+    missing = sorted(_SNAPSHOT_BINDING_FIELDS - set(payload))
+    if missing:
+        raise RequestInvalidError("Missing field(s): " + ", ".join(missing))
+
+    raw_role = payload["role"]
+    if not isinstance(raw_role, str):
+        raise RequestInvalidError("'role' must be a string")
+    if raw_role not in ("input", "output"):
+        raise RequestInvalidError("'role' must be 'input' or 'output'")
+
+    for key in ("version", "snapshot_id"):
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RequestInvalidError(f"'{key}' must be an integer")
+
+    return raw_role, payload["version"], payload["snapshot_id"]
+
+
+def create_snapshot_binding(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Bind one existing, non-deleted snapshot of this dataset to a run.
+
+    Precedence mirrors appending an audit record: the path dataset/version/
+    task resolve first (404); the body and query shape are judged next (422);
+    the run must then exist (404) and belong to the path task (422); only
+    afterwards is the body's version/snapshot resolved — a version missing
+    from this dataset or a snapshot that does not exist or has been deleted
+    is a 404. A second binding of the same ``(role, snapshot_id)`` to the run
+    is a 409. Every rejection rolls back: no binding is written and the run's
+    audit-record chain is never touched.
+
+    Bindings are an independent per-run append-only chain: sequences start at
+    1, the per-run lock serializes writers in this process and the
+    UNIQUE(run_id, sequence) constraint plus read-tail retry guarantees
+    gap-free, non-reused sequences across processes.
+    """
+    dataset = require_dataset(conn, dataset_name)
+    version_row = _require_schema_version(conn, dataset, version_number)
+    _require_task(conn, version_row, dataset_name, version_number, task_id)
+
+    role, body_version_number, snapshot_id = _parse_snapshot_binding_body(body)
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot bindings endpoint does not accept query parameters"
+        )
+
+    run_row = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if run_row is None:
+        raise NotFoundError(f"Processing task run {run_id} does not exist")
+    if run_row["task_id"] != task_id:
+        raise RequestInvalidError(
+            f"Processing task run {run_id} does not belong to task {task_id} "
+            f"in version {version_number} of dataset '{dataset_name}'"
+        )
+
+    # The bound snapshot may come from any version of the same dataset; the
+    # path version only names the task/run. A missing version, a missing
+    # snapshot or one already confirmed deleted is a 404.
+    body_version_row = conn.execute(
+        "SELECT id, version FROM schema_versions "
+        "WHERE dataset_id = ? AND version = ?",
+        (dataset["id"], body_version_number),
+    ).fetchone()
+    if body_version_row is None:
+        raise NotFoundError(
+            f"Schema version {body_version_number} of dataset "
+            f"'{dataset_name}' does not exist"
+        )
+    snapshot_row = conn.execute(
+        "SELECT id FROM snapshots WHERE version_id = ? AND id = ?",
+        (body_version_row["id"], snapshot_id),
+    ).fetchone()
+    if snapshot_row is None:
+        raise NotFoundError(
+            f"Snapshot {snapshot_id} does not exist in version "
+            f"{body_version_number} of dataset '{dataset_name}'"
+        )
+
+    duplicate = conn.execute(
+        "SELECT id FROM processing_run_snapshot_bindings "
+        "WHERE run_id = ? AND role = ? AND snapshot_id = ?",
+        (run_id, role, snapshot_id),
+    ).fetchone()
+    if duplicate is not None:
+        raise ConflictError(
+            f"Snapshot {snapshot_id} is already bound to run {run_id} "
+            f"as '{role}'"
+        )
+
+    with _binding_append_lock(run_id):
+        for attempt in range(_BINDING_APPEND_MAX_ATTEMPTS):
+            run_status = conn.execute(
+                "SELECT status FROM processing_task_runs WHERE id = ?", (run_id,)
+            ).fetchone()["status"]
+            tail = conn.execute(
+                "SELECT sequence, evidence_hash "
+                "FROM processing_run_snapshot_bindings "
+                "WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if tail is None:
+                sequence = 1
+                previous_hash = None
+            else:
+                sequence = tail["sequence"] + 1
+                previous_hash = tail["evidence_hash"]
+
+            record = {
+                "sequence": sequence,
+                "role": role,
+                "dataset": dataset["name"],
+                "version": body_version_row["version"],
+                "snapshot_id": snapshot_id,
+                "run_status": run_status,
+                "previous_hash": previous_hash,
+            }
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO processing_run_snapshot_bindings ("
+                    "run_id, sequence, role, dataset, version, snapshot_id, "
+                    "run_status, previous_hash, evidence_hash, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        sequence,
+                        role,
+                        dataset["name"],
+                        body_version_row["version"],
+                        snapshot_id,
+                        run_status,
+                        previous_hash,
+                        _binding_evidence_hash(record),
+                        utc_now_iso(),
+                    ),
+                )
+                break
+            except sqlite3.IntegrityError:
+                # Either another process took this sequence first, or a
+                # concurrent request won the (role, snapshot_id) race. The
+                # latter is a definitive 409; otherwise end the pinned
+                # transaction and retry against the new chain tail.
+                raced_duplicate = conn.execute(
+                    "SELECT id FROM processing_run_snapshot_bindings "
+                    "WHERE run_id = ? AND role = ? AND snapshot_id = ?",
+                    (run_id, role, snapshot_id),
+                ).fetchone()
+                if raced_duplicate is not None:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"Snapshot {snapshot_id} is already bound to run "
+                        f"{run_id} as '{role}'"
+                    )
+                if attempt + 1 == _BINDING_APPEND_MAX_ATTEMPTS:
+                    conn.rollback()
+                    raise ConflictError(
+                        "Too many concurrent snapshot-binding writes; retry "
+                        "the request"
+                    )
+                conn.rollback()
+                continue
+
+    stored = conn.execute(
+        "SELECT * FROM processing_run_snapshot_bindings WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _binding_row_to_dict(stored)
+
+
+def list_snapshot_bindings(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Return every snapshot binding of a run in ascending sequence order.
+
+    Same path resolution as the audit-record list: unknown
+    dataset/version/task/run is a 404 and a run owned by another task is a
+    422. The read takes no body and no query parameters (422), checked after
+    the path resolves so an unknown path stays a 404. Nothing is written.
+    """
+    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+    if body:
+        raise RequestInvalidError(
+            "The snapshot bindings endpoint does not accept a request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot bindings endpoint does not accept query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM processing_run_snapshot_bindings WHERE run_id = ? "
+        "ORDER BY sequence ASC",
+        (run_id,),
+    ).fetchall()
+    return [_binding_row_to_dict(row) for row in rows]
+
+
+def _binding_snapshot_exists(
+    conn: sqlite3.Connection, dataset_name: str, version_number: int, snapshot_id: int
+) -> bool:
+    row = conn.execute(
+        "SELECT snapshots.id AS id "
+        "FROM snapshots "
+        "JOIN schema_versions ON schema_versions.id = snapshots.version_id "
+        "JOIN datasets ON datasets.id = schema_versions.dataset_id "
+        "WHERE datasets.name = ? AND schema_versions.version = ? "
+        "AND snapshots.id = ?",
+        (dataset_name, version_number, snapshot_id),
+    ).fetchone()
+    return row is not None
+
+
+def verify_snapshot_bindings(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    task_id: int,
+    run_id: int,
+    *,
+    body: bytes = b"",
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Re-verify a run's snapshot-binding evidence chain, fresh.
+
+    Path resolution and the no-body/no-query rules match the binding list.
+    The stored bindings are walked in ascending sequence order and four kinds
+    of problems are reported, one item per defect:
+
+    * ``sequence_gap`` — the sequence is not the expected continuous value
+      starting at 1;
+    * ``previous_hash_mismatch`` — the first ``previous_hash`` is not null or
+      a later one does not equal the preceding binding's ``evidence_hash``;
+    * ``hash_mismatch`` — a recomputed canonical-JSON SHA-256 differs from
+      the stored ``evidence_hash``;
+    * ``snapshot_deleted`` — the bound snapshot no longer exists (deleting it
+      never changes or removes the binding).
+
+    Problems sort by (sequence, code). An empty chain is valid with a zero
+    count; nothing is written.
+    """
+    _resolve_run(conn, dataset_name, version_number, task_id, run_id)
+    if body:
+        raise RequestInvalidError(
+            "The snapshot binding verification endpoint does not accept a "
+            "request body"
+        )
+    if query_keys:
+        raise RequestInvalidError(
+            "The snapshot binding verification endpoint does not accept "
+            "query parameters"
+        )
+
+    rows = conn.execute(
+        "SELECT * FROM processing_run_snapshot_bindings WHERE run_id = ? "
+        "ORDER BY sequence ASC",
+        (run_id,),
+    ).fetchall()
+
+    problems: list[dict] = []
+    expected_sequence = 1
+    previous_hash: str | None = None
+    for row in rows:
+        binding = _binding_row_to_dict(row)
+        if binding["sequence"] != expected_sequence:
+            problems.append(
+                {
+                    "sequence": binding["sequence"],
+                    "binding_id": binding["id"],
+                    "code": "sequence_gap",
+                }
+            )
+        if binding["previous_hash"] != previous_hash:
+            problems.append(
+                {
+                    "sequence": binding["sequence"],
+                    "binding_id": binding["id"],
+                    "code": "previous_hash_mismatch",
+                }
+            )
+        if _binding_evidence_hash(binding) != binding["evidence_hash"]:
+            problems.append(
+                {
+                    "sequence": binding["sequence"],
+                    "binding_id": binding["id"],
+                    "code": "hash_mismatch",
+                }
+            )
+        if not _binding_snapshot_exists(
+            conn, binding["dataset"], binding["version"], binding["snapshot_id"]
+        ):
+            problems.append(
+                {
+                    "sequence": binding["sequence"],
+                    "binding_id": binding["id"],
+                    "code": "snapshot_deleted",
+                }
+            )
+        previous_hash = binding["evidence_hash"]
+        expected_sequence += 1
+
+    problems.sort(key=lambda problem: (problem["sequence"], problem["code"]))
+
+    return {
+        "dataset": dataset_name,
+        "version": version_number,
+        "task_id": task_id,
+        "run_id": run_id,
+        "valid": not problems,
+        "checked_count": len(rows),
+        "problems": problems,
+    }
