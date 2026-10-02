@@ -322,6 +322,29 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (task_id, attempt)
     )
     """,
+    # Lease held by a worker on the run it started through the lease-dispatch
+    # flow. Exactly one lease row exists per leased run (UNIQUE(run_id));
+    # ``lease_id`` is a service-generated token unique across the whole dataset
+    # (UNIQUE(dataset_id, lease_id)), spanning every schema version. A lease is
+    # active while ``expires_at`` is still in the future: heartbeat extends it,
+    # lease-complete ends the run as its holder and reclaim-leases atomically
+    # fails runs whose active lease has lapsed. The row is retained after the
+    # run ends (or is reclaimed) so an unknown lease id can be told apart from
+    # an expired or ended one.
+    """
+    CREATE TABLE IF NOT EXISTS processing_run_leases (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+        version_id INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+        run_id     INTEGER NOT NULL UNIQUE
+                   REFERENCES processing_task_runs(id) ON DELETE CASCADE,
+        lease_id   TEXT NOT NULL,
+        worker_id  TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (dataset_id, lease_id)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS processing_task_audit_records (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,

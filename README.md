@@ -1885,6 +1885,79 @@ run records one attempt. Tasks and runs are persisted across restarts.
   `totals` has exactly `version_count`, `task_count` and the six
   `*_count` counters, each the sum of the matching per-version values.
 
+### Lease-based task claiming
+
+Alongside the legacy entry points, a separate lease-based worker flow runs on
+the same dataset, schema-version, task and run layers; it never changes the
+behavior of the legacy endpoints, and runs started through the legacy flow
+carry no lease and are invisible to lease operations. Every lease stores a
+service-generated `lease_id` (unique within the dataset), the holding
+`worker_id` and a timezone-bearing `lease_expires_at`. A lease is *active*
+while its expiry is strictly in the future; the expiry instant itself counts
+as expired.
+
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/lease-dispatch`
+  — worker batch claim. The required body contains exactly `worker_id` (a
+  non-empty string, stored verbatim), `lease_seconds` (a positive integer) and
+  an optional `limit` (a positive integer defaulting to `1`; booleans, floats
+  and numeric strings are rejected). In one transaction, up to `limit`
+  startable tasks are selected by task id ascending using exactly the legacy
+  dispatch startability rules (`pending`, or `failed` with attempts left, with
+  every direct dependency `succeeded` at selection time; tasks started earlier
+  in the same request are not chained). Each selected task starts its next
+  continuous attempt — concurrent lease dispatches, legacy dispatches and
+  single-task starts can never duplicate or skip an attempt, and a task never
+  carries two running runs — and the new run additionally gets a lease whose
+  expiry equals the request time plus `lease_seconds`. Returns `201` with
+  `{"dataset", "version", "runs"}`; when no task is startable the response is
+  still `201` with an empty `runs` list. Each run element carries the ordinary
+  run fields (`id`, `task_id`, `attempt`, `status`, `started_at`,
+  `finished_at`, `error`) followed by `lease_id`, `worker_id` and
+  `lease_expires_at`, and runs are sorted by run `id` ascending. Unknown
+  dataset/version → `404` (checked before every body/query shape check); an
+  empty/whitespace/malformed/non-object body, a missing, extra or wrongly
+  typed field, a non-positive `lease_seconds`/`limit` or any query parameter →
+  `422` and zero writes.
+- `POST .../processing-tasks/runs/{run_id}/lease-heartbeat` — extend a lease.
+  Body contains exactly `{"lease_id", "lease_seconds"}` (non-empty id string,
+  positive integer seconds). Only the unexpired holder of a run that still
+  belongs to the path version and is still `running` may extend its lease; the
+  new expiry is the request time plus `lease_seconds`. Returns the full leased
+  run element. The path dataset/version/run resolves first (unknown run →
+  `404`, including a run owned by another version); the body/query shape is
+  judged next (`422`); an unknown lease id, an expired lease, an already ended
+  run or another run's lease id is a `409` and writes nothing.
+- `POST .../processing-tasks/runs/{run_id}/lease-complete` — finish the run
+  using the existing single-run finish result semantics, with the required
+  `lease_id` added. Body contains exactly `lease_id`, `status`
+  (`succeeded`/`failed`) and an optional `error`: a success carries no
+  non-null error, a failure requires a non-empty-after-trimming message. Only
+  the unexpired holder may write the result; the run gets `finished_at` and
+  the task moves to the same status atomically, and a `failed` task keeps its
+  consumed attempts so it is claimable again while attempts remain. Returns
+  the full leased run element. Precedence and status codes mirror the
+  heartbeat (path `404`, shape `422`, unknown/expired/ended/non-holder lease
+  `409`); every rejection is a zero-write rollback.
+- `POST /datasets/{dataset}/versions/{version}/processing-tasks/reclaim-leases`
+  — atomically reclaim timed-out work. Body contains only `{"as_of":
+  "<timezone-bearing ISO-8601 instant>"}`. Every run of the version that is
+  still `running` and whose lease expiry is at or before `as_of` is changed to
+  `failed` with `error` exactly `lease expired`, and its task moves to
+  `failed`, all in one transaction; attempts are not rolled back, so the task
+  is a normal schedulable failure while attempts remain and permanently failed
+  once they are exhausted. Runs whose leases are still active, runs already
+  terminal and legacy lease-less runs are left untouched, and a repeated
+  reclaim (or one with an earlier cutoff) changes nothing. Returns
+  `{"dataset", "version", "runs"}` with one element per reclaimed run (the
+  same leased-run shape, sorted by run `id` ascending); an empty result is a
+  normal `200`. Unknown dataset/version → `404` (before the body checks); an
+  empty/malformed/non-object body, a missing/extra field, an unparseable or
+  timezone-less `as_of` or any query parameter → `422` and zero writes.
+
+Rejections, repeated reclaims and every legacy endpoint call leave tasks,
+attempt counts, run audit records and run snapshot bindings unchanged; leased
+runs and their leases are persisted and survive process restarts.
+
 ### Processing run audit records (append-only proof chain)
 
 Every run carries an independent, tamper-evident chain of audit records.

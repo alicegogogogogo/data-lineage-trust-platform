@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import sqlite3
 import threading
 from collections import Counter, deque
@@ -10125,6 +10126,559 @@ def batch_complete_task_runs(
         "dataset": dataset["name"],
         "version": version_row["version"],
         "runs": completed,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Lease-based task claiming (lease dispatch / heartbeat / complete / reclaim)
+# --------------------------------------------------------------------------- #
+
+
+# A lease id is a 128-bit random token rendered as 32 lowercase hex characters
+# with a fixed prefix; 2**128 possibilities make a collision overwhelmingly
+# unlikely, and the UNIQUE(dataset_id, lease_id) constraint rejects one anyway.
+_LEASE_ID_PREFIX = "lease-"
+_LEASE_ID_HEX_BYTES = 16
+_LEASE_INSERT_MAX_ATTEMPTS = 5
+_LEASE_EXPIRED_ERROR = "lease expired"
+
+
+def _new_lease_id() -> str:
+    token = secrets.token_hex(_LEASE_ID_HEX_BYTES)
+    return f"{_LEASE_ID_PREFIX}{token}"
+
+
+def _lease_run_dict(
+    run_row: sqlite3.Row, lease_row: sqlite3.Row
+) -> dict:
+    """One lease response element: the run fields plus the three lease fields."""
+    result = _run_row_to_dict(run_row)
+    result["lease_id"] = lease_row["lease_id"]
+    result["worker_id"] = lease_row["worker_id"]
+    result["lease_expires_at"] = lease_row["expires_at"]
+    return result
+
+
+def _require_version_run(
+    conn: sqlite3.Connection,
+    version_row: sqlite3.Row,
+    dataset_name: str,
+    version_number: int,
+    run_id: int,
+) -> sqlite3.Row:
+    """Resolve a run that belongs to a task of the path version (else 404)."""
+    run_row = conn.execute(
+        "SELECT r.* FROM processing_task_runs r "
+        "JOIN processing_tasks t ON t.id = r.task_id "
+        "WHERE r.id = ? AND t.version_id = ?",
+        (run_id, version_row["id"]),
+    ).fetchone()
+    if run_row is None:
+        raise NotFoundError(
+            f"Processing task run {run_id} does not exist in version "
+            f"{version_number} of dataset '{dataset_name}'"
+        )
+    return run_row
+
+
+def _strict_positive_int(payload: dict, key: str) -> int:
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RequestInvalidError(f"'{key}' must be a positive integer")
+    return value
+
+
+def _parse_lease_dispatch_body(
+    body: bytes,
+) -> tuple[str, int, int]:
+    """Parse a lease-dispatch body into (worker_id, lease_seconds, limit).
+
+    The body is required and must contain exactly ``worker_id`` (a non-empty
+    string), ``lease_seconds`` (a positive integer; booleans rejected) and an
+    optional ``limit`` (a positive integer defaulting to 1).
+    """
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    allowed = {"worker_id", "lease_seconds", "limit"}
+    extra = sorted(set(payload) - allowed)
+    if extra:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra))
+    missing = sorted(allowed - {"limit"} - set(payload))
+    if missing:
+        raise RequestInvalidError("Missing field(s): " + ", ".join(missing))
+
+    worker_id = payload["worker_id"]
+    if not isinstance(worker_id, str) or not worker_id:
+        raise RequestInvalidError("'worker_id' must be a non-empty string")
+    lease_seconds = _strict_positive_int(payload, "lease_seconds")
+    limit = (
+        _strict_positive_int(payload, "limit") if "limit" in payload else 1
+    )
+    return worker_id, lease_seconds, limit
+
+
+def _parse_lease_heartbeat_body(body: bytes) -> tuple[str, int]:
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    allowed = {"lease_id", "lease_seconds"}
+    extra = sorted(set(payload) - allowed)
+    if extra:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra))
+    missing = sorted(allowed - set(payload))
+    if missing:
+        raise RequestInvalidError("Missing field(s): " + ", ".join(missing))
+
+    lease_id = payload["lease_id"]
+    if not isinstance(lease_id, str) or not lease_id:
+        raise RequestInvalidError("'lease_id' must be a non-empty string")
+    lease_seconds = _strict_positive_int(payload, "lease_seconds")
+    return lease_id, lease_seconds
+
+
+def _parse_lease_complete_body(body: bytes) -> tuple[str, str, str | None]:
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    allowed = {"lease_id", "status", "error"}
+    extra = sorted(set(payload) - allowed)
+    if extra:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra))
+    missing = sorted(allowed - {"error"} - set(payload))
+    if missing:
+        raise RequestInvalidError("Missing field(s): " + ", ".join(missing))
+
+    lease_id = payload["lease_id"]
+    if not isinstance(lease_id, str) or not lease_id:
+        raise RequestInvalidError("'lease_id' must be a non-empty string")
+    status = payload["status"]
+    if status not in ("succeeded", "failed"):
+        raise RequestInvalidError("'status' must be 'succeeded' or 'failed'")
+    error = payload.get("error")
+    if error is not None and not isinstance(error, str):
+        raise RequestInvalidError("'error' must be a string")
+    return lease_id, status, error
+
+
+def _parse_lease_reclaim_body(body: bytes) -> str:
+    if not body.strip():
+        raise RequestInvalidError("A JSON request body is required")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RequestInvalidError("Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RequestInvalidError("Request body must be a JSON object")
+
+    allowed = {"as_of"}
+    extra = sorted(set(payload) - allowed)
+    if extra:
+        raise RequestInvalidError("Unknown field(s): " + ", ".join(extra))
+    if "as_of" not in payload:
+        raise RequestInvalidError("Missing field(s): as_of")
+
+    as_of = payload["as_of"]
+    if not isinstance(as_of, str) or not as_of:
+        raise RequestInvalidError("'as_of' must be an ISO-8601 date-time string")
+    return as_of
+
+
+def _reject_lease_query_parameters(query_keys: tuple[str, ...]) -> None:
+    if query_keys:
+        raise RequestInvalidError(
+            "The processing lease endpoints do not accept query parameters"
+        )
+
+
+def _parse_timezone_aware(raw: str, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise RequestInvalidError(
+            f"'{field}' must be an ISO-8601 date-time"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RequestInvalidError(f"'{field}' must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _find_lease(
+    conn: sqlite3.Connection, dataset_id: int, lease_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM processing_run_leases WHERE dataset_id = ? AND lease_id = ?",
+        (dataset_id, lease_id),
+    ).fetchone()
+
+
+def _lease_active(lease_row: sqlite3.Row, now: datetime) -> bool:
+    # Stored expiries are UTC; the boundary instant itself counts as expired.
+    return datetime.fromisoformat(lease_row["expires_at"]) > now
+
+
+def _start_leased_task_run(
+    conn: sqlite3.Connection,
+    task_row: sqlite3.Row,
+    dataset_row: sqlite3.Row,
+    version_row: sqlite3.Row,
+    worker_id: str,
+    lease_expires: datetime,
+) -> dict:
+    """Start one task's next attempt and attach a fresh lease atomically."""
+    run = _start_task_run(conn, task_row)
+    lease_id = _new_lease_id()
+    for attempt in range(_LEASE_INSERT_MAX_ATTEMPTS):
+        try:
+            conn.execute(
+                "INSERT INTO processing_run_leases ("
+                "dataset_id, version_id, run_id, lease_id, worker_id, "
+                "expires_at, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    dataset_row["id"],
+                    version_row["id"],
+                    run["id"],
+                    lease_id,
+                    worker_id,
+                    lease_expires.isoformat(),
+                    utc_now_iso(),
+                ),
+            )
+            break
+        except sqlite3.IntegrityError as exc:
+            # UNIQUE(run_id) cannot fire for a run created in this same
+            # transaction; a lease-id collision against a concurrent writer in
+            # another process is the only possibility, so retry with a fresh
+            # token rather than failing the whole dispatch.
+            existing = _find_lease(conn, dataset_row["id"], lease_id)
+            if existing is None:
+                raise ConflictError(
+                    "A processing run lease could not be created"
+                ) from exc
+            if attempt + 1 == _LEASE_INSERT_MAX_ATTEMPTS:
+                raise ConflictError(
+                    "A processing run lease could not be created"
+                ) from exc
+            lease_id = _new_lease_id()
+
+    lease_row = conn.execute(
+        "SELECT * FROM processing_run_leases WHERE run_id = ?", (run["id"],)
+    ).fetchone()
+    run_row = conn.execute(
+        "SELECT * FROM processing_task_runs WHERE id = ?", (run["id"],)
+    ).fetchone()
+    return _lease_run_dict(run_row, lease_row)
+
+
+def lease_dispatch_processing_tasks(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Claim up to ``limit`` startable tasks and hand each a timed lease.
+
+    The path dataset/version resolves first (404); the body and query shape
+    are judged next (422), before any task is read. Selection then follows the
+    legacy dispatch exactly: pending/failed tasks with attempts left whose
+    direct dependencies have all succeeded, task id ascending, no chaining of
+    tasks started in this same request. Each selected task starts its next
+    continuous attempt and additionally gets a lease carrying a dataset-unique
+    lease id, the worker id and an expiry equal to the request time plus
+    ``lease_seconds``. Serialization mirrors the legacy dispatch, so a lease
+    dispatch never duplicates or skips an attempt against another dispatch or
+    single-task start and no task ever carries two running runs.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            worker_id, lease_seconds, limit = _parse_lease_dispatch_body(body)
+            _reject_lease_query_parameters(query_keys)
+
+            # One request time for the whole batch: every lease handed out by
+            # this request expires at the same instant.
+            request_time = datetime.now(timezone.utc)
+            lease_expires = request_time + timedelta(seconds=lease_seconds)
+
+            rows = _version_task_rows(conn, version_row["id"])
+            statuses: dict[int, str] = {row["id"]: row["status"] for row in rows}
+            started: list[dict] = []
+            for row in rows:
+                if len(started) >= limit:
+                    break
+                if row["status"] not in ("pending", "failed"):
+                    continue
+                if row["attempt_count"] >= row["max_attempts"]:
+                    continue
+                dependencies = json.loads(row["depends_on"])
+                if any(
+                    statuses.get(dep_id) != "succeeded" for dep_id in dependencies
+                ):
+                    continue
+                started.append(
+                    _start_leased_task_run(
+                        conn, row, dataset, version_row, worker_id, lease_expires
+                    )
+                )
+                statuses[row["id"]] = "running"
+        except BaseException:
+            conn.rollback()
+            raise
+
+    started.sort(key=lambda run: run["task_id"])
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "runs": started,
+    }
+
+
+def heartbeat_processing_run_lease(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    run_id: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Extend a running run's lease as its unexpired holder.
+
+    The path dataset/version/run resolves first (404); the body and query
+    shape are judged next (422). Afterwards the named lease must exist for the
+    dataset, belong to this run and still be active on a run that is still
+    ``running``; an unknown, expired, ended or non-holder lease is a 409 that
+    writes nothing. On success the lease expiry becomes the request time plus
+    ``lease_seconds`` and the full leased-run element is returned.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            run_row = _require_version_run(
+                conn, version_row, dataset_name, version_number, run_id
+            )
+            lease_id, lease_seconds = _parse_lease_heartbeat_body(body)
+            _reject_lease_query_parameters(query_keys)
+
+            lease_row = _find_lease(conn, dataset["id"], lease_id)
+            now = datetime.now(timezone.utc)
+            if (
+                lease_row is None
+                or lease_row["run_id"] != run_row["id"]
+                or run_row["status"] != "running"
+                or not _lease_active(lease_row, now)
+            ):
+                raise ConflictError(
+                    "The lease is unknown, expired, ended or held by another "
+                    "worker and cannot be extended"
+                )
+
+            new_expires = now + timedelta(seconds=lease_seconds)
+            conn.execute(
+                "UPDATE processing_run_leases SET expires_at = ? WHERE id = ?",
+                (new_expires.isoformat(), lease_row["id"]),
+            )
+            updated_lease = conn.execute(
+                "SELECT * FROM processing_run_leases WHERE id = ?",
+                (lease_row["id"],),
+            ).fetchone()
+            result = _lease_run_dict(run_row, updated_lease)
+        except BaseException:
+            conn.rollback()
+            raise
+    return result
+
+
+def complete_processing_run_lease(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    run_id: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Finish a running run with the existing result semantics, lease-held.
+
+    Precedence mirrors the heartbeat: path dataset/version/run (404), then
+    body/query shape (422), then lease state (409). Only the unexpired holder
+    of the run's lease may write the result; an unknown token, an expired
+    lease, an already ended run or another run's lease id is a 409 and writes
+    nothing. Success carries no non-null error; failure requires a non-empty
+    error message, exactly as the single-run PATCH finish. The task moves to
+    the same status atomically and a failed task keeps its consumed attempts.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            run_row = _require_version_run(
+                conn, version_row, dataset_name, version_number, run_id
+            )
+            lease_id, status, error = _parse_lease_complete_body(body)
+            _reject_lease_query_parameters(query_keys)
+
+            if status == "succeeded":
+                if error is not None:
+                    raise RequestInvalidError(
+                        "A successful run must not carry an error message"
+                    )
+            elif not error or not error.strip():
+                raise RequestInvalidError(
+                    "A failed run requires a non-empty error message"
+                )
+
+            lease_row = _find_lease(conn, dataset["id"], lease_id)
+            now = datetime.now(timezone.utc)
+            if (
+                lease_row is None
+                or lease_row["run_id"] != run_row["id"]
+                or run_row["status"] != "running"
+                or not _lease_active(lease_row, now)
+            ):
+                raise ConflictError(
+                    "The lease is unknown, expired, ended or held by another "
+                    "worker and cannot complete the run"
+                )
+
+            # The conditional terminal write is the hard guard against a
+            # concurrent legacy finish/cancel or a reclaim in another process:
+            # only the transaction that still sees the run as 'running' ends
+            # it, so exactly one racing writer commits the transition.
+            cursor = conn.execute(
+                "UPDATE processing_task_runs SET status = ?, finished_at = ?, "
+                "error = ? WHERE id = ? AND status = 'running'",
+                (status, utc_now_iso(), error, run_row["id"]),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    f"Processing task run {run_id} was finished concurrently"
+                )
+            conn.execute(
+                "UPDATE processing_tasks SET status = ? WHERE id = ?",
+                (status, run_row["task_id"]),
+            )
+            updated_run = conn.execute(
+                "SELECT * FROM processing_task_runs WHERE id = ?", (run_row["id"],)
+            ).fetchone()
+            result = _lease_run_dict(updated_run, lease_row)
+        except BaseException:
+            conn.rollback()
+            raise
+    return result
+
+
+def reclaim_processing_run_leases(
+    conn: sqlite3.Connection,
+    dataset_name: str,
+    version_number: int,
+    body: bytes,
+    *,
+    query_keys: tuple[str, ...] = (),
+) -> dict:
+    """Atomically fail every run whose lease has expired by ``as_of``.
+
+    The path dataset/version resolves first (404) and the body/query shape
+    next (422); ``as_of`` must be a timezone-bearing ISO-8601 instant. Every
+    run of the version that is still ``running`` and whose lease expiry is at
+    or before the cutoff becomes ``failed`` with error ``lease expired``, its
+    task moving to ``failed`` in the same transaction. Attempts are not rolled
+    back: a task with attempts left is a normal retryable failure while one
+    whose attempts are exhausted stays failed permanently. Runs started
+    through the legacy endpoints carry no lease row and are never touched, and
+    a repeated reclaim (or one with an earlier cutoff) changes nothing.
+    """
+    with _processing_write_section():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            dataset = require_dataset(conn, dataset_name)
+            version_row = _require_schema_version(conn, dataset, version_number)
+            raw_as_of = _parse_lease_reclaim_body(body)
+            _reject_lease_query_parameters(query_keys)
+            as_of = _parse_timezone_aware(raw_as_of, "as_of")
+
+            # Compare parsed instants rather than ISO text so a cutoff written
+            # without fractional seconds (or with a different offset) still
+            # orders correctly against the stored UTC expiries.
+            candidates = conn.execute(
+                "SELECT l.*, r.task_id AS owner_task_id "
+                "FROM processing_run_leases l "
+                "JOIN processing_task_runs r ON r.id = l.run_id "
+                "JOIN processing_tasks t ON t.id = r.task_id "
+                "WHERE t.version_id = ? AND r.status = 'running' "
+                "ORDER BY r.id",
+                (version_row["id"],),
+            ).fetchall()
+            expired = [
+                lease_row
+                for lease_row in candidates
+                if datetime.fromisoformat(lease_row["expires_at"]) <= as_of
+            ]
+
+            finished_at = utc_now_iso()
+            changed_run_ids: list[int] = []
+            for lease_row in expired:
+                cursor = conn.execute(
+                    "UPDATE processing_task_runs SET status = 'failed', "
+                    "finished_at = ?, error = ? "
+                    "WHERE id = ? AND status = 'running'",
+                    (finished_at, _LEASE_EXPIRED_ERROR, lease_row["run_id"]),
+                )
+                if cursor.rowcount != 1:
+                    # A concurrent writer (another process) ended the run
+                    # first; it is terminal either way and is not reported as
+                    # reclaimed by this request.
+                    continue
+                conn.execute(
+                    "UPDATE processing_tasks SET status = 'failed' WHERE id = ?",
+                    (lease_row["owner_task_id"],),
+                )
+                changed_run_ids.append(lease_row["run_id"])
+
+            reclaimed: list[dict] = []
+            for lease_row in expired:
+                if lease_row["run_id"] not in changed_run_ids:
+                    continue
+                run_row = conn.execute(
+                    "SELECT * FROM processing_task_runs WHERE id = ?",
+                    (lease_row["run_id"],),
+                ).fetchone()
+                reclaimed.append(_lease_run_dict(run_row, lease_row))
+        except BaseException:
+            conn.rollback()
+            raise
+
+    reclaimed.sort(key=lambda run: run["id"])
+    return {
+        "dataset": dataset["name"],
+        "version": version_row["version"],
+        "runs": reclaimed,
     }
 
 

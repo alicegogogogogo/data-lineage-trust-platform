@@ -1844,6 +1844,32 @@ class ProcessingRunBatchCompleteResponse(BaseModel):
     runs: list[ProcessingTaskRun]
 
 
+# --------------------------------------------------------------------------- #
+# Lease-based task claiming (lease dispatch / heartbeat / complete / reclaim)
+# --------------------------------------------------------------------------- #
+
+
+# A leased run is the ordinary run object extended with the three lease
+# fields; it is the element shape of the dispatch/reclaim responses and the
+# body returned by heartbeat and lease-complete.
+class LeasedRun(ProcessingTaskRun):
+    lease_id: str
+    worker_id: str
+    lease_expires_at: str
+
+
+class LeaseDispatchResponse(BaseModel):
+    dataset: str
+    version: int
+    runs: list[LeasedRun]
+
+
+class LeaseReclaimResponse(BaseModel):
+    dataset: str
+    version: int
+    runs: list[LeasedRun]
+
+
 class ProcessingTaskDependenciesUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

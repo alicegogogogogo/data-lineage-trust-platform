@@ -61,6 +61,9 @@ from app.models import (
     ProcessingTaskDispatchResponse,
     ProcessingTaskRun,
     ProcessingTaskWithRuns,
+    LeasedRun,
+    LeaseDispatchResponse,
+    LeaseReclaimResponse,
     ProcessingScheduleResponse,
     ProcessingAuditReportResponse,
     ProcessingAuditExportResponse,
@@ -3241,6 +3244,105 @@ def batch_complete_processing_task_runs(
             dataset_name,
             version,
             [item.model_dump(exclude_unset=True) for item in payload.runs],
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+# The lease-based endpoints are a separate flow mounted on the same task
+# collection. The two collection-level literals are declared before the
+# "/{task_id}" route (mirrors "dispatch"); the run-scoped routes use the literal
+# "runs" first segment, which never matches an integer task id. All four parse
+# the body as raw bytes in the repository so the path dataset/version (and the
+# run where it is a path object) resolve to a 404 ahead of every body/query 422.
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/lease-dispatch",
+    response_model=LeaseDispatchResponse,
+    status_code=201,
+)
+def lease_dispatch_processing_tasks(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> LeaseDispatchResponse:
+    return LeaseDispatchResponse(
+        **repository.lease_dispatch_processing_tasks(
+            conn,
+            dataset_name,
+            version,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/runs/{{run_id}}/lease-heartbeat",
+    response_model=LeasedRun,
+)
+def heartbeat_processing_run_lease(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    run_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> LeasedRun:
+    return LeasedRun(
+        **repository.heartbeat_processing_run_lease(
+            conn,
+            dataset_name,
+            version,
+            run_id,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/runs/{{run_id}}/lease-complete",
+    response_model=LeasedRun,
+)
+def complete_processing_run_lease(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    run_id: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> LeasedRun:
+    return LeasedRun(
+        **repository.complete_processing_run_lease(
+            conn,
+            dataset_name,
+            version,
+            run_id,
+            body,
+            query_keys=tuple(request.query_params.keys()),
+        )
+    )
+
+
+@app.post(
+    f"{PROCESSING_TASKS_PATH}/reclaim-leases",
+    response_model=LeaseReclaimResponse,
+)
+def reclaim_processing_run_leases(
+    request: Request,
+    dataset_name: str,
+    version: int,
+    body: bytes = Depends(_read_request_body),
+    conn=Depends(get_db),
+) -> LeaseReclaimResponse:
+    return LeaseReclaimResponse(
+        **repository.reclaim_processing_run_leases(
+            conn,
+            dataset_name,
+            version,
+            body,
             query_keys=tuple(request.query_params.keys()),
         )
     )
